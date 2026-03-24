@@ -1,0 +1,106 @@
+name: "Wesker Mutation Testing"
+description: "In-process AST mutation testing for Python. Zero dependencies."
+branding:
+  icon: "shield"
+  color: "red"
+
+inputs:
+  targets:
+    description: "Files or directories to profile (space-separated)"
+    required: false
+    default: "src/"
+  threshold:
+    description: "Minimum kill rate % — fails the check if below"
+    required: false
+    default: "0"
+  exclude:
+    description: "Files to exclude (space-separated)"
+    required: false
+    default: ""
+  mcdc:
+    description: "MC/DC targets (file.py::function, space-separated)"
+    required: false
+    default: ""
+  budget:
+    description: "Per-file budget in ms"
+    required: false
+    default: "10000"
+  max-per-category:
+    description: "Max mutants per category"
+    required: false
+    default: "3"
+  python-version:
+    description: "Python version to use"
+    required: false
+    default: "3.12"
+
+outputs:
+  kill-rate:
+    description: "Mutation kill rate percentage"
+    value: ${{ steps.run.outputs.kill_rate }}
+  total-killed:
+    description: "Total mutants killed"
+    value: ${{ steps.run.outputs.total_killed }}
+  total-mutants:
+    description: "Total mutants generated"
+    value: ${{ steps.run.outputs.total_mutants }}
+  mcdc-status:
+    description: "MC/DC verification status"
+    value: ${{ steps.run.outputs.mcdc_status }}
+  report:
+    description: "Path to JSON report"
+    value: ${{ steps.run.outputs.report }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install Wesker
+      shell: bash
+      run: pip install ${{ github.action_path }}
+
+    - name: Install project dependencies
+      shell: bash
+      run: |
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        if [ -f pyproject.toml ]; then pip install -e ".[dev,test]" 2>/dev/null || pip install -e . 2>/dev/null || true; fi
+
+    - name: Run Wesker
+      id: run
+      shell: bash
+      run: |
+        ARGS="${{ inputs.targets }}"
+        if [ -n "${{ inputs.threshold }}" ] && [ "${{ inputs.threshold }}" != "0" ]; then
+          ARGS="$ARGS --threshold ${{ inputs.threshold }}"
+        fi
+        if [ -n "${{ inputs.exclude }}" ]; then
+          ARGS="$ARGS --exclude ${{ inputs.exclude }}"
+        fi
+        if [ -n "${{ inputs.mcdc }}" ]; then
+          ARGS="$ARGS --mcdc ${{ inputs.mcdc }}"
+        fi
+        ARGS="$ARGS --budget ${{ inputs.budget }} --max-per-category ${{ inputs.max-per-category }}"
+
+        # Run with JSON output for parsing, tee to terminal
+        python -m Wesker $ARGS --json > .wesker-report.json 2>&1 || EXIT_CODE=$?
+
+        # Parse outputs
+        KILL_RATE=$(python -c "import json; d=json.load(open('.wesker-report.json')); print(d.get('mutation',{}).get('kill_pct',0))" 2>/dev/null || echo "0")
+        TOTAL_KILLED=$(python -c "import json; d=json.load(open('.wesker-report.json')); print(d.get('mutation',{}).get('total_killed',0))" 2>/dev/null || echo "0")
+        TOTAL_MUTANTS=$(python -c "import json; d=json.load(open('.wesker-report.json')); print(d.get('mutation',{}).get('total_mutants',0))" 2>/dev/null || echo "0")
+        MCDC_STATUS=$(python -c "import json; d=json.load(open('.wesker-report.json')); print('verified' if d.get('mcdc',{}).get('verified') else 'none')" 2>/dev/null || echo "none")
+
+        echo "kill_rate=$KILL_RATE" >> $GITHUB_OUTPUT
+        echo "total_killed=$TOTAL_KILLED" >> $GITHUB_OUTPUT
+        echo "total_mutants=$TOTAL_MUTANTS" >> $GITHUB_OUTPUT
+        echo "mcdc_status=$MCDC_STATUS" >> $GITHUB_OUTPUT
+        echo "report=.wesker-report.json" >> $GITHUB_OUTPUT
+
+        # Also print human-readable summary
+        python -m Wesker $ARGS 2>&1 || true
+
+        exit ${EXIT_CODE:-0}

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "Wesker"
+version = "0.1.0"
+description = "In-process AST mutation testing for Python. Zero dependencies."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Rohan Vinaik" }]
+keywords = ["mutation-testing", "testing", "ast", "code-quality", "ci"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.scripts]
+wesker = "Wesker.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/rohanvinaik/Wesker"
+Repository = "https://github.com/rohanvinaik/Wesker"

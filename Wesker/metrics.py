@@ -211,13 +211,17 @@ def _count_source_loc() -> int:
 # MC/DC verification (text-level operator swaps)
 # ---------------------------------------------------------------------------
 
-_TEXT_OP_SWAPS = {
-    " <= ": " < ",
-    " >= ": " > ",
-    " < ": " <= ",
-    " > ": " >= ",
-    " == ": " != ",
-    " != ": " == ",
+# Full ROR universe: each relational operator maps to all 5 alternatives.
+# Offutt & Voas (1996) prove this subsumes MC/DC; Kaminski et al. (2013)
+# show the minimal sufficient subset is 3 per operator, but we test all 5
+# to cover the complete mutation universe.
+_TEXT_OP_SWAPS: dict[str, list[str]] = {
+    " <= ": [" < ", " >= ", " > ", " == ", " != "],
+    " >= ": [" > ", " <= ", " < ", " == ", " != "],
+    " < ":  [" <= ", " > ", " >= ", " == ", " != "],
+    " > ":  [" >= ", " < ", " <= ", " == ", " != "],
+    " == ": [" != ", " < ", " <= ", " > ", " >= "],
+    " != ": [" == ", " < ", " <= ", " > ", " >= "],
 }
 
 _AST_TO_TEXT = {
@@ -273,8 +277,8 @@ def _verify_mcdc_single(filepath: str, func_name: str) -> dict:
                 op_name = type(op).__name__
                 op_text = _AST_TO_TEXT.get(op_name)
                 if op_text:
-                    swap_text = _TEXT_OP_SWAPS.get(op_text)
-                    if swap_text:
+                    swaps = _TEXT_OP_SWAPS.get(op_text, [])
+                    for swap_text in swaps:
                         condition_sites.append({
                             "line": child.lineno,
                             "op_text": op_text,

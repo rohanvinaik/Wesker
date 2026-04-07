@@ -50,7 +50,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", dest="json_output", help="JSON output")
     parser.add_argument("--threshold", type=int, default=0, help="Minimum kill rate %% (exit 1 if below)")
     parser.add_argument("--budget", type=float, default=10000, help="Per-file budget in ms")
-    parser.add_argument("--max-per-category", type=int, default=3, help="Max mutants per category")
+    parser.add_argument("--max-per-category", type=int, default=5, help="Max mutants per category per pass (0=exhaustive)")
+    parser.add_argument("--passes", type=int, default=3, help="Convergence passes (different seed each)")
     parser.add_argument("--exclude", nargs="*", default=[], help="Files to exclude")
     parser.add_argument("--quiet", action="store_true", help="Minimal output")
     args = parser.parse_args(argv)
@@ -75,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
         files,
         budget_ms_per_file=args.budget,
         max_per_category=args.max_per_category,
+        passes=args.passes,
         verbose=not args.quiet and not args.json_output,
     )
 

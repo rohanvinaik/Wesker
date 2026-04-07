@@ -186,11 +186,117 @@ For safety-critical functions requiring proof that every condition independently
 
 ---
 
-## Quick start
+## Installation
 
 ```bash
 pip install wesker
+```
+
+Or from source:
+
+```bash
+git clone https://github.com/rohanvinaik/Wesker.git
+cd Wesker
+pip install -e .
+```
+
+Requires Python 3.10+. No dependencies beyond the standard library and your test framework.
+
+---
+
+## Usage
+
+### CLI
+
+Profile an entire source directory:
+
+```bash
 wesker src/
+```
+
+Profile specific files:
+
+```bash
+wesker src/scoring.py src/query.py
+```
+
+Fail CI if kill rate drops below a threshold:
+
+```bash
+wesker src/ --threshold 90
+```
+
+Run in exhaustive mode (every possible mutant, no sampling):
+
+```bash
+wesker src/ --max-per-category 0 --passes 1
+```
+
+JSON output for CI parsing:
+
+```bash
+wesker src/ --json
+```
+
+MC/DC verification on safety-critical functions:
+
+```bash
+wesker --mcdc src/scoring.py::compute_score
+```
+
+Full option reference:
+
+```
+wesker [targets...] [options]
+
+  --threshold N            Exit 1 if kill rate < N%
+  --mcdc FILE::FUNC ...    MC/DC verification on specific functions
+  --json                   JSON output (for CI parsing)
+  --budget MS              Per-file time budget (default: 10000ms)
+  --max-per-category N     Mutants per category per pass (default: 5, 0=exhaustive)
+  --passes N               Convergence passes (default: 3)
+  --exclude FILE ...       Files to skip
+  --quiet                  Minimal output
+```
+
+### As a library
+
+Profile a single function (interactive/editor use):
+
+```python
+from Wesker.ci import profile_function
+
+result = profile_function(".", "src/scoring.py", "compute_score")
+print(result["kill_matrix"])        # which test killed which mutant
+print(result["survivor_records"])   # surviving mutants with category + location
+print(result["is_gateable"])        # True if all mutants were tested
+```
+
+With per-function caching (returns instantly on repeat calls until code changes):
+
+```python
+from Wesker.ci import profile_function_cached
+
+result = profile_function_cached(".", "src/scoring.py", "compute_score")
+```
+
+Profile an entire file:
+
+```python
+from Wesker.ci import profile_file
+
+results = profile_file(".", "src/scoring.py", passes=3)
+for r in results:
+    print(f"{r['function_key']}: {r['total_killed']}/{r['total_mutants']}")
+```
+
+Profile a codebase (CI-level, with terminal output):
+
+```python
+from Wesker.ci import profile_codebase
+
+result = profile_codebase(".", ["src/scoring.py", "src/query.py"])
+print(result["kill_pct"], result["per_category"])
 ```
 
 ### Configuration
@@ -207,28 +313,13 @@ mcdc_targets = [["src/mypackage/scoring.py", "compute_score"]]
 
 Wesker auto-detects source layout from `[tool.coverage.run]`, `[tool.hatch.build]`, or `src/*/` convention when `[tool.wesker]` is not configured.
 
-### CLI
-
-```
-wesker [targets...] [options]
-
-  --threshold N            Exit 1 if kill rate < N%
-  --mcdc FILE::FUNC ...    MC/DC verification on specific functions
-  --json                   JSON output (for CI parsing)
-  --budget MS              Per-file time budget (default: 10000ms)
-  --max-per-category N     Mutants per category per pass (default: 5, 0=exhaustive)
-  --passes N               Convergence passes (default: 3)
-  --exclude FILE ...       Files to skip
-  --quiet                  Minimal output
-```
-
 ### GitHub Action
 
 ```yaml
-- uses: rohanvinaik/wesker@v1
-  with:
-    targets: src/
-    threshold: 90
+- name: Mutation testing
+  run: |
+    pip install wesker
+    wesker src/ --threshold 90
 ```
 
 ---

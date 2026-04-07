@@ -361,6 +361,194 @@ def profile_file(
     return results
 
 
+# ── Single-function profiling ──────────────────────────────────
+
+
+def profile_function(
+    project_root: str,
+    source_file: str,
+    function_name: str,
+    budget_ms: float = 10000,
+    max_per_category: int = 5,
+    passes: int = 3,
+    cached_state: dict | None = None,
+) -> dict | None:
+    """Profile a single function by name — the interactive/library entry point.
+
+    Parses the file, finds the named function (supports ``Class.method``
+    dotted names), discovers tests, and runs multi-pass convergence.
+    Returns a full ProfilingResult dict (with kill_matrix, survivor/killed
+    records, gateability) or None if the function was not found.
+
+    This is the API that downstream consumers (LintGate, editors, MCP
+    tools) should call when targeting a specific function rather than
+    profiling an entire file.
+    """
+    full_path = (
+        os.path.join(project_root, source_file)
+        if not os.path.isabs(source_file)
+        else source_file
+    )
+
+    abs_root = os.path.abspath(project_root)
+    src_dir = os.path.join(abs_root, "src")
+    if os.path.isdir(src_dir) and src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
+
+    try:
+        with open(full_path) as f:
+            tree = ast.parse(f.read(), filename=full_path)
+    except (OSError, SyntaxError):
+        return None
+
+    functions = walk_functions(tree)
+    func_names = [name for name, _ in functions]
+
+    # Find the target function
+    func_node = None
+    qualname = None
+    for qn, node in functions:
+        if qn == function_name or qn.split(".")[-1] == function_name:
+            func_node = node
+            qualname = qn
+            break
+
+    if func_node is None:
+        return None
+
+    cats = filter_categories(func_node)
+    if not cats:
+        return None
+
+    priors = prioritize_categories(cats, cached_state)
+    cat_order = [p.category for p in priors]
+
+    test_files = discover_tests(project_root, full_path, func_names)
+    tests = load_test_callables(test_files)
+
+    rel = os.path.relpath(full_path, project_root)
+    func_key = f"{rel}::{qualname}"
+
+    result = run_function_converged(
+        func_node,  # type: ignore[arg-type]
+        func_key,
+        cats,
+        tests,
+        None,
+        budget_ms=budget_ms,
+        max_per_category=max_per_category,
+        passes=passes,
+        category_order=cat_order,
+    )
+    return result.to_dict()
+
+
+# ── Per-function result cache ──────────────────────────────────
+
+
+def _code_hash(source: str) -> str:
+    """Stable hash of source text for cache invalidation."""
+    import hashlib
+    return hashlib.sha256(source.encode()).hexdigest()[:16]
+
+
+def _load_function_cache(project_root: str) -> dict:
+    """Load per-function result cache from .wesker/function_cache.json.
+
+    Returns a dict keyed by ``func_key:code_hash`` → result dict.
+    Entries whose code_hash no longer matches are stale and will be
+    ignored by callers.
+    """
+    cache_path = Path(project_root) / ".wesker" / "function_cache.json"
+    if not cache_path.exists():
+        return {}
+    try:
+        return json.loads(cache_path.read_text())
+    except Exception:
+        return {}
+
+
+def _save_function_cache(project_root: str, cache: dict) -> None:
+    """Write per-function result cache."""
+    cache_dir = Path(project_root) / ".wesker"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "function_cache.json").write_text(json.dumps(cache, indent=2))
+
+
+def profile_function_cached(
+    project_root: str,
+    source_file: str,
+    function_name: str,
+    budget_ms: float = 10000,
+    max_per_category: int = 5,
+    passes: int = 3,
+) -> dict | None:
+    """Profile a function with per-function caching.
+
+    Checks ``.wesker/function_cache.json`` for a valid cached result
+    (matching code hash). On hit, returns the cached result immediately.
+    On miss, profiles the function, writes the result to cache, and returns it.
+
+    This is the preferred entry point for interactive/local use where
+    the same function may be profiled repeatedly across sessions.
+    """
+    full_path = (
+        os.path.join(project_root, source_file)
+        if not os.path.isabs(source_file)
+        else source_file
+    )
+    try:
+        source = Path(full_path).read_text()
+    except OSError:
+        return None
+
+    # Extract just the function's source for hashing
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+
+    func_source = None
+    for qn, node in walk_functions(tree):
+        if qn == function_name or qn.split(".")[-1] == function_name:
+            lines = source.splitlines(keepends=True)
+            end = getattr(node, "end_lineno", None) or len(lines)
+            func_source = "".join(lines[node.lineno - 1 : end])
+            break
+
+    if func_source is None:
+        return None
+
+    h = _code_hash(func_source)
+    rel = os.path.relpath(full_path, project_root)
+    # Find qualname for the cache key
+    for qn, node in walk_functions(tree):
+        if qn == function_name or qn.split(".")[-1] == function_name:
+            cache_key = f"{rel}::{qn}:{h}"
+            break
+    else:
+        return None
+
+    # Check cache
+    cache = _load_function_cache(project_root)
+    if cache_key in cache:
+        return cache[cache_key]
+
+    # Cache miss — profile
+    cached_state = _load_cached_state(project_root)
+    result = profile_function(
+        project_root, source_file, function_name,
+        budget_ms=budget_ms, max_per_category=max_per_category,
+        passes=passes, cached_state=cached_state,
+    )
+
+    if result is not None:
+        cache[cache_key] = result
+        _save_function_cache(project_root, cache)
+
+    return result
+
+
 # ── Codebase profiling with formatted output ─────────────────────
 
 

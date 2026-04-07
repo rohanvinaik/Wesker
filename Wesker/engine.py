@@ -1417,8 +1417,12 @@ def run_function_converged(
     per_mutant_timeout_ms: float = 500,
     passes: int = 3,
     category_order: list[MutationCategory] | None = None,
-) -> SamplingResult:
+) -> ProfilingResult:
     """Multi-pass convergence with integrated equivalence detection.
+
+    Returns ``ProfilingResult`` with full kill matrix, survivor/killed
+    records, and gateability — compatible with downstream consumers
+    (gap classifiers, convergence engines, cross-channel gates).
 
     Each pass uses a different seed, so ``max_per_category`` mutants are
     sampled from a different subset of each category's target space.
@@ -1429,11 +1433,6 @@ def run_function_converged(
     When ``category_order`` is provided (from Layer 2 predictive priors),
     mutants are generated in priority order within each pass. If budget
     runs out mid-pass, high-prior categories have already been tested.
-
-    The probability of missing a real survivor after K passes is
-    ``(1 - k/n)^K`` where k=max_per_category and n=targets_in_category.
-    With passes=3 and max_per_category=5, a category with 20 targets has
-    P(miss) ≈ 0.24. With passes=5, P(miss) ≈ 0.07.
 
     Coverage depth:
       - "profiled" if all possible mutants were tested
@@ -1449,6 +1448,9 @@ def run_function_converged(
     )
 
     seen: dict[str, MutantResult] = {}
+    kill_matrix: dict[str, list[str]] = {}
+    survivor_records: list[dict] = []
+    killed_records: list[dict] = []
 
     for seed in range(passes):
         if _elapsed(start) > budget_ms:
@@ -1477,6 +1479,25 @@ def run_function_converged(
                     )
 
             seen[mutant.mutant_id] = result
+
+            # Build kill matrix and records for downstream consumers
+            record = {
+                "mutant_id": mutant.mutant_id,
+                "mutant": mutant.description,
+                "category": mutant.category.value,
+                "elapsed_ms": round(result.elapsed_ms, 1),
+            }
+            if result.killed:
+                record["killed_by"] = result.killed_by
+                record["test"] = result.test_name
+                killed_records.append(record)
+                if result.test_name:
+                    kill_matrix.setdefault(mutant.description, []).append(result.test_name)
+            elif result.equivalent:
+                record["equivalent"] = True
+                survivor_records.append(record)
+            else:
+                survivor_records.append(record)
 
     # Aggregate by category
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
@@ -1513,7 +1534,7 @@ def run_function_converged(
     else:
         depth = "sampled"
 
-    return SamplingResult(
+    return ProfilingResult(
         function_key=func_key,
         categories_tested=len(per_cat),
         total_mutants=total,
@@ -1523,7 +1544,11 @@ def run_function_converged(
         universe_size=universe,
         survival_rate=survived / total if total > 0 else 0.0,
         coverage_depth=depth,
+        is_gateable=depth == "profiled",
         per_category=per_cat,
+        kill_matrix=kill_matrix,
+        survivor_records=survivor_records,
+        killed_records=killed_records,
         budget_exhausted=budget_exhausted,
         elapsed_ms=_elapsed(start),
     )

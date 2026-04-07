@@ -1250,10 +1250,22 @@ def run_function_profiling(
                 cr.timed_out += 1
             if result.test_name:
                 kill_matrix.setdefault(mutant.description, []).append(result.test_name)
-            killed_records.append({"mutant": mutant.description, "killed_by": result.killed_by, "test": result.test_name})
+            killed_records.append({
+                "mutant_id": mutant.mutant_id,
+                "mutant": mutant.description,
+                "category": mutant.category.value,
+                "killed_by": result.killed_by,
+                "test": result.test_name,
+                "elapsed_ms": round(result.elapsed_ms, 1),
+            })
         else:
             cr.survived += 1
-            survivor_records.append({"mutant": mutant.description})
+            survivor_records.append({
+                "mutant_id": mutant.mutant_id,
+                "mutant": mutant.description,
+                "category": mutant.category.value,
+                "elapsed_ms": round(result.elapsed_ms, 1),
+            })
 
     per_cat = list(results_by_cat.values())
     total = sum(cr.total for cr in per_cat)

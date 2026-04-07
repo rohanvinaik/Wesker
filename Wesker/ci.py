@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 import os
 import sys
 import time
@@ -22,7 +23,7 @@ from typing import Any
 from Wesker.engine import (
     run_function_converged,
 )
-from Wesker.filter import filter_categories
+from Wesker.filter import filter_categories, prioritize_categories
 
 
 # ── ANSI colors for terminal output ──────────────────────────────
@@ -261,6 +262,29 @@ def walk_functions(
     return results
 
 
+# ── Cached state for Layer 2 predictive priors ─────────────────
+
+
+def _load_cached_state(project_root: str) -> dict | None:
+    """Load cached mutation report from a previous Wesker run.
+
+    Reads ``.wesker/mutation_report.json`` which contains per-category
+    aggregate survival data. Returns the full report dict (with a
+    ``per_category`` list), or None if no cache exists.
+
+    This enables Layer 2 (§6.2): historical survival rates inform which
+    categories are most likely to contain specification gaps, so budget
+    is spent where information gain is highest.
+    """
+    report_path = Path(project_root) / ".wesker" / "mutation_report.json"
+    if not report_path.exists():
+        return None
+    try:
+        return json.loads(report_path.read_text())
+    except Exception:
+        return None
+
+
 # ── File profiling ───────────────────────────────────────────────
 
 
@@ -270,12 +294,18 @@ def profile_file(
     budget_ms: float = 10000,
     max_per_category: int = 5,
     passes: int = 3,
+    cached_state: dict | None = None,
 ) -> list[dict]:
     """Profile all functions in a file with multi-pass convergence.
 
     Each function is profiled with ``passes`` rounds of sampling, each
     using a different seed. Equivalence detection is integrated into the
     evaluation loop — no post-hoc re-evaluation needed.
+
+    When ``cached_state`` is provided (from a previous run's report),
+    Layer 2 predictive priors order categories by historical survival
+    rate — highest-survival first — so budget-limited runs test the
+    most informative categories before less informative ones.
     """
     full_path = (
         os.path.join(project_root, source_file)
@@ -308,6 +338,10 @@ def profile_file(
         if not cats:
             continue
 
+        # Layer 2: order categories by historical survival prior
+        priors = prioritize_categories(cats, cached_state)
+        cat_order = [p.category for p in priors]
+
         rel = os.path.relpath(full_path, project_root)
         func_key = f"{rel}::{qualname}"
 
@@ -320,6 +354,7 @@ def profile_file(
             budget_ms=budget_ms,
             max_per_category=max_per_category,
             passes=passes,
+            category_order=cat_order,
         )
         results.append(sr.to_dict())
 
@@ -340,6 +375,11 @@ def profile_codebase(
 ) -> dict:
     """Profile all functions across multiple files with multi-pass convergence.
 
+    Automatically loads cached state from ``.wesker/mutation_report.json``
+    (written by previous runs) to enable Layer 2 predictive priors. On
+    first run, all category priors are uniform; subsequent runs prioritize
+    categories with historically higher survival rates.
+
     Args:
         passes: Number of convergence passes per function. Each pass uses
             a different seed, sampling different mutants. Higher values give
@@ -347,12 +387,19 @@ def profile_codebase(
         max_per_category: Mutants sampled per category per pass. Total unique
             mutants tested ≈ passes × max_per_category per category.
     """
+    # Layer 2: load historical priors from previous run
+    cached_state = _load_cached_state(project_root)
+    if verbose and cached_state and cached_state.get("per_category"):
+        n_cats = len(cached_state["per_category"])
+        print(f"  {_DIM}(loaded {n_cats}-category priors from previous run){_RESET}")
+
     total_killed = 0
     total_mutants = 0
     total_equivalent = 0
     total_universe = 0
     total_functions = 0
     per_file: dict[str, dict] = {}
+    global_cats: dict[str, dict] = {}
     start = time.monotonic()
 
     for i, target in enumerate(targets, 1):
@@ -367,6 +414,7 @@ def profile_codebase(
             budget_ms=budget_ms_per_file,
             max_per_category=max_per_category,
             passes=passes,
+            cached_state=cached_state,
         )
         file_ms = (time.monotonic() - file_start) * 1000
 
@@ -379,6 +427,21 @@ def profile_codebase(
         total_equivalent += file_equiv
         total_universe += file_universe
         total_functions += len(results)
+
+        # Aggregate per-category stats for the report (feeds next run's priors)
+        for r in results:
+            for cat_data in r.get("per_category", []):
+                cat_name = cat_data.get("category", "")
+                if not cat_name:
+                    continue
+                agg = global_cats.setdefault(
+                    cat_name,
+                    {"category": cat_name, "total": 0, "killed": 0, "survived": 0, "equivalent": 0},
+                )
+                agg["total"] += cat_data.get("total", 0)
+                agg["killed"] += cat_data.get("killed", 0)
+                agg["survived"] += cat_data.get("survived", 0)
+                agg["equivalent"] += cat_data.get("equivalent", 0)
 
         if file_total > 0:
             effective_total = file_total - file_equiv
@@ -416,4 +479,5 @@ def profile_codebase(
         "passes": passes,
         "elapsed_ms": round(elapsed),
         "per_file": per_file,
+        "per_category": list(global_cats.values()),
     }

@@ -601,6 +601,7 @@ def generate_mutants(
     categories: set[MutationCategory],
     max_per_category: int = 0,
     seed: int | None = None,
+    category_order: list[MutationCategory] | None = None,
 ) -> list[Mutant]:
     """Generate mutants for a function across specified categories.
 
@@ -612,11 +613,24 @@ def generate_mutants(
               ``max_per_category > 0``, the target indices are shuffled before
               truncation so different seeds sample different mutants from the
               same function. ``None`` (default) preserves AST-walk order.
+        category_order: Optional priority ordering of categories. When provided,
+              mutants are generated in this order (high-priority first). Categories
+              in this list but not in ``categories`` are skipped. When None, uses
+              alphabetical order.
     """
     mutants: list[Mutant] = []
     ds_pos = _docstring_positions(func_node)
 
-    for cat in sorted(categories, key=lambda c: c.value):
+    if category_order is not None:
+        order = [c for c in category_order if c in categories]
+        # Append any categories not in the ordering (shouldn't happen, but defensive)
+        for c in sorted(categories, key=lambda c: c.value):
+            if c not in order:
+                order.append(c)
+    else:
+        order = sorted(categories, key=lambda c: c.value)
+
+    for cat in order:
         # STATE needs special handling: two independent sub-modes with
         # separate target counts so indices align with the transformer.
         if cat == MutationCategory.STATE:
@@ -1402,6 +1416,7 @@ def run_function_converged(
     max_per_category: int = 5,
     per_mutant_timeout_ms: float = 500,
     passes: int = 3,
+    category_order: list[MutationCategory] | None = None,
 ) -> SamplingResult:
     """Multi-pass convergence with integrated equivalence detection.
 
@@ -1410,6 +1425,10 @@ def run_function_converged(
     Across N passes, tests up to N × max_per_category unique mutants per
     category. Surviving mutants are checked for semantic equivalence via
     boundary input evaluation.
+
+    When ``category_order`` is provided (from Layer 2 predictive priors),
+    mutants are generated in priority order within each pass. If budget
+    runs out mid-pass, high-prior categories have already been tested.
 
     The probability of missing a real survivor after K passes is
     ``(1 - k/n)^K`` where k=max_per_category and n=targets_in_category.
@@ -1435,7 +1454,8 @@ def run_function_converged(
         if _elapsed(start) > budget_ms:
             break
         mutants = generate_mutants(
-            func_node, categories, max_per_category=max_per_category, seed=seed,
+            func_node, categories, max_per_category=max_per_category,
+            seed=seed, category_order=category_order,
         )
         for mutant in mutants:
             if mutant.mutant_id in seen:

@@ -71,7 +71,13 @@ def _discover_by_convention(project_root: str, source_file: str) -> list[str]:
 
     # Parent-aware matching
     parent_dir = Path(source_file).parent.name
-    parent_qualified = f"{parent_dir}_{base}" if parent_dir not in ("model_atlas", "src") else None
+    # Skip qualification for top-level package dirs and src/
+    _skip_dirs = {"src"}
+    # Auto-detect: if parent is the package root (immediate child of src/), skip
+    parent_path = Path(source_file).parent
+    if parent_path.parent.name == "src" or parent_dir == "src":
+        _skip_dirs.add(parent_dir)
+    parent_qualified = f"{parent_dir}_{base}" if parent_dir not in _skip_dirs else None
 
     # Partial stems for compound names (query_navigate -> query, navigate)
     partial_stems = {p for p in base_stripped.split("_") if len(p) >= 4}
@@ -450,7 +456,7 @@ def profile_codebase(
 
     for i, target in enumerate(targets, 1):
         if verbose:
-            short = target.replace("src/model_atlas/", "")
+            short = target.rsplit("/", 1)[-1]
             print(f"  {_DIM}[{i}/{len(targets)}]{_RESET} {short}", end="", flush=True)
 
         file_start = time.monotonic()

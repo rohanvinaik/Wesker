@@ -127,7 +127,7 @@ def _discover_targets(config: dict) -> list[str]:
     if not source_dir or not Path(source_dir).is_dir():
         return []
 
-    exclude = config.get("exclude", set())
+    exclude = {str(Path(p)) for p in config.get("exclude", [])}
     targets = []
     for py in sorted(Path(source_dir).rglob("*.py")):
         path_str = str(py)

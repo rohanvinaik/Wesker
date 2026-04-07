@@ -36,42 +36,102 @@ from pathlib import Path
 
 from Wesker.ci import profile_codebase  # noqa: E402
 
-# Files excluded from mutation profiling — same as coverage exclusions.
-_MUTATION_EXCLUDE = {
-    "src/model_atlas/phase_c_worker.py",
-    "src/model_atlas/phase_c1_worker.py",
-    "src/model_atlas/phase_c1_extended.py",
-    "src/model_atlas/phase_c3_worker.py",
-    "src/model_atlas/phase_d_worker.py",
-    "src/model_atlas/ingest_cli.py",
-    "src/model_atlas/ingest.py",
-    "src/model_atlas/ingest_seed.py",
-    "src/model_atlas/ingest_vibes.py",
-    "src/model_atlas/sources/huggingface.py",
-    "src/model_atlas/sources/ollama.py",
-    "src/model_atlas/sources/base.py",
-    "src/model_atlas/ground_truth.py",
-    "src/model_atlas/search/structured.py",
-    "src/model_atlas/wiki/__main__.py",
-}
 
-# Scoring core functions for MC/DC verification
-MCDC_TARGETS = [
-    ("src/model_atlas/query_navigate.py", "_bank_score_single"),
-    ("src/model_atlas/query_navigate.py", "_nav_bank_alignment"),
-    ("src/model_atlas/query_navigate.py", "_nav_anchor_relevance"),
-    ("src/model_atlas/query_navigate.py", "_nav_seed_similarity"),
-    ("src/model_atlas/query.py", "_gradient_decay"),
-    ("src/model_atlas/query.py", "_score_constraint"),
-]
+# ---------------------------------------------------------------------------
+# Project configuration — auto-discovered from pyproject.toml
+# ---------------------------------------------------------------------------
 
 
-def _discover_targets() -> list[str]:
-    """Discover all testable Python files under src/model_atlas/."""
+def _load_config() -> dict:
+    """Load Wesker config from the calling project's pyproject.toml.
+
+    Reads [tool.wesker] section. Falls back to auto-detection from
+    [tool.coverage.run].source, [tool.hatch.build], or src/ layout.
+
+    Config keys:
+        source_dir: str — source directory (e.g. "src/prism")
+        exclude: list[str] — files to exclude from mutation profiling
+        mcdc_targets: list[list[str]] — [[file, function], ...] for MC/DC
+        project_name: str — display name (defaults to pyproject.toml [project].name)
+    """
+    config: dict = {
+        "source_dir": "",
+        "exclude": [],
+        "mcdc_targets": [],
+        "project_name": "Project",
+    }
+
+    pyproject = Path("pyproject.toml")
+    if not pyproject.exists():
+        return config
+
+    try:
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:
+            try:
+                import tomllib
+            except ImportError:
+                import tomli as tomllib  # type: ignore[no-redef]
+
+        data = tomllib.loads(pyproject.read_text())
+    except Exception:
+        return config
+
+    # Project name
+    project_name = data.get("project", {}).get("name", "")
+    if project_name:
+        config["project_name"] = project_name
+
+    # Explicit [tool.wesker] config takes priority
+    wesker = data.get("tool", {}).get("wesker", {})
+    if wesker:
+        config["source_dir"] = wesker.get("source_dir", config["source_dir"])
+        config["exclude"] = set(wesker.get("exclude", []))
+        config["mcdc_targets"] = [
+            tuple(t) for t in wesker.get("mcdc_targets", [])
+        ]
+        if config["source_dir"]:
+            return config
+
+    # Auto-detect source_dir from coverage config
+    cov_source = data.get("tool", {}).get("coverage", {}).get("run", {}).get("source", [])
+    if cov_source:
+        config["source_dir"] = cov_source[0]
+        cov_omit = data.get("tool", {}).get("coverage", {}).get("run", {}).get("omit", [])
+        config["exclude"] = set(cov_omit)
+        return config
+
+    # Auto-detect from hatch build config
+    hatch_pkgs = (
+        data.get("tool", {}).get("hatch", {}).get("build", {})
+        .get("targets", {}).get("wheel", {}).get("packages", [])
+    )
+    if hatch_pkgs:
+        config["source_dir"] = hatch_pkgs[0]
+        return config
+
+    # Last resort: look for src/*/ directories
+    src = Path("src")
+    if src.is_dir():
+        subdirs = [d for d in src.iterdir() if d.is_dir() and not d.name.startswith("_")]
+        if len(subdirs) == 1:
+            config["source_dir"] = str(subdirs[0])
+
+    return config
+
+
+def _discover_targets(config: dict) -> list[str]:
+    """Discover all testable Python files under the source directory."""
+    source_dir = config.get("source_dir", "")
+    if not source_dir or not Path(source_dir).is_dir():
+        return []
+
+    exclude = config.get("exclude", set())
     targets = []
-    for py in sorted(Path("src/model_atlas").rglob("*.py")):
+    for py in sorted(Path(source_dir).rglob("*.py")):
         path_str = str(py)
-        if path_str in _MUTATION_EXCLUDE:
+        if path_str in exclude:
             continue
         if py.name == "__init__.py" or "__pycache__" in path_str:
             continue
@@ -308,11 +368,14 @@ def _write_metrics(metrics: dict) -> None:
 
 
 def main():
+    config = _load_config()
+    project_name = config["project_name"]
+
     print("=" * 60)
-    print("Wesker — ModelAtlas Specification Metrics")
+    print(f"Wesker — {project_name} Specification Metrics")
     print("=" * 60)
 
-    targets = _discover_targets()
+    targets = _discover_targets(config)
     print(f"\nTargets: {len(targets)} files")
 
     # 1. Mutation profiling (in-process, via Wesker engine)
@@ -325,8 +388,9 @@ def main():
         print(f"    {f}: {d['killed']}/{d['total']} ({status})")
 
     # 2. MC/DC verification
+    mcdc_targets = config.get("mcdc_targets", [])
     print("\n[2/4] Verifying MC/DC on scoring functions...")
-    mcdc = _verify_mcdc(MCDC_TARGETS)
+    mcdc = _verify_mcdc(mcdc_targets)
     mcdc_status = "Verified" if mcdc["verified"] else "Partial"
     mcdc_detail = f"{mcdc['conditions_covered']}/{mcdc['conditions_total']} conditions"
     print(f"  MC/DC: {mcdc_status} ({mcdc_detail})")

@@ -34,6 +34,8 @@ class _FunctionSignals:
     has_self_assigns: bool = False
     has_global_nonlocal: bool = False
     has_isinstance: bool = False
+    has_arithmetic: bool = False
+    has_logical: bool = False
 
 
 def _collect_signals(func_node: ast.FunctionDef) -> _FunctionSignals:
@@ -53,6 +55,16 @@ def _collect_signals(func_node: ast.FunctionDef) -> _FunctionSignals:
             and node.func.id == "isinstance"
         ):
             signals.has_isinstance = True
+        elif isinstance(node, ast.BinOp) and isinstance(
+            node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow),
+        ):
+            signals.has_arithmetic = True
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            signals.has_arithmetic = True
+        elif isinstance(node, ast.BoolOp):
+            signals.has_logical = True
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            signals.has_logical = True
     return signals
 
 
@@ -76,6 +88,10 @@ def filter_categories(
         relevant.add(MutationCategory.STATE)
     if sig.has_isinstance:
         relevant.add(MutationCategory.TYPE)
+    if sig.has_arithmetic:
+        relevant.add(MutationCategory.ARITHMETIC)
+    if sig.has_logical:
+        relevant.add(MutationCategory.LOGICAL)
 
     return relevant
 

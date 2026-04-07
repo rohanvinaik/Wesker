@@ -29,6 +29,8 @@ class MutationCategory(str, Enum):
     STATE = "STATE"
     BOUNDARY = "BOUNDARY"
     TYPE = "TYPE"
+    ARITHMETIC = "ARITHMETIC"
+    LOGICAL = "LOGICAL"
 
 
 @dataclass
@@ -52,6 +54,7 @@ class MutantResult:
     killed_by: str | None = None  # "assertion" | "crash" | "timeout"
     test_name: str | None = None
     elapsed_ms: float = 0.0
+    equivalent: bool = False
 
 
 @dataclass
@@ -65,6 +68,7 @@ class CategoryResult:
     killed_by_assertion: int = 0
     killed_by_crash: int = 0
     timed_out: int = 0
+    equivalent: int = 0
 
     @property
     def survival_rate(self) -> float:
@@ -85,15 +89,26 @@ class SamplingResult:
     per_category: list[CategoryResult] = field(default_factory=list)
     budget_exhausted: bool = False
     elapsed_ms: float = 0.0
+    total_equivalent: int = 0
+    universe_size: int = 0
 
     def to_dict(self) -> dict:
+        effective_total = self.total_mutants - self.total_equivalent
+        effective_kill_pct = (
+            round(100 * self.total_killed / effective_total)
+            if effective_total > 0
+            else 100
+        )
         return {
             "function_key": self.function_key,
             "categories_tested": self.categories_tested,
             "total_mutants": self.total_mutants,
             "total_killed": self.total_killed,
             "total_survived": self.total_survived,
+            "total_equivalent": self.total_equivalent,
+            "universe_size": self.universe_size,
             "survival_rate": round(self.survival_rate, 3),
+            "effective_kill_pct": effective_kill_pct,
             "coverage_depth": self.coverage_depth,
             "budget_exhausted": self.budget_exhausted,
             "elapsed_ms": round(self.elapsed_ms, 1),
@@ -103,6 +118,7 @@ class SamplingResult:
                     "total": cr.total,
                     "killed": cr.killed,
                     "survived": cr.survived,
+                    "equivalent": cr.equivalent,
                     "survival_rate": round(cr.survival_rate, 3),
                 }
                 for cr in self.per_category
@@ -128,15 +144,26 @@ class ProfilingResult:
     killed_records: list[dict] = field(default_factory=list)
     budget_exhausted: bool = False
     elapsed_ms: float = 0.0
+    total_equivalent: int = 0
+    universe_size: int = 0
 
     def to_dict(self) -> dict:
+        effective_total = self.total_mutants - self.total_equivalent
+        effective_kill_pct = (
+            round(100 * self.total_killed / effective_total)
+            if effective_total > 0
+            else 100
+        )
         d = {
             "function_key": self.function_key,
             "categories_tested": self.categories_tested,
             "total_mutants": self.total_mutants,
             "total_killed": self.total_killed,
             "total_survived": self.total_survived,
+            "total_equivalent": self.total_equivalent,
+            "universe_size": self.universe_size,
             "survival_rate": round(self.survival_rate, 3),
+            "effective_kill_pct": effective_kill_pct,
             "coverage_depth": self.coverage_depth,
             "is_gateable": self.is_gateable,
             "budget_exhausted": self.budget_exhausted,
@@ -147,6 +174,7 @@ class ProfilingResult:
                     "total": cr.total,
                     "killed": cr.killed,
                     "survived": cr.survived,
+                    "equivalent": cr.equivalent,
                     "killed_by_assertion": cr.killed_by_assertion,
                     "killed_by_crash": cr.killed_by_crash,
                     "survival_rate": round(cr.survival_rate, 3),
@@ -236,6 +264,8 @@ class _BoundaryMutator(_BaseMutator):
         ast.LtE: ast.Lt,
         ast.Gt: ast.GtE,
         ast.GtE: ast.Gt,
+        ast.Eq: ast.NotEq,
+        ast.NotEq: ast.Eq,
     }
 
     def visit_Compare(self, node: ast.Compare) -> ast.AST:
@@ -314,6 +344,79 @@ class _TypeMutator(_BaseMutator):
             if self.current == self.target:
                 self.applied = True
                 return ast.Constant(value=True)
+            self.current += 1
+        return self.generic_visit(node)
+
+
+class _ArithmeticMutator(_BaseMutator):
+    """Replace arithmetic operators: + ↔ -, * ↔ /, // → /, % → *, ** → *.
+
+    Also removes unary negation (-x → x). Covers AOR and UOI from the
+    DeMillo/Lipton/Sayward operator set.
+    """
+
+    _BIN_SWAP: dict[type, type] = {
+        ast.Add: ast.Sub,
+        ast.Sub: ast.Add,
+        ast.Mult: ast.Div,
+        ast.Div: ast.Mult,
+        ast.FloorDiv: ast.Div,
+        ast.Mod: ast.Mult,
+        ast.Pow: ast.Mult,
+    }
+
+    def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+        if self.applied:
+            return self.generic_visit(node)
+        swapped = self._BIN_SWAP.get(type(node.op))
+        if swapped:
+            if self.current == self.target:
+                self.applied = True
+                node.op = swapped()
+            self.current += 1
+        return self.generic_visit(node)
+
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.AST:
+        if self.applied:
+            return self.generic_visit(node)
+        if isinstance(node.op, ast.USub):
+            if self.current == self.target:
+                self.applied = True
+                return self.generic_visit(node.operand)
+            self.current += 1
+        return self.generic_visit(node)
+
+
+class _LogicalMutator(_BaseMutator):
+    """Replace logical operators: and ↔ or; remove not.
+
+    Covers COR (Conditional Operator Replacement) from the standard
+    mutation operator set.
+    """
+
+    _BOOL_SWAP: dict[type, type] = {
+        ast.And: ast.Or,
+        ast.Or: ast.And,
+    }
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> ast.AST:
+        if self.applied:
+            return self.generic_visit(node)
+        swapped = self._BOOL_SWAP.get(type(node.op))
+        if swapped:
+            if self.current == self.target:
+                self.applied = True
+                node.op = swapped()
+            self.current += 1
+        return self.generic_visit(node)
+
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.AST:
+        if self.applied:
+            return self.generic_visit(node)
+        if isinstance(node.op, ast.Not):
+            if self.current == self.target:
+                self.applied = True
+                return self.generic_visit(node.operand)
             self.current += 1
         return self.generic_visit(node)
 
@@ -417,12 +520,32 @@ def _count_type_target(node: ast.AST) -> int:
     )
 
 
+def _count_arithmetic_target(node: ast.AST) -> int:
+    """Count arithmetic mutation targets (BinOp + unary negation)."""
+    if isinstance(node, ast.BinOp) and type(node.op) in _ArithmeticMutator._BIN_SWAP:
+        return 1
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return 1
+    return 0
+
+
+def _count_logical_target(node: ast.AST) -> int:
+    """Count logical mutation targets (BoolOp + not removal)."""
+    if isinstance(node, ast.BoolOp) and type(node.op) in _LogicalMutator._BOOL_SWAP:
+        return 1
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return 1
+    return 0
+
+
 _TARGET_COUNTERS: dict[MutationCategory, Callable[[ast.AST], int]] = {
     MutationCategory.VALUE: _count_value_target,
     MutationCategory.BOUNDARY: _count_boundary_target,
     MutationCategory.SWAP: _count_swap_target,
     MutationCategory.STATE: _count_state_target,
     MutationCategory.TYPE: _count_type_target,
+    MutationCategory.ARITHMETIC: _count_arithmetic_target,
+    MutationCategory.LOGICAL: _count_logical_target,
 }
 
 
@@ -559,6 +682,10 @@ def _make_transformer(
         return _StateMutator(index, "remove_assign"), "remove state assignment"
     if category == MutationCategory.TYPE:
         return _TypeMutator(index), "replace isinstance with True"
+    if category == MutationCategory.ARITHMETIC:
+        return _ArithmeticMutator(index), "replace arithmetic operator"
+    if category == MutationCategory.LOGICAL:
+        return _LogicalMutator(index), "replace logical operator"
     msg = f"Unknown category: {category}"
     raise ValueError(msg)
 
@@ -1130,6 +1257,253 @@ def run_function_profiling(
         kill_matrix=kill_matrix,
         survivor_records=survivor_records,
         killed_records=killed_records,
+        budget_exhausted=budget_exhausted,
+        elapsed_ms=_elapsed(start),
+    )
+
+
+# ── Universe Estimation ──────────────────────────────────────────
+
+
+def estimate_universe_size(
+    func_node: ast.FunctionDef,
+    categories: set[MutationCategory],
+) -> int:
+    """Count total possible mutation targets without generating mutants.
+
+    Cheap (AST walk only, no compilation or test execution). Used to
+    report sampling coverage: tested/killed out of universe_size.
+    """
+    return sum(_count_targets(func_node, cat) for cat in categories)
+
+
+# ── Equivalence Detection ────────────────────────────────────────
+
+
+def _generate_boundary_inputs(
+    func_node: ast.FunctionDef,
+) -> list[tuple]:
+    """Generate boundary test inputs based on parameter count.
+
+    Uses a fixed set of boundary values: 0, 1, -1, 0.5, True, False, "", "x".
+    For multi-param functions, generates combinations of the first few values.
+    """
+    n_params = len(func_node.args.args)
+    # Skip 'self'/'cls' parameter — can't provide meaningful instance
+    if n_params > 0 and func_node.args.args[0].arg in ("self", "cls"):
+        n_params -= 1
+
+    if n_params == 0:
+        return [()]
+
+    int_vals = [0, 1, -1, 2, -2]
+    float_vals = [0.0, 1.0, -1.0, 0.5]
+    bool_vals = [True, False]
+
+    if n_params == 1:
+        return [(v,) for v in int_vals + float_vals + bool_vals]
+
+    if n_params == 2:
+        inputs = []
+        for a in int_vals[:3] + float_vals[:2]:
+            for b in int_vals[:3] + float_vals[:2]:
+                inputs.append((a, b))
+        return inputs[:25]
+
+    base = int_vals[:3] + float_vals[:2]
+    return [tuple(base[i % len(base)] for _ in range(n_params)) for i in range(5)]
+
+
+def check_equivalent(
+    func_node: ast.FunctionDef,
+    mutant: Mutant,
+) -> bool:
+    """Check if a surviving mutant is semantically equivalent.
+
+    Compiles both original and mutated functions, runs them on boundary
+    inputs, and compares outputs. If all outputs match, the mutant is
+    likely equivalent — no test can distinguish them.
+
+    Skips methods (self/cls parameter) since we cannot synthesize a
+    meaningful instance for boundary testing.
+    """
+    # Methods: can't provide meaningful self — skip equivalence check
+    if (
+        func_node.args.args
+        and func_node.args.args[0].arg in ("self", "cls")
+    ):
+        return False
+
+    try:
+        orig_mod = ast.Module(body=[func_node], type_ignores=[])  # type: ignore[list-item]
+        ast.fix_missing_locations(orig_mod)
+        orig_code = compile(orig_mod, "<original>", "exec")
+        orig_ns: dict[str, Any] = {}
+        exec(orig_code, orig_ns)  # noqa: S102
+
+        mut_mod = ast.Module(body=[mutant.mutated_node], type_ignores=[])  # type: ignore[list-item]
+        ast.fix_missing_locations(mut_mod)
+        mut_code = compile(mut_mod, "<mutant>", "exec")
+        mut_ns: dict[str, Any] = {}
+        exec(mut_code, mut_ns)  # noqa: S102
+
+        func_name = func_node.name
+        orig_fn = orig_ns.get(func_name)
+        mut_fn = mut_ns.get(func_name)
+
+        if orig_fn is None or mut_fn is None:
+            return False
+
+        boundary_inputs = _generate_boundary_inputs(func_node)
+        successful_comparisons = 0
+
+        for args in boundary_inputs:
+            orig_exc = mut_exc = None
+            orig_result = mut_result = None
+            try:
+                orig_result = orig_fn(*args)
+            except Exception as e:
+                orig_exc = e
+            try:
+                mut_result = mut_fn(*args)
+            except Exception as e:
+                mut_exc = e
+
+            # One raises and the other doesn't → NOT equivalent
+            if (orig_exc is None) != (mut_exc is None):
+                return False
+            # Both returned values → compare
+            if orig_exc is None:
+                if orig_result != mut_result:
+                    return False
+                successful_comparisons += 1
+            # Both raised → check exception type matches
+            elif type(orig_exc) is not type(mut_exc):
+                return False
+
+        # Only declare equivalent if we got at least one real comparison.
+        # If ALL inputs raised, we have no evidence of equivalence.
+        return successful_comparisons > 0
+
+    except Exception:
+        return False
+
+
+# ── Multi-Pass Convergence ───────────────────────────────────────
+
+
+def run_function_converged(
+    func_node: ast.FunctionDef,
+    func_key: str,
+    categories: set[MutationCategory],
+    test_functions: list[Callable[..., None]],
+    original_func: Callable[..., Any] | None,  # kept for API symmetry
+    budget_ms: float = 5000,
+    max_per_category: int = 5,
+    per_mutant_timeout_ms: float = 500,
+    passes: int = 3,
+) -> SamplingResult:
+    """Multi-pass convergence with integrated equivalence detection.
+
+    Each pass uses a different seed, so ``max_per_category`` mutants are
+    sampled from a different subset of each category's target space.
+    Across N passes, tests up to N × max_per_category unique mutants per
+    category. Surviving mutants are checked for semantic equivalence via
+    boundary input evaluation.
+
+    The probability of missing a real survivor after K passes is
+    ``(1 - k/n)^K`` where k=max_per_category and n=targets_in_category.
+    With passes=3 and max_per_category=5, a category with 20 targets has
+    P(miss) ≈ 0.24. With passes=5, P(miss) ≈ 0.07.
+
+    Coverage depth:
+      - "profiled" if all possible mutants were tested
+      - "converged" if passes > 1
+      - "sampled" otherwise
+    """
+    start = time.monotonic()
+    universe = estimate_universe_size(func_node, categories)
+    qualname = (
+        func_key.split("::", 1)[1]
+        if "::" in func_key
+        else getattr(func_node, "name", None)
+    )
+
+    seen: dict[str, MutantResult] = {}
+
+    for seed in range(passes):
+        if _elapsed(start) > budget_ms:
+            break
+        mutants = generate_mutants(
+            func_node, categories, max_per_category=max_per_category, seed=seed,
+        )
+        for mutant in mutants:
+            if mutant.mutant_id in seen:
+                continue
+            if _elapsed(start) > budget_ms:
+                break
+
+            result = evaluate_mutant(
+                mutant, test_functions, original_func,  # type: ignore[arg-type]
+                timeout_ms=per_mutant_timeout_ms, qualname=qualname,
+            )
+
+            # Integrated equivalence: check survivors immediately
+            if not result.killed:
+                if check_equivalent(func_node, mutant):
+                    result = MutantResult(
+                        mutant=mutant, killed=False, equivalent=True,
+                        elapsed_ms=result.elapsed_ms,
+                    )
+
+            seen[mutant.mutant_id] = result
+
+    # Aggregate by category
+    results_by_cat: dict[MutationCategory, CategoryResult] = {}
+    for result in seen.values():
+        cat = result.mutant.category
+        cr = results_by_cat.setdefault(cat, CategoryResult(category=cat))
+        cr.total += 1
+        if result.killed:
+            cr.killed += 1
+            if result.killed_by == "assertion":
+                cr.killed_by_assertion += 1
+            elif result.killed_by == "crash":
+                cr.killed_by_crash += 1
+            elif result.killed_by == "timeout":
+                cr.timed_out += 1
+        elif result.equivalent:
+            cr.equivalent += 1
+            cr.survived += 1
+        else:
+            cr.survived += 1
+
+    per_cat = list(results_by_cat.values())
+    total = sum(cr.total for cr in per_cat)
+    killed = sum(cr.killed for cr in per_cat)
+    equiv = sum(cr.equivalent for cr in per_cat)
+    survived = total - killed
+    budget_exhausted = _elapsed(start) > budget_ms
+
+    # Determine coverage depth
+    if total >= universe > 0:
+        depth = "profiled"
+    elif passes > 1:
+        depth = "converged"
+    else:
+        depth = "sampled"
+
+    return SamplingResult(
+        function_key=func_key,
+        categories_tested=len(per_cat),
+        total_mutants=total,
+        total_killed=killed,
+        total_survived=survived,
+        total_equivalent=equiv,
+        universe_size=universe,
+        survival_rate=survived / total if total > 0 else 0.0,
+        coverage_depth=depth,
+        per_category=per_cat,
         budget_exhausted=budget_exhausted,
         elapsed_ms=_elapsed(start),
     )

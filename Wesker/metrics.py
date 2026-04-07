@@ -53,12 +53,16 @@ def _load_config() -> dict:
         exclude: list[str] — files to exclude from mutation profiling
         mcdc_targets: list[list[str]] — [[file, function], ...] for MC/DC
         project_name: str — display name (defaults to pyproject.toml [project].name)
+        max_per_category: int — mutants per category per pass (default 5)
+        convergence_passes: int — number of convergence passes (default 3)
     """
     config: dict = {
         "source_dir": "",
         "exclude": [],
         "mcdc_targets": [],
         "project_name": "Project",
+        "max_per_category": 5,
+        "convergence_passes": 3,
     }
 
     pyproject = Path("pyproject.toml")
@@ -91,6 +95,8 @@ def _load_config() -> dict:
         config["mcdc_targets"] = [
             tuple(t) for t in wesker.get("mcdc_targets", [])
         ]
+        config["max_per_category"] = wesker.get("max_per_category", config["max_per_category"])
+        config["convergence_passes"] = wesker.get("convergence_passes", config["convergence_passes"])
         if config["source_dir"]:
             return config
 
@@ -378,14 +384,27 @@ def main():
     targets = _discover_targets(config)
     print(f"\nTargets: {len(targets)} files")
 
-    # 1. Mutation profiling (in-process, via Wesker engine)
-    print("\n[1/4] Running in-process mutation profiling...")
-    mutation = profile_codebase(".", targets, budget_ms_per_file=15000, max_per_category=3)
+    # 1. Mutation profiling (in-process, multi-pass convergence)
+    passes = config.get("convergence_passes", 3)
+    max_per_cat = config.get("max_per_category", 5)
+    print(f"\n[1/4] Running in-process mutation profiling ({passes} passes, {max_per_cat}/cat)...")
+    mutation = profile_codebase(
+        ".", targets,
+        budget_ms_per_file=15000,
+        max_per_category=max_per_cat,
+        passes=passes,
+    )
+    equiv = mutation.get("total_equivalent", 0)
+    universe = mutation.get("total_universe", 0)
+    equiv_note = f" ({equiv} equivalent)" if equiv else ""
+    coverage_note = f" [{mutation['total_mutants']}/{universe} sampled]" if universe > mutation['total_mutants'] else ""
     print(f"  Mutation: {mutation['total_killed']}/{mutation['total_mutants']} "
-          f"({mutation['kill_pct']}%) across {mutation['total_functions']} functions")
+          f"({mutation['kill_pct']}%) across {mutation['total_functions']} functions"
+          f"{equiv_note}{coverage_note}")
     for f, d in sorted(mutation["per_file"].items()):
         status = "OK" if d["kill_pct"] == 100 else f"{d['kill_pct']}%"
-        print(f"    {f}: {d['killed']}/{d['total']} ({status})")
+        file_note = f" [{d['total']}/{d.get('universe', d['total'])}]" if d.get("universe", 0) > d["total"] else ""
+        print(f"    {f}: {d['killed']}/{d['total']} ({status}){file_note}")
 
     # 2. MC/DC verification
     mcdc_targets = config.get("mcdc_targets", [])
@@ -412,7 +431,10 @@ def main():
     metrics = {
         "MUTATION_KILLED": mutation["total_killed"],
         "MUTATION_TOTAL": mutation["total_mutants"],
+        "MUTATION_EQUIVALENT": mutation.get("total_equivalent", 0),
+        "MUTATION_UNIVERSE": mutation.get("total_universe", 0),
         "MUTATION_KILL_PCT": mutation["kill_pct"],
+        "MUTATION_PASSES": mutation.get("passes", 1),
         "MEAN_SIGMA": mean_sigma,
         "TEST_COUNT": test_count,
         "SOURCE_LOC": source_loc,
@@ -425,7 +447,8 @@ def main():
     }
 
     print(f"\n{'=' * 60}")
-    print(f"Mutation: {mutation['total_killed']}/{mutation['total_mutants']} ({mutation['kill_pct']}%)")
+    print(f"Mutation: {mutation['total_killed']}/{mutation['total_mutants']} "
+          f"({mutation['kill_pct']}%){equiv_note}{coverage_note}")
     print(f"MC/DC: {mcdc_status} — {mcdc_detail}")
     print(f"Mean sigma: {mean_sigma} across {func_count} functions")
     print(f"Tests: {test_count} | Source: {source_loc} LOC | Ratio: 1:{ratio}")

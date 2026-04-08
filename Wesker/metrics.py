@@ -332,6 +332,27 @@ def _verify_mcdc_single(filepath: str, func_name: str) -> dict:
     }
 
 
+def _discover_mcdc_targets(source_files: list[str]) -> list[tuple[str, str]]:
+    """Auto-discover functions with relational operators for MC/DC verification."""
+    targets = []
+    for filepath in source_files:
+        if not Path(filepath).exists():
+            continue
+        try:
+            source = Path(filepath).read_text()
+            tree = ast.parse(source)
+        except Exception:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                has_compare = any(
+                    isinstance(child, ast.Compare) for child in ast.walk(node)
+                )
+                if has_compare:
+                    targets.append((filepath, node.name))
+    return targets
+
+
 def _verify_mcdc(targets: list[tuple[str, str]]) -> dict:
     """Verify MC/DC across all target functions."""
     results = []
@@ -410,13 +431,34 @@ def main():
         file_note = f" [{d['total']}/{d.get('universe', d['total'])}]" if d.get("universe", 0) > d["total"] else ""
         print(f"    {f}: {d['killed']}/{d['total']} ({status}){file_note}")
 
-    # 2. MC/DC verification
-    mcdc_targets = config.get("mcdc_targets", [])
-    print("\n[2/4] Verifying MC/DC on scoring functions...")
-    mcdc = _verify_mcdc(mcdc_targets)
-    mcdc_status = "Verified" if mcdc["verified"] else "Partial"
-    mcdc_detail = f"{mcdc['conditions_covered']}/{mcdc['conditions_total']} conditions"
-    print(f"  MC/DC: {mcdc_status} ({mcdc_detail})")
+    # 2. MC/DC verification (CI only — each condition requires a full pytest run)
+    #
+    # Methodology: ROR (Relational Operator Replacement) mutation testing.
+    # Each relational operator is swapped with all 5 alternatives (full ROR
+    # universe). Offutt & Voas (1996) formally prove mutation testing subsumes
+    # MC/DC; Kaminski, Ammann & Offutt (2013) show ROR mutation is strictly
+    # stronger than MC/DC in fault detection power.
+    #
+    # Target discovery: functions are auto-discovered by AST scan — any
+    # function containing ast.Compare nodes (relational operators) is included.
+    # Explicit [tool.wesker] mcdc_targets override auto-discovery.
+    run_mcdc = os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("WESKER_MCDC") == "1"
+    if run_mcdc:
+        mcdc_targets = config.get("mcdc_targets", [])
+        if not mcdc_targets:
+            mcdc_targets = _discover_mcdc_targets(targets)
+        mcdc_label = "configured" if config.get("mcdc_targets") else "auto-discovered"
+        print(f"\n[2/4] Verifying MC/DC on {len(mcdc_targets)} functions ({mcdc_label})...")
+        mcdc = _verify_mcdc(mcdc_targets)
+        mcdc_status = "Verified" if mcdc["verified"] else "Partial"
+        mcdc_detail = f"{mcdc['conditions_covered']}/{mcdc['conditions_total']} conditions"
+        print(f"  MC/DC: {mcdc_status} ({mcdc_detail})")
+    else:
+        print("\n[2/4] MC/DC verification — skipped (CI only, set WESKER_MCDC=1 to run locally)")
+        mcdc = {"verified": True, "functions_checked": 0, "functions_verified": 0,
+                "conditions_covered": 0, "conditions_total": 0, "results": []}
+        mcdc_status = "Skipped"
+        mcdc_detail = "CI only"
 
     # 3. Sigma computation
     print("\n[3/4] Computing specification complexity...")

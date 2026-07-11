@@ -356,18 +356,22 @@ def _make_owner() -> _OwnerFixture:
 def test_patch_module_qualified_patches_class_method_owner():
     from Wesker.engine import _patch_module_qualified
 
-    def mutant(self):        # the VALUE mutant: flip the return
+    def mutant(self):  # the VALUE mutant: flip the return
         return False
 
     assert _make_owner().flag() is True
-    saved = _patch_module_qualified("flag", mutant, __file__, qualname="_OwnerFixture.flag")
+    saved = _patch_module_qualified(
+        "flag", mutant, __file__, qualname="_OwnerFixture.flag"
+    )
     try:
         assert saved, "owner class was not resolved/patched"
-        assert _make_owner().flag() is False   # mutant on the class -> instance dispatch hits it (killable)
+        assert (
+            _make_owner().flag() is False
+        )  # mutant on the class -> instance dispatch hits it (killable)
     finally:
         for owner, orig in saved:
             setattr(owner, "flag", orig)
-    assert _make_owner().flag() is True          # cleanly restored
+    assert _make_owner().flag() is True  # cleanly restored
 
 
 def test_patch_module_qualified_skips_inherited_method():
@@ -377,7 +381,9 @@ def test_patch_module_qualified_skips_inherited_method():
     def mutant(self):
         return False
 
-    saved = _patch_module_qualified("flag", mutant, __file__, qualname="_SubNoOverride.flag")
-    for owner, orig in saved:                    # cleanup if anything was (wrongly) patched
+    saved = _patch_module_qualified(
+        "flag", mutant, __file__, qualname="_SubNoOverride.flag"
+    )
+    for owner, orig in saved:  # cleanup if anything was (wrongly) patched
         setattr(owner, "flag", orig)
-    assert saved == []                            # nothing defines _SubNoOverride.flag directly
+    assert saved == []  # nothing defines _SubNoOverride.flag directly

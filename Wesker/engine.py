@@ -55,7 +55,9 @@ class MutantResult:
     test_name: str | None = None  # first killing test (first-killer mode)
     elapsed_ms: float = 0.0
     equivalent: bool = False
-    killed_by_tests: list[str] = field(default_factory=list)  # all killers (full-matrix mode)
+    killed_by_tests: list[str] = field(
+        default_factory=list
+    )  # all killers (full-matrix mode)
 
 
 @dataclass
@@ -1084,7 +1086,9 @@ def _patch_module_qualified(
                     owner = getattr(owner, part)
             except Exception:
                 continue
-            if not isinstance(owner, type) or method not in getattr(owner, "__dict__", {}):
+            if not isinstance(owner, type) or method not in getattr(
+                owner, "__dict__", {}
+            ):
                 continue
             existing = _get_raw_attr(owner, method)
             code = getattr(_unwrap_descriptor(existing), "__code__", None)
@@ -1092,7 +1096,9 @@ def _patch_module_qualified(
                 continue
             try:
                 if os.path.abspath(code.co_filename) == src_abs:
-                    setattr(owner, method, _preserve_descriptor_shape(existing, mutated_obj))
+                    setattr(
+                        owner, method, _preserve_descriptor_shape(existing, mutated_obj)
+                    )
                     saved.append((owner, existing))
             except Exception:
                 continue
@@ -1371,7 +1377,9 @@ def evaluate_mutant(
     # the mutant — not only tests that call a bare imported name. Restored in the
     # finally regardless of how the loop exits. No-op when source_path is absent,
     # so existing callers/output are unchanged.
-    module_saved = _patch_module_qualified(func_name, mutated_obj, source_path, qualname)
+    module_saved = _patch_module_qualified(
+        func_name, mutated_obj, source_path, qualname
+    )
     try:
         # Run tests against mutated function
         killers: list[str] = []

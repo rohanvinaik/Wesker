@@ -1,5 +1,5 @@
-<svg width="228.9" height="20" viewBox="0 0 2289 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Mutation Sampling: 967/1183 (81.7%)">
-  <title>Mutation Sampling: 967/1183 (81.7%)</title>
+<svg width="228.9" height="20" viewBox="0 0 2289 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Mutation Sampling: 969/1187 (81.6%)">
+  <title>Mutation Sampling: 969/1187 (81.6%)</title>
   <linearGradient id="a" x2="0" y2="100%">
     <stop offset="0" stop-opacity=".1" stop-color="#EEE"/>
     <stop offset="1" stop-opacity=".1"/>
@@ -13,8 +13,8 @@
   <g aria-hidden="true" fill="#fff" text-anchor="start" font-family="Verdana,DejaVu Sans,sans-serif" font-size="110">
     <text x="60" y="148" textLength="1040" fill="#000" opacity="0.25">Mutation Sampling</text>
     <text x="50" y="138" textLength="1040">Mutation Sampling</text>
-    <text x="1195" y="148" textLength="1049" fill="#000" opacity="0.25">967/1183 (81.7%)</text>
-    <text x="1185" y="138" textLength="1049">967/1183 (81.7%)</text>
+    <text x="1195" y="148" textLength="1049" fill="#000" opacity="0.25">969/1187 (81.6%)</text>
+    <text x="1185" y="138" textLength="1049">969/1187 (81.6%)</text>
   </g>
   
 </svg>

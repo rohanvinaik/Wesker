@@ -70,6 +70,9 @@ _REWRITES: tuple[tuple[re.Pattern[str], str], ...] = (
 def rewrite_source(source: str) -> str:
     """Point a module's intra-package imports at the private copy.
 
+    Idempotent: a rewritten line has no `Wesker.` prefix left to match, so re-running is a
+    no-op rather than a corruption.
+
     ``from Wesker.engine import X`` -> ``from _wesker_self.engine import X``. Only absolute
     intra-package imports are touched; relative imports already resolve against the importing
     module's package, which for the private copy IS the private package, so they need nothing.

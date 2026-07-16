@@ -56,6 +56,10 @@ jobs:
       # Same colour rule as the full badge: grey below 80. This measures something almost no
       # suite scores well on, and a badge that scolds most projects is not one anyone installs
       # twice.
+      - name: Create badges directory
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        run: mkdir -p .github/badges
+
       - name: Diff specification badge
         if: github.event.pull_request.head.repo.full_name == github.repository
         uses: emibcn/badge-action@v2.0.2

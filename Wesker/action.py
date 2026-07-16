@@ -66,6 +66,12 @@ def changed_files(base_ref: str, project_root: str = ".") -> list[str] | None:
     honestly means "this PR changed no Python". The caller must not silently treat the first
     as the second: "I could not tell what changed" and "nothing changed" imply opposite actions.
     """
+    # A ref may not begin with '-': git forbids it, and argv does not distinguish a ref from a
+    # flag. Without this, `--base-ref=--upload-pack=...` reaches git as an OPTION rather than a
+    # revision. There is no shell here (subprocess takes a list), so this is argument
+    # injection, not command injection — but the fix is the same and it costs one comparison.
+    if base_ref.startswith("-"):
+        return None
     out = _git(["diff", "--name-only", f"{base_ref}...HEAD"], project_root)
     if out is None:
         out = _git(["diff", "--name-only", base_ref], project_root)
@@ -383,7 +389,14 @@ def main(argv: list[str] | None = None) -> int:
     Path(".wesker").mkdir(exist_ok=True)
     Path(".wesker/mutation_report.json").write_text(json.dumps(report, indent=2))
     if args.sarif:
+        # Kept inside the workspace. `--sarif` names an output file, and an output file that
+        # can be `../../../anywhere` is a path-traversal write with `parents=True` behind it —
+        # this runs on a CI runner with a checkout and a token, so "the caller chose the path"
+        # is not a reason to skip the check.
         sarif_path = Path(args.sarif)
+        workspace = Path.cwd().resolve()
+        if not sarif_path.resolve().is_relative_to(workspace):
+            return _fail(f"--sarif must stay inside the workspace: {args.sarif}")
         sarif_path.parent.mkdir(parents=True, exist_ok=True)
         sarif_path.write_text(
             json.dumps(to_sarif(report, version=_version()), indent=2)

@@ -10,11 +10,13 @@ by an integration smoke test rather than pinned mutant-by-mutant.
 from __future__ import annotations
 
 import ast
+import os
 import textwrap
 
 import Wesker.ci as ci
 from Wesker.ci import (
     _build_static_impact_map,
+    callable_origin,
     _discover_all_test_files,
     _discover_by_convention,
     _load_cached_state,
@@ -230,3 +232,42 @@ def test_load_cached_state_corrupt_is_none(tmp_path):
     wdir.mkdir()
     (wdir / "mutation_report.json").write_text("{ not json")
     assert _load_cached_state(str(tmp_path)) is None
+
+
+# ── callable_origin: the one origin contract for every callable shape ──
+
+
+def test_callable_origin_resolution_order():
+    """Tag outranks __wrapped__ outranks the raw code object; nothing → None.
+
+    Module-level import on purpose: a function-local `from Wesker.ci import
+    callable_origin` binds at call time straight from the module, so mutant
+    patching (which installs into the TEST module's globals) never reaches it
+    and every mutant of this function reads as an unkillable survivor.
+    """
+
+    def real():  # pragma: no cover — a value, never called
+        pass
+
+    real_origin = os.path.abspath(real.__code__.co_filename)
+
+    def tagged():  # pragma: no cover
+        pass
+
+    tagged.__wesker_origin__ = "/somewhere/test_tagged.py"
+    tagged.__wrapped__ = real
+    # The tag wins even with __wrapped__ present.
+    assert callable_origin(tagged) == "/somewhere/test_tagged.py"
+
+    def wrapper():  # pragma: no cover
+        pass
+
+    wrapper.__wrapped__ = real
+    # __wrapped__ wins over the wrapper's own code object.
+    assert callable_origin(wrapper) == real_origin
+
+    # A plain function falls through to its code object.
+    assert callable_origin(real) == real_origin
+
+    # Nothing to read — no tag, no wrap, no code — resolves to None, not a crash.
+    assert callable_origin(1) is None

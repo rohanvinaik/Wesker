@@ -724,7 +724,11 @@ class _SwapMutator(_BaseMutator):
 
 
 class _StateMutator(_BaseMutator):
-    """Remove self.x = ... assignments or replace return with return None."""
+    """Remove self.x = ... assignments, replace return with return None, or
+    swap break ↔ continue (loop_flow mode) — "leave the loop" and "skip this
+    iteration" are one keyword apart and a classic transposition bug; no other
+    operator can express it (SDL deletes the statement, which crashes nothing
+    and reads as unreachable-code noise instead of the control-flow question)."""
 
     def __init__(self, target_index: int = 0, mode: str = "remove_assign"):
         super().__init__(target_index)
@@ -755,6 +759,26 @@ class _StateMutator(_BaseMutator):
                 return ast.Return(value=ast.Constant(value=None))
             self._note("STATE:return_none")
             self.current += 1
+        return node
+
+    def visit_Break(self, node: ast.Break) -> ast.AST:
+        if self.applied or self.mode != "loop_flow":
+            return node
+        if self.current == self.target:
+            self._mark_applied(node)
+            return ast.Continue()
+        self._note("STATE:loop_flow:break")
+        self.current += 1
+        return node
+
+    def visit_Continue(self, node: ast.Continue) -> ast.AST:
+        if self.applied or self.mode != "loop_flow":
+            return node
+        if self.current == self.target:
+            self._mark_applied(node)
+            return ast.Break()
+        self._note("STATE:loop_flow:continue")
+        self.current += 1
         return node
 
 
@@ -1306,8 +1330,17 @@ def _count_state_return_target(node: ast.AST) -> int:
     return 0
 
 
+def _count_state_loop_target(node: ast.AST) -> int:
+    """Count break/continue statements (loop_flow mode)."""
+    return 1 if isinstance(node, (ast.Break, ast.Continue)) else 0
+
+
 def _count_state_target(node: ast.AST) -> int:
-    return _count_state_assign_target(node) + _count_state_return_target(node)
+    return (
+        _count_state_assign_target(node)
+        + _count_state_return_target(node)
+        + _count_state_loop_target(node)
+    )
 
 
 def _count_type_target(node: ast.AST) -> int:
@@ -1399,11 +1432,12 @@ def _generate_state_mutants(
     greedy: bool = True,
     pass_index: int = 0,
 ) -> list[Mutant]:
-    """Generate STATE mutants across both sub-modes (assign + return).
+    """Generate STATE mutants across the sub-modes (assign + return + loop flow).
 
-    STATE has two independent sub-modes with separate target indices:
+    STATE has independent sub-modes with separate target indices:
     - remove_assign: replaces ``self.x = expr`` with ``pass``
     - return_none: replaces ``return expr`` with ``return None``
+    - loop_flow: swaps ``break`` ↔ ``continue``
 
     Each sub-mode gets its own target count and transformer pass so that
     target indices align correctly with what the transformer visits. Under
@@ -1418,6 +1452,7 @@ def _generate_state_mutants(
     sub_modes = [
         ("remove_assign", "remove state assignment", _count_state_assign_target),
         ("return_none", "replace return with None", _count_state_return_target),
+        ("loop_flow", "swap break/continue", _count_state_loop_target),
     ]
 
     for mode, desc, counter in sub_modes:
@@ -2176,7 +2211,7 @@ def dimension_budget(
     if category is MutationCategory.STATE:
         return sum(
             _live_dimension_count(_record_state_dimensions(func_node, mode))
-            for mode in ("remove_assign", "return_none")
+            for mode in ("remove_assign", "return_none", "loop_flow")
         )
     if category is MutationCategory.EXCEPTION:
         return sum(

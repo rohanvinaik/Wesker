@@ -586,3 +586,60 @@ def test_swap_second_pair_transposes_later_neighbors():
     p1 = next(m for m in muts if m.dimension.endswith("~p1"))
     f = _exec_mutant(p1)["f"]
     assert f(1, 2, 3) == "132"  # (b, c) transposed; (a, b) untouched
+
+
+# ── STATE loop_flow: break ↔ continue ────────────────────────────
+
+
+def test_state_loop_flow_swaps_break_to_continue():
+    func = _fn(
+        """
+        def f(xs):
+            total = 0
+            for x in xs:
+                if x < 0:
+                    break
+                total += x
+            return total
+        """
+    )
+    muts = generate_mutants(func, {MutationCategory.STATE}, max_per_category=0)
+    flow = next(m for m in muts if m.dimension == "STATE:loop_flow:break")
+    g = _exec_mutant(flow)["f"]
+    # Original stops at the first negative (returns 3); the mutant skips
+    # negatives and keeps summing.
+    assert g([1, 2, -1, 4]) == 7
+
+
+def test_state_loop_flow_swaps_continue_to_break():
+    func = _fn(
+        """
+        def f(xs):
+            total = 0
+            for x in xs:
+                if x < 0:
+                    continue
+                total += x
+            return total
+        """
+    )
+    muts = generate_mutants(func, {MutationCategory.STATE}, max_per_category=0)
+    flow = next(m for m in muts if m.dimension == "STATE:loop_flow:continue")
+    g = _exec_mutant(flow)["f"]
+    # Original skips the negative (returns 7); the mutant stops there.
+    assert g([1, 2, -1, 4]) == 3
+
+
+def test_state_loop_flow_count_aligns_with_record():
+    func = _fn(
+        """
+        def f(xs):
+            for x in xs:
+                if x:
+                    break
+                continue
+        """
+    )
+    keys = _record_state_dimensions(func, "loop_flow")
+    assert keys == ["STATE:loop_flow:break", "STATE:loop_flow:continue"]
+    assert _count_targets(func, MutationCategory.STATE) == 2  # no assigns/returns

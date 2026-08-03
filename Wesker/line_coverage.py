@@ -22,9 +22,43 @@ import io
 import sys
 import threading
 import time
+from types import CodeType
 from typing import Any, Callable
 
 from Wesker.interrupt import abandon
+
+
+def _traceable_lines(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> set[int] | None:
+    """Lines the compiled body can attribute an instruction to — ``co_lines`` union.
+
+    The AST extent of a statement sweeps in lines that carry no bytecode: a bare
+    ``else:`` or ``finally:`` (keyword-only lines with no AST node of their own),
+    and comment or closing-bracket lines inside a multi-line statement. CPython can
+    never emit a trace event for such a line, so leaving one in the denominator
+    manufactures a line-coverage gap NO test can ever close — the caller then asks
+    for input after input to reach a line that is not code. ``co_lines`` over the
+    compiled function (and its nested code objects) is exactly the set the tracer
+    can report, so intersecting with it removes every such phantom while keeping
+    all sub-expression and mutant fire-site lines, which do carry instructions.
+
+    Returns None when the body cannot compile standalone (e.g. ``nonlocal`` into
+    an enclosing scope) — the caller then keeps the unfiltered extent rather than
+    risk dropping real lines.
+    """
+    try:
+        module = ast.Module(body=[func_node], type_ignores=[])
+        top = compile(module, "<traceable-lines>", "exec")
+    except SyntaxError:
+        return None
+    lines: set[int] = set()
+    stack = [top]
+    while stack:
+        code = stack.pop()
+        stack.extend(c for c in code.co_consts if isinstance(c, CodeType))
+        lines.update(line for _, _, line in code.co_lines() if line is not None)
+    return lines
 
 
 def executable_lines(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[int]:
@@ -42,7 +76,10 @@ def executable_lines(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[i
     good the suite is. Spanning full statement extents keys the two together.
 
     The ``def`` line and a leading docstring are excluded: neither is behavior a
-    test can meaningfully "reach".
+    test can meaningfully "reach". The spanned extent is then intersected with
+    ``_traceable_lines`` so keyword-only lines (``else:``, ``finally:``) and other
+    bytecode-free lines inside an extent cannot enter the denominator: they would
+    read as a permanent, unclosable coverage gap.
     """
     body = list(func_node.body)
     if (
@@ -59,6 +96,9 @@ def executable_lines(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[i
                 continue
             end = getattr(descendant, "end_lineno", None) or start
             lines.update(range(start, end + 1))
+    traceable = _traceable_lines(func_node)
+    if traceable is not None:
+        lines &= traceable
     return lines
 
 

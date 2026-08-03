@@ -176,3 +176,61 @@ def test_scoped_and_unscoped_verdicts_agree():
         f"scoping changed the verdict: {unscoped.total_killed} killed unscoped vs "
         f"{scoped.total_killed} scoped — scoping is not verdict-exact"
     )
+
+
+BRANCHY_SRC = '''
+def g(x):
+    """doc"""
+    if x <= 2:
+        r = 1
+    elif x <= 10:
+        r = 2
+    else:
+        r = 3
+    return r
+'''
+
+
+def test_keyword_only_lines_excluded_from_denominator():
+    """A bare ``else:`` carries no bytecode, so no trace event can EVER mention it.
+
+    Regression cover for the inverse defect of the statement-start one above:
+    spanning full statement extents swept keyword-only lines (``else:``,
+    ``finally:``) into the denominator. ``_trace_one`` intersects traced hits
+    with the denominator, so such a line read as a permanent coverage gap no
+    test could ever close — and callers asked for input after input to reach a
+    line that is not code.
+    """
+    src = BRANCHY_SRC.strip()
+    node = _fn(src)
+    lines = executable_lines(node)
+    else_line = next(
+        i for i, text in enumerate(src.splitlines(), start=1) if text.strip() == "else:"
+    )
+    assert else_line not in lines, "keyword-only line inflates the denominator forever"
+    # The branch bodies on either side of the keyword ARE reachable behavior.
+    assert else_line - 1 in lines
+    assert else_line + 1 in lines
+
+
+def test_no_mutant_orphaned_by_traceability_filter():
+    """The co_lines intersection must not evict any mutant's fire-site line.
+
+    Same invariant as ``test_every_mutant_line_is_in_the_denominator``, asserted
+    against the branchy sample the filter actually prunes: soundness requires
+    pruning ONLY lines no mutant and no trace event can ever name.
+    """
+    from Wesker.engine import generate_mutants
+    from Wesker.filter import filter_categories
+
+    node = _fn(BRANCHY_SRC.strip())
+    cats = filter_categories(node)
+    lines = executable_lines(node)
+    mutants = generate_mutants(node, cats, max_per_category=0)
+    assert mutants, "expected mutants for this function"
+    orphans = [
+        (m.category.value, m.mutated_line)
+        for m in mutants
+        if m.mutated_line not in lines
+    ]
+    assert not orphans, f"mutants on lines outside the denominator: {orphans}"

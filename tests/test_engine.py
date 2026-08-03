@@ -21,7 +21,6 @@ import pytest
 from Wesker.engine import (
     _DEAD_DIM,
     MutationCategory,
-    _SwapMutator,
     _ValueMutator,
     _callee_name,
     _count_targets,
@@ -142,7 +141,13 @@ def test_record_dimensions_value_keys_by_python_type():
     keys = _record_dimensions(func, MutationCategory.VALUE, set())
     # bool checked before int; order follows AST/transformer traversal. Ints
     # carry the collapse and the off-by-one as adjacent dimensions.
-    assert keys == ["VALUE:int", "VALUE:int~off1", "VALUE:bool", "VALUE:float", "VALUE:str"]
+    assert keys == [
+        "VALUE:int",
+        "VALUE:int~off1",
+        "VALUE:bool",
+        "VALUE:float",
+        "VALUE:str",
+    ]
 
 
 def test_record_dimensions_unknown_category_is_empty():
@@ -643,3 +648,126 @@ def test_state_loop_flow_count_aligns_with_record():
     keys = _record_state_dimensions(func, "loop_flow")
     assert keys == ["STATE:loop_flow:break", "STATE:loop_flow:continue"]
     assert _count_targets(func, MutationCategory.STATE) == 2  # no assigns/returns
+
+
+# ── SWAP callee-dual dimension (issue #5): min↔max, any↔all, floor↔ceil ────
+
+
+def test_swap_dual_min_becomes_max():
+    func = _fn("def f(a, b):\n    return min(a, b)")
+    muts = generate_mutants(func, {MutationCategory.SWAP}, max_per_category=0)
+    dual = next(m for m in muts if m.dimension == "SWAP:min~dual")
+    f = _exec_mutant(dual)["f"]
+    assert f(1, 9) == 9  # the fold direction flipped; original returns 1
+
+
+def test_swap_dual_any_becomes_all():
+    """The wrong-fold-direction class no transposition can express: any(xs) and
+    all(xs) take identical arguments in every order."""
+    func = _fn("def f(xs):\n    return any(xs)")
+    muts = generate_mutants(func, {MutationCategory.SWAP}, max_per_category=0)
+    dual = next(m for m in muts if m.dimension == "SWAP:any~dual")
+    f = _exec_mutant(dual)["f"]
+    assert (
+        f([True, False]) is False
+    )  # some-but-not-all: the one input class that distinguishes
+
+
+def test_swap_dual_attribute_callee_keeps_its_module():
+    func = _fn("def f(x):\n    import math\n    return math.floor(x)")
+    muts = generate_mutants(func, {MutationCategory.SWAP}, max_per_category=0)
+    dual = next(m for m in muts if m.dimension == "SWAP:floor~dual")
+    f = _exec_mutant(dual)["f"]
+    assert f(1.2) == 2  # math.ceil — the module survived, only the attr flipped
+
+
+def test_swap_dual_absent_for_uncurated_callees():
+    """Every entry inflates every universe that calls it — the table is closed."""
+    func = _fn("def f(xs):\n    return sorted(xs)")
+    keys = _record_dimensions(func, MutationCategory.SWAP, set())
+    assert not any(k.endswith("~dual") for k in keys)
+
+
+def test_swap_dual_counts_align_with_generation():
+    """The single-source-of-truth guarantee: estimate and generation cannot drift."""
+    func = _fn("def f(a, b):\n    return min(a, b) + max(a, 0)")
+    from Wesker.engine import estimate_universe_size
+
+    est = estimate_universe_size(func, {MutationCategory.SWAP})
+    muts = generate_mutants(func, {MutationCategory.SWAP}, max_per_category=0)
+    assert len(muts) == est
+    assert sum(1 for m in muts if m.dimension.endswith("~dual")) == 2
+
+
+def test_swap_dual_skips_arbitrary_attribute_callees():
+    """`obj.floor(...)` is any object's method — a dual there asserts a duality the
+    code never promised. Only the literal `math.floor`/`math.ceil` qualifies."""
+    func = _fn("def f(obj, x):\n    return obj.floor(x)")
+    keys = _record_dimensions(func, MutationCategory.SWAP, set())
+    assert not any(k.endswith("~dual") for k in keys)
+
+
+def test_swap_dual_skips_shadowed_builtins():
+    """A parameter or local named `min` is the user's object, not the builtin."""
+    param = _fn("def f(min, a, b):\n    return min(a, b)")
+    assert not any(
+        k.endswith("~dual")
+        for k in _record_dimensions(param, MutationCategory.SWAP, set())
+    )
+    local = _fn("def f(a, b):\n    max = a\n    return max(a, b)")
+    assert not any(
+        k.endswith("~dual")
+        for k in _record_dimensions(local, MutationCategory.SWAP, set())
+    )
+
+
+def test_swap_dual_local_import_of_math_still_qualifies():
+    """`import math` binds the RESOLVED module — an import is not shadowing."""
+    func = _fn("def f(x):\n    import math\n    return math.ceil(x)")
+    keys = _record_dimensions(func, MutationCategory.SWAP, set())
+    assert "SWAP:ceil~dual" in keys
+
+
+def test_swap_dual_foreign_import_is_not_the_builtin():
+    """`from custom import min` has no established relationship to builtin max."""
+    func = _fn("def f(a, b):\n    from custom import min\n    return min(a, b)")
+    keys = _record_dimensions(func, MutationCategory.SWAP, set())
+    assert not any(k.endswith("~dual") for k in keys)
+
+
+def test_swap_dual_numpy_as_math_is_not_math():
+    """The literal spelling `math.floor` resolves to NumPy here — no dual."""
+    func = _fn("def f(x):\n    import numpy as math\n    return math.floor(x)")
+    keys = _record_dimensions(func, MutationCategory.SWAP, set())
+    assert not any(k.endswith("~dual") for k in keys)
+
+
+def test_swap_dual_nested_scope_param_does_not_shadow_outer():
+    """g's parameter `min` binds g's frame; the outer builtin keeps its dual."""
+    func = _fn(
+        "def f(a, b):\n    def g(min):\n        return min\n    return min(a, b)"
+    )
+    keys = _record_dimensions(func, MutationCategory.SWAP, set())
+    assert "SWAP:min~dual" in keys
+
+
+def test_swap_dual_math_alias_is_resolved():
+    """`import math as m; m.floor` IS math.floor — provenance, not spelling."""
+    func = _fn("def f(x):\n    import math as m\n    return m.floor(x)")
+    muts = generate_mutants(func, {MutationCategory.SWAP}, max_per_category=0)
+    dual = next(m for m in muts if m.dimension == "SWAP:floor~dual")
+    f = _exec_mutant(dual)["f"]
+    assert f(1.2) == 2  # m.ceil
+
+
+def test_swap_dual_from_math_import_floor_is_resolved():
+    func = _fn("def f(x):\n    from math import floor\n    return floor(x)")
+    keys = _record_dimensions(func, MutationCategory.SWAP, set())
+    assert "SWAP:floor~dual" in keys
+
+
+def test_swap_dual_bare_floor_without_import_abstains():
+    """`floor` is not a builtin; with no visible import it is unresolvable."""
+    func = _fn("def f(x):\n    return floor(x)")
+    keys = _record_dimensions(func, MutationCategory.SWAP, set())
+    assert not any(k.endswith("~dual") for k in keys)

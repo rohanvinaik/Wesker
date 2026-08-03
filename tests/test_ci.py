@@ -16,7 +16,11 @@ import textwrap
 import Wesker.ci as ci
 from Wesker.ci import (
     _build_static_impact_map,
+    callable_base_name,
+    callable_case_id,
+    callable_node_id,
     callable_origin,
+    callable_source,
     _discover_all_test_files,
     _discover_by_convention,
     _load_cached_state,
@@ -271,3 +275,98 @@ def test_callable_origin_resolution_order():
 
     # Nothing to read — no tag, no wrap, no code — resolves to None, not a crash.
     assert callable_origin(1) is None
+
+
+def test_callable_source_unwraps_once_and_passes_plain_through():
+    """The SOURCE accessor of DISCOVERED_CALLABLE_CONTRACT (issue #6): wrapper shapes
+    hand back the user's test via __wrapped__; a plain function is already the source.
+    Module-level import for the same mutant-patching reason as callable_origin's test."""
+
+    def real():  # pragma: no cover — a value, never called
+        pass
+
+    def wrapper():  # pragma: no cover
+        pass
+
+    wrapper.__wrapped__ = real
+    assert callable_source(wrapper) is real
+    assert callable_source(real) is real
+    assert (
+        callable_source(1) == 1
+    )  # a non-callable oddity passes through, never crashes
+
+
+def test_contract_is_the_single_reference():
+    """The contract doc exists, names every attribute it governs, and the accessors
+    reference it — the one place a new consumer is pointed at."""
+    from Wesker.ci import DISCOVERED_CALLABLE_CONTRACT
+
+    for attr in ("__name__", "__qualname__", "__wesker_origin__", "__wrapped__"):
+        assert attr in DISCOVERED_CALLABLE_CONTRACT
+    assert "callable_origin" in DISCOVERED_CALLABLE_CONTRACT
+    assert "callable_source" in DISCOVERED_CALLABLE_CONTRACT
+
+
+def test_callable_base_name_and_case_id_split_a_row():
+    def plain():  # pragma: no cover — a value, never called
+        pass
+
+    plain.__name__ = "test_golden[args0-1.5]"
+    assert callable_base_name(plain) == "test_golden"
+    assert callable_case_id(plain) == "args0-1.5"
+
+    def bare():  # pragma: no cover
+        pass
+
+    bare.__name__ = "test_bare"
+    assert callable_base_name(bare) == "test_bare"
+    assert callable_case_id(bare) == ""
+    assert callable_base_name(1) == ""  # a non-callable oddity never crashes
+
+
+def test_callable_node_id_prefers_the_nodeid():
+    def wrapper():  # pragma: no cover
+        pass
+
+    wrapper.__qualname__ = "tests/test_x.py::test_golden[args0]"
+    assert callable_node_id(wrapper) == "tests/test_x.py::test_golden[args0]"
+
+
+def test_case_id_conformance_across_backend_shapes():
+    """Issue #6 round 2: every backend shape yields the same logical base identity
+    and a correct case ID through the accessors — including the PRINCIPAL shape,
+    where the discriminator lives on __qualname__, not __name__."""
+
+    def live():  # pragma: no cover — live/legacy wrapper convention
+        pass
+
+    live.__name__ = "test_golden"
+    live.__qualname__ = "tests/test_x.py::test_golden[args0-1.5]"
+    assert callable_base_name(live) == "test_golden"
+    assert callable_case_id(live) == "args0-1.5"
+
+    def recollected():  # pragma: no cover — bracketed-__name__ shape
+        pass
+
+    recollected.__name__ = "test_golden[args1]"
+    recollected.__qualname__ = "tests/test_x.py::test_golden[args1]"
+    assert callable_base_name(recollected) == "test_golden"
+    assert callable_case_id(recollected) == "args1"
+
+    def plain():  # pragma: no cover
+        pass
+
+    plain.__name__ = "test_plain"
+    plain.__qualname__ = "tests/test_x.py::test_plain"
+    assert callable_base_name(plain) == "test_plain"
+    assert callable_case_id(plain) == ""
+
+    def unit():  # pragma: no cover — unittest method shape
+        pass
+
+    unit.__name__ = "TestThing.test_method"
+    unit.__qualname__ = "tests/test_x.py::TestThing::test_method"
+    assert callable_base_name(unit) == "TestThing.test_method"
+    assert callable_case_id(unit) == ""
+
+    assert callable_case_id(1) == ""  # non-callable oddity: never crashes

@@ -270,7 +270,11 @@ def _parametrize_cases(func: Any) -> "list[Any] | None":
     resolved here (unrecognized shape, fixtures, indirect) — the caller then keeps its prior behavior for
     that callable, so this only ever ADDS coverage, never removes a case that used to load.
     """
-    marks = [m for m in getattr(func, "pytestmark", ()) if getattr(m, "name", "") == "parametrize"]
+    marks = [
+        m
+        for m in getattr(func, "pytestmark", ())
+        if getattr(m, "name", "") == "parametrize"
+    ]
     if not marks:
         return None
 
@@ -293,7 +297,9 @@ def _parametrize_cases(func: Any) -> "list[Any] | None":
                 if _is_paramset(v):
                     vals: tuple = tuple(v.values)
                 elif len(names) == 1:
-                    vals = (v,)  # a single argname takes each value whole (even a tuple is ONE value)
+                    vals = (
+                        v,
+                    )  # a single argname takes each value whole (even a tuple is ONE value)
                 else:
                     vals = tuple(v)
                 frags.append(dict(zip(names, vals)))
@@ -409,11 +415,48 @@ _LIVE_SUITE: ContextVar[list[Any] | None] = ContextVar(
 )
 
 
+DISCOVERED_CALLABLE_CONTRACT = """What every discovered test callable guarantees — THE single reference (issue #6).
+
+Three backends hand out callables, in three shapes:
+
+* live pytest items — ``pytest_runner._make_item_callable`` wrappers,
+* re-collected pytest — ``pytest_discovery`` closures (parametrized bindings, TestCase runners),
+* the legacy loader — plain function objects.
+
+Which shape a consumer receives depends on in-process session state, so NO consumer may
+branch on the shape. The contract every shape satisfies:
+
+``__name__``
+    The test's display/matrix name. A bracketed suffix (``test_x[case0]``) is a
+    parametrized ROW of one live test, never a function of its own. NOT unique across
+    files — never an identity on its own.
+``__qualname__``
+    The pytest nodeid when one exists (path::name[case]), else the name. The most
+    discriminating identity string a callable carries.
+``__wesker_origin__`` (optional, stamped at build time)
+    Absolute path of the test FILE the callable stands for. The only truth for closures
+    whose code object lives in Wesker's own modules. Read it through
+    :func:`callable_origin`, never directly.
+``__wrapped__`` (optional)
+    The USER's underlying test function. ``inspect.getsource``/``unwrap`` follow it, and
+    content-hashing consumers (trace cache, Detective's verdict cache) depend on it. Read
+    it through :func:`callable_source`, never directly.
+Invocation
+    Zero-argument call, raising on test failure. Parametrized bindings are already bound.
+
+Consumers resolve identity ONLY through the accessors below — a raw ``__code__`` /
+``__wrapped__`` / ``__name__`` read is correct under one backend and silently wrong under
+another (Detective's ``_locate`` bug: right under the legacy loader, a no-op under the
+pytest backend, invisible to 312 green tests). Old call sites migrate as they are touched;
+new ones start here.
+"""
+
+
 def callable_origin(call: Any) -> str | None:
     """Absolute path of the test FILE a discovered callable came from, or None.
 
-    The single origin contract for every callable shape discovery can hand out:
-    a ``__wesker_origin__`` tag outranks everything (stamped at build time, and
+    Accessor of :data:`DISCOVERED_CALLABLE_CONTRACT` — the ORIGIN axis. A
+    ``__wesker_origin__`` tag outranks everything (stamped at build time, and
     the only truth for closures whose code object lives in Wesker's own modules);
     ``__wrapped__`` is the live-item wrapper's pointer to the real test function;
     the raw ``__code__.co_filename`` is the plain-function fallback. Consumers
@@ -428,6 +471,67 @@ def callable_origin(call: Any) -> str | None:
     code = getattr(real, "__code__", None)
     f = getattr(code, "co_filename", None)
     return os.path.abspath(f) if f else None
+
+
+def callable_source(call: Any) -> Any:
+    """The USER's underlying test function for a discovered callable — itself when it is
+    already the plain function.
+
+    Accessor of :data:`DISCOVERED_CALLABLE_CONTRACT` — the SOURCE axis. Wrapper shapes
+    carry the real test as ``__wrapped__`` so introspection (``inspect.getsource``,
+    content fingerprints) reads the user's code instead of Wesker's wrapper body, which is
+    identical for every test in the suite and collapses any source-keyed cache to one
+    entry. New consumers reach the source function through this, never through a raw
+    ``__wrapped__`` read.
+    """
+    return getattr(call, "__wrapped__", call)
+
+
+def callable_base_name(call: Any) -> str:
+    """The test's FUNCTION name with any parametrize row id stripped —
+    ``test_x[case0]`` → ``test_x``.
+
+    Accessor of :data:`DISCOVERED_CALLABLE_CONTRACT` — the NAME axis. A bracketed
+    ``__name__`` is a ROW of one live test, never a function of its own; consumers
+    grouping rows to their test (row pruning, ownership matching) resolve through
+    this instead of re-implementing the split.
+    """
+    name = str(getattr(call, "__name__", "") or "")
+    return name.split("[", 1)[0]
+
+
+def callable_case_id(call: Any) -> str:
+    """The parametrize row id, or ``""`` for a non-parametrized test —
+    ``test_x[case0]`` → ``case0``.
+
+    Accessor of :data:`DISCOVERED_CALLABLE_CONTRACT` — the CASE axis, the complement
+    of :func:`callable_base_name`. The principal backend shape puts the discriminator
+    in the NODEID, not the display name: live and legacy wrappers deliberately share a
+    base ``__name__`` and carry ``test_golden[args0]`` on ``__qualname__``. A
+    bracketed ``__name__`` wins when present (the recollected-closure shape); else the
+    nodeid's FINAL bracket suffix is the row id — final, because a nodeid can carry
+    brackets in its path components too.
+    """
+    name = str(getattr(call, "__name__", "") or "")
+    if "[" in name and name.endswith("]"):
+        return name.split("[", 1)[1][:-1]
+    node_id = callable_node_id(call)
+    if node_id.endswith("]") and "[" in node_id:
+        return node_id.rsplit("[", 1)[1][:-1]
+    return ""
+
+
+def callable_node_id(call: Any) -> str:
+    """The most discriminating identity string a discovered callable carries: the
+    pytest nodeid when one exists (stamped on ``__qualname__`` at build time), else
+    the display name.
+
+    Accessor of :data:`DISCOVERED_CALLABLE_CONTRACT` — the IDENTITY axis. This is
+    what per-case caches key on (``trace_cache.test_fingerprint``): sibling
+    parametrized cases share their function's SOURCE, and only the nodeid tells them
+    apart.
+    """
+    return str(getattr(call, "__qualname__", "") or getattr(call, "__name__", "") or "")
 
 
 def discover_test_callables(

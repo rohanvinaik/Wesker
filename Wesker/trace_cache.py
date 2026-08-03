@@ -81,8 +81,12 @@ def test_fingerprint(fn: Callable[..., Any]) -> str:
     hash) and the same nodeid still warms the cache across runs. Non-parametrized tests are unaffected:
     `getsource` already includes the `def` line, so distinct functions already have distinct sources.
     """
-    real = getattr(fn, "__wrapped__", fn)
-    disc = getattr(fn, "__qualname__", "") or ""
+    # Contract accessors, not raw attribute reads (issue #6) — local import because ci
+    # imports lazily in the other direction (same pattern as engine's trace_cache import).
+    from Wesker.ci import callable_node_id, callable_source
+
+    real = callable_source(fn)
+    disc = callable_node_id(fn)
     try:
         return _sha(inspect.getsource(real) + "\x00" + disc)
     except (OSError, TypeError):

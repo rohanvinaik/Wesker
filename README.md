@@ -9,7 +9,7 @@
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-3367d6.svg" alt="Python 3.10+"></a>
 </p>
 
-`8 semantic categories · 1.00 mutants per behavioral dimension · Zero dependencies · Fully deterministic`
+`9 semantic categories · 1.00 mutants per behavioral dimension · Zero dependencies · Fully deterministic`
 
 Point it at Detective's 25 files and it finds 2,795 behavioral questions your tests could leave open. A traditional tool asks those same questions **8,657 times**:
 
@@ -66,7 +66,7 @@ The cost drops multiplicatively across three layers, and no information is lost 
 
 **Layer 1 · In-process AST mutation.** Traditional tools spawn a subprocess per mutant, rewrite source on disk, and shell out to the runner — roughly 400 ms of overhead before a single test runs. Wesker compiles mutant ASTs in memory, patches them into a sandboxed namespace through the test's `__globals__`, and evaluates in-process: no subprocess, no disk I/O. The mutated function is compiled from the same AST a file-rewriting tool would produce and judged by the same assertion — the execution path differs, the observable semantics do not. This is the **meta-mutant dispatch** pattern validated by mutest-rs (Lévai & McMinn, ICST 2023) and mu2 (Vikram & Padhye, ISSTA 2023).
 
-**Layer 2 · Categorical exclusion — the Monty Hall filter.** Before generating a single mutant, Wesker walks the AST and asks which categories even *have* a target. No comparison operators → no BOUNDARY mutant can exist; no `self.x = …` → no STATE; fewer than two call arguments → no SWAP. This is not sampling. It is elimination of structural impossibilities, and skipping an absent category loses exactly nothing. A typical function has 3–4 applicable categories out of 7, cutting the space 40–60% before any test runs.
+**Layer 2 · Categorical exclusion — the Monty Hall filter.** Before generating a single mutant, Wesker walks the AST and asks which categories even *have* a target. No comparison operators → no BOUNDARY mutant can exist; no `self.x = …` → no STATE; fewer than two call arguments → no SWAP. This is not sampling. It is elimination of structural impossibilities, and skipping an absent category loses exactly nothing. A typical function has 3–4 applicable categories out of 9, cutting the space 40–60% before any test runs.
 
 **Layer 3 · Targeted test discovery.** A test that neither imports, references, nor transitively calls the mutated function cannot detect the mutation; running it is pure waste. Wesker resolves covering tests in three tiers — convention (`src/query.py` → `tests/test_query.py`), then static AST impact, then full fallback only if the first two find nothing — so each mutant runs against 3–15 tests rather than the whole suite. This is the one comparison with nothing confounded: `scope_tests=False` *is* classical mutation testing, and it was Wesker's own default until these numbers were taken.
 

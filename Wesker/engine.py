@@ -678,18 +678,77 @@ class _SwapMutator(_BaseMutator):
     def __init__(self, target_index: int = 0):
         super().__init__(target_index)
         self._stmt_ids: set[int] | None = None
+        self._bindings: dict[str, str] | None = None
 
     def visit(self, node: ast.AST) -> ast.AST:
-        # The first visit sees the root: capture statement-position calls once,
-        # so per-Call eligibility below needs no parent pointers.
+        # The first visit sees the root: capture statement-position calls and the
+        # function's bound names once, so per-Call eligibility below needs no
+        # parent pointers.
         if self._stmt_ids is None:
             self._stmt_ids = _stmt_call_ids(node)
+            self._bindings = _scope_bindings(node)
         return super().visit(node)
 
+    # The curated callee-dual table (issue #5). Small and boring ON PURPOSE — every
+    # entry inflates every universe that calls it (measured before adding: the whole
+    # table costs +0.33% universe on Detective, +0.46% on Wesker). Symmetric pairs;
+    # `sorted(reverse=)` deliberately excluded until a measured case wants it.
+    _DUALS = {
+        "min": "max",
+        "max": "min",
+        "any": "all",
+        "all": "any",
+        "floor": "ceil",
+        "ceil": "floor",
+    }
+
     @staticmethod
-    def _alternatives(node: ast.Call, stmt_ids: set[int]) -> list[tuple[Any, str]]:
+    def _dual_eligible(node: ast.Call, bindings: dict[str, str]) -> bool:
+        """Only a callee that RESOLVES to the curated table gets a dual dimension.
+
+        Resolution, not spelling (issue #5, second round): an attribute callee
+        qualifies only when its qualifier is PROVEN to be the stdlib ``math`` module —
+        the literal unbound name ``math``, or any alias whose import provenance is
+        ``math`` (``import math as m``) — so ``import numpy as math; math.floor``
+        never qualifies. A bare-name callee qualifies as an unbound builtin
+        (``min``/``max``/``any``/``all``) or as a name imported FROM math
+        (``from math import floor``); a param/local/def shadow or a foreign import
+        (``from custom import min``) is the user's object, whose dual the table never
+        promised. Bare ``floor``/``ceil`` with no visible import is unresolvable and
+        abstains — they are not builtins.
+        """
+        f = node.func
+        if isinstance(f, ast.Attribute):
+            if f.attr not in ("floor", "ceil") or not isinstance(f.value, ast.Name):
+                return False
+            provenance = bindings.get(f.value.id)
+            if provenance is None:
+                return (
+                    f.value.id == "math"
+                )  # module-level `import math` is the one sane reading
+            return provenance == "import:math"
+        if isinstance(f, ast.Name) and f.id in _SwapMutator._DUALS:
+            provenance = bindings.get(f.id)
+            if provenance is None:
+                return f.id in (
+                    "min",
+                    "max",
+                    "any",
+                    "all",
+                )  # builtins; bare floor/ceil abstain
+            return provenance == "import:math"
+        return False
+
+    @staticmethod
+    def _alternatives(
+        node: ast.Call, stmt_ids: set[int], bindings: dict[str, str] | None = None
+    ) -> list[tuple[Any, str]]:
         """Ordered (spec, dimension label) for one call site — a spec is the
-        left index of the adjacent pair to transpose, or ``"unwrap"``."""
+        left index of the adjacent pair to transpose, ``"unwrap"``, or ``"dual"``
+        (swap the callee for its curated dual: ``min``↔``max``, ``any``↔``all``,
+        ``math.floor``↔``math.ceil``). The dual expresses the wrong-fold-direction
+        bug class no argument transposition can reach — ``min(a, b)`` and
+        ``max(a, b)`` take the same arguments in every order."""
         name = _callee_name(node)
         alts: list[tuple[Any, str]] = []
         for i in range(len(node.args) - 1):
@@ -700,12 +759,16 @@ class _SwapMutator(_BaseMutator):
             and id(node) not in stmt_ids
         ):
             alts.append(("unwrap", f"SWAP:{name}~unwrap"))
+        if _SwapMutator._dual_eligible(node, bindings or {}):
+            alts.append(("dual", f"SWAP:{name}~dual"))
         return alts
 
     def visit_Call(self, node: ast.Call) -> ast.AST:
         if self.applied:
             return self.generic_visit(node)
-        for spec, label in self._alternatives(node, self._stmt_ids or set()):
+        for spec, label in self._alternatives(
+            node, self._stmt_ids or set(), self._bindings or {}
+        ):
             selected = not self.applied and self.current == self.target
             self._note(label)
             self.current += 1
@@ -718,6 +781,18 @@ class _SwapMutator(_BaseMutator):
                 # skipped subtree costs nothing (record mode never fires this
                 # branch, so key alignment is untouched).
                 return node.args[0]
+            if spec == "dual":
+                dual = self._DUALS[_callee_name(node)]
+                if isinstance(node.func, ast.Name):
+                    node.func = ast.copy_location(
+                        ast.Name(id=dual, ctx=ast.Load()), node.func
+                    )
+                else:  # Attribute — swap only the attr, keep the value (math.floor -> math.ceil)
+                    node.func = ast.copy_location(
+                        ast.Attribute(value=node.func.value, attr=dual, ctx=ast.Load()),
+                        node.func,
+                    )
+                continue
             node.args = list(node.args)
             node.args[spec], node.args[spec + 1] = node.args[spec + 1], node.args[spec]
         return self.generic_visit(node)
@@ -1250,8 +1325,9 @@ def _count_targets(func_node: ast.FunctionDef, category: MutationCategory) -> in
     # over the same tree, so the count cannot drift from the mutator's _note calls.
     if category == MutationCategory.SWAP:
         stmt_ids = _stmt_call_ids(func_node)
+        bindings = _scope_bindings(func_node)
         return sum(
-            len(_SwapMutator._alternatives(node, stmt_ids))
+            len(_SwapMutator._alternatives(node, stmt_ids, bindings))
             for node in ast.walk(func_node)
             if isinstance(node, ast.Call)
         )
@@ -1518,6 +1594,60 @@ _DEAD_DIM = "\x00dead"  # sentinel: a candidate site that yields no mutant
 
 def _is_dead(dim_key: str) -> bool:
     return dim_key == _DEAD_DIM
+
+
+def _scope_bindings(root: ast.AST) -> dict[str, str]:
+    """Provenance of every name the analyzed function's OWN scope binds (issue #5,
+    second round): ``"shadow"`` for params/assignments/def/class names — the user's
+    object, whose dual the curated table never promised — and ``"import:<module>"``
+    for import bindings, which RESOLVE: ``from math import floor`` is the curated
+    callee however it is spelled, ``from custom import min`` is not, and
+    ``import numpy as math`` makes the literal spelling ``math.floor`` a lie.
+
+    Own scope only: a nested function's parameters and locals bind ITS frame, so
+    ``def g(min): ...`` must not suppress the outer builtin ``min``'s dual — only the
+    nested def's NAME binds here. Comprehension targets are counted as shadows
+    (over-approximate: can only withhold a dimension, never fabricate one)."""
+    bindings: dict[str, str] = {}
+
+    def bind_params(fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> None:
+        a = fn.args
+        for x in a.posonlyargs + a.args + a.kwonlyargs:
+            bindings[x.arg] = "shadow"
+        if a.vararg:
+            bindings[a.vararg.arg] = "shadow"
+        if a.kwarg:
+            bindings[a.kwarg.arg] = "shadow"
+
+    def visit(node: ast.AST) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bindings[node.name] = "shadow"
+            return  # a nested scope's params/locals bind ITS frame, not this one
+        if isinstance(node, ast.Lambda):
+            return
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".")[0]
+                module = (
+                    node.module
+                    if isinstance(node, ast.ImportFrom)
+                    else alias.name.split(".")[0]
+                )
+                bindings[bound] = f"import:{module or '?'}"
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bindings[node.id] = "shadow"
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    if isinstance(root, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        bind_params(root)
+        for stmt in root.body:
+            visit(stmt)
+    else:
+        for child in ast.iter_child_nodes(root):
+            visit(child)
+    return bindings
 
 
 def _callee_name(node: ast.Call) -> str:

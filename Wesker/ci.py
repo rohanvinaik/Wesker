@@ -256,6 +256,67 @@ def discover_tests(
 # ── Test callable loading ────────────────────────────────────────
 
 
+def _parametrize_cases(func: Any) -> "list[Any] | None":
+    """Expand a ``@pytest.mark.parametrize``-decorated test into one bound, runnable callable per
+    case — the legacy loader's parity with pytest for the parametrize forms it can resolve without a
+    live session.
+
+    The decorator only ATTACHES marks; it leaves the function's ORIGINAL signature intact, so appending
+    the bare object yields an uncallable ``test(args, expected)`` that raises ``TypeError`` the moment
+    the profiler calls it — and that raise reads as a crash, silently dropping the case's value-kills and
+    line coverage (a parametrized golden then profiles as one case, so a re-profile disagrees with the
+    live-pytest pass). Stacked marks take the cartesian product (pytest's own rule); ``pytest.param(...)``
+    values are unwrapped. Returns None when there is no parametrize mark, or when a form cannot be
+    resolved here (unrecognized shape, fixtures, indirect) — the caller then keeps its prior behavior for
+    that callable, so this only ever ADDS coverage, never removes a case that used to load.
+    """
+    marks = [m for m in getattr(func, "pytestmark", ()) if getattr(m, "name", "") == "parametrize"]
+    if not marks:
+        return None
+
+    def _is_paramset(v: Any) -> bool:
+        # A pytest.param(...) ParameterSet — namedtuple(values, marks, id). Checking all three fields
+        # (not just `.values`) avoids mis-reading a dict/namedtuple VALUE as a wrapper to unwrap.
+        return hasattr(v, "values") and hasattr(v, "marks") and hasattr(v, "id")
+
+    try:
+        combined: list[dict] = [{}]
+        for m in marks:
+            argnames, argvalues = m.args[0], m.args[1]
+            names = (
+                [s.strip() for s in argnames.split(",")]
+                if isinstance(argnames, str)
+                else list(argnames)
+            )
+            frags: list[dict] = []
+            for v in argvalues:
+                if _is_paramset(v):
+                    vals: tuple = tuple(v.values)
+                elif len(names) == 1:
+                    vals = (v,)  # a single argname takes each value whole (even a tuple is ONE value)
+                else:
+                    vals = tuple(v)
+                frags.append(dict(zip(names, vals)))
+            combined = [{**c, **f} for c in combined for f in frags]
+    except Exception:
+        return None
+
+    cases: list[Any] = []
+    for i, kwargs in enumerate(combined):
+
+        def _case(_kwargs=kwargs, _i=i):
+            return func(**_kwargs)
+
+        # Mirror the live-item convention: siblings SHARE __name__ (the union key in trace_suite) and
+        # differ on __qualname__ (the per-case discriminator test_fingerprint folds in), so the legacy
+        # and pytest paths attribute a parametrized case's coverage identically.
+        _case.__name__ = func.__name__
+        _case.__qualname__ = f"{getattr(func, '__qualname__', func.__name__)}[{i}]"
+        _case.__doc__ = func.__doc__
+        cases.append(_case)
+    return cases
+
+
 def load_test_callables(
     test_files: list[str], project_root: str | None = None
 ) -> list[Any]:
@@ -306,7 +367,10 @@ def load_test_callables(
         for name in dir(mod):
             obj = getattr(mod, name)
             if name.startswith("test_") and callable(obj):
-                callables.append(obj)
+                # A @parametrize'd function is uncallable bare (its params are still required); expand
+                # it into one bound callable per case so the fallback matches the pytest backend.
+                cases = _parametrize_cases(obj)
+                callables.extend(cases if cases is not None else [obj])
             elif isinstance(obj, type) and (
                 (issubclass(obj, unittest.TestCase) and obj is not unittest.TestCase)
                 or name.startswith("Test")

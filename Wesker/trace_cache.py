@@ -61,22 +61,34 @@ def _sha(text: str) -> str:
 
 
 def test_fingerprint(fn: Callable[..., Any]) -> str:
-    """A test's identity BY CONTENT — its source, else its dotted name.
+    """A test's identity BY CONTENT — its source AND its parametrization, else its dotted name.
 
     Mirrors `Detective.verdict_cache`'s discipline deliberately: the same question deserves the
     same key everywhere, and two hashers that disagree are two caches that cannot warm each
     other. A live pytest item wraps the test as `__wrapped__`; unwrap first or every parametrized
     case fingerprints as the wrapper and the whole file collapses to one key.
+
+    Unwrapping alone is NOT enough: a parametrized case shares its underlying function's SOURCE with
+    every sibling case, so `getsource(real)` is byte-identical across them → one fingerprint → the
+    trace cache serves case 0's coverage for case 1, and case 1's own branch lines silently vanish
+    from the union (`trace_suite` keys the union on `__name__`, which is RIGHT — the base name — but
+    the cache keys on THIS, so only both being right keeps the two consistent; keyed on source alone
+    they disagree and a parametrized golden profiles as one case). The live-item wrapper carries the
+    full nodeid on `__qualname__` (`test[args0-…]`) — the per-case discriminator; fold it in so sibling
+    cases fingerprint APART, while a source edit still invalidates every case (source stays in the
+    hash) and the same nodeid still warms the cache across runs. Non-parametrized tests are unaffected:
+    `getsource` already includes the `def` line, so distinct functions already have distinct sources.
     """
     real = getattr(fn, "__wrapped__", fn)
+    disc = getattr(fn, "__qualname__", "") or ""
     try:
-        return _sha(inspect.getsource(real))
+        return _sha(inspect.getsource(real) + "\x00" + disc)
     except (OSError, TypeError):
         # No readable source (a C callable, a closure built at runtime). Its NAME is not content,
         # so this cannot detect an edit — but it is stable, and the alternative is refusing to
         # cache the whole suite because one test is unreadable.
         return _sha(
-            f"{getattr(real, '__module__', '?')}.{getattr(real, '__qualname__', repr(real))}"
+            f"{getattr(real, '__module__', '?')}.{getattr(real, '__qualname__', repr(real))}\x00{disc}"
         )
 
 

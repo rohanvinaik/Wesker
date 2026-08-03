@@ -76,3 +76,43 @@ def test_zero_arg_test_runs_directly(tmp_path):
     assert callables is not None
     assert len(callables) == 1
     callables[0]()  # runs without raising
+
+
+def test_parametrized_cases_fingerprint_apart(tmp_path):
+    """Each bound case must carry its own trace-cache identity — nodeid on
+    ``__qualname__``, the user's test on ``__wrapped__``.
+
+    With neither set (the 0.9.2 regression), `test_fingerprint` hashed the
+    bound closure itself: two Wesker-internal constants, identical for every
+    parametrized case in every project. The per-test trace cache then served
+    whichever case was traced first as the coverage of all of them — a stale
+    line-17-style gap no re-run could clear, because the poisoned entry's key
+    matched forever.
+    """
+    from Wesker.trace_cache import test_fingerprint
+
+    _write(
+        tmp_path,
+        "fpident",
+        """
+        import pytest
+
+        @pytest.mark.parametrize("x, expected", [(5, 10), (-3, -4)])
+        def test_double_or_dec(x, expected):
+            assert (x * 2 if x > 0 else x - 1) == expected
+        """,
+    )
+    callables = collect_pytest_callables(str(tmp_path))
+    assert callables is not None
+    cases = [c for c in callables if "test_double_or_dec" in getattr(c, "__name__", "")]
+    assert len(cases) == 2
+
+    # The identity contract itself, not just its consequence: __wrapped__ is
+    # the USER's function (so a source edit still invalidates the entry) and
+    # __qualname__ discriminates the cases (the nodeid).
+    assert all(getattr(c, "__wrapped__", None) is not None for c in cases)
+    quals = {getattr(c, "__qualname__", "") for c in cases}
+    assert len(quals) == 2
+
+    fps = {test_fingerprint(c) for c in cases}
+    assert len(fps) == 2  # sibling cases fingerprint APART

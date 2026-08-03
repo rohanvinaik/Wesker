@@ -34,8 +34,10 @@ WHAT IS NOT STORED: `inert`, keyed by `id()`. An id is a fact about one process'
 nothing in the next. The NAMES are stored and the ids rebuilt on load against the live callables
 — the same information, addressed by something that survives a process boundary.
 
-ON DISK under `.wesker/`, so `memory_guard.purge_caches` already owns its lifecycle: this is a
-regeneratable measurement, never a product, and a user who distrusts it deletes it.
+ON DISK under `.wesker/`, and `memory_guard.purge_caches` owns its lifecycle — it targets
+`trace_cache.json` by name (it did NOT for this file's whole early life, so `purge` reported "clean"
+while a poisoned entry survived; that gap is closed). This is a regeneratable measurement, never a
+product, and a user who distrusts it deletes it.
 """
 
 from __future__ import annotations

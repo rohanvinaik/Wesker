@@ -12,7 +12,7 @@ verification.
 # restated... bump both, or neither", which was true until the number moved here and stopped being
 # restated. Following it now would put a second copy back in pyproject and recreate precisely the
 # drift going dynamic removed: 0.6.0 shipped to PyPI announcing itself as 0.5.1.)
-__version__ = "0.9.2"
+__version__ = "0.9.3"
 
 from .engine import (
     BoundaryInput,

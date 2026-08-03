@@ -109,6 +109,15 @@ def _bind_item(item: Any, fn: Callable[..., Any]) -> Callable[..., Any] | None:
         fn(**bound)
 
     run.__name__ = f"{getattr(fn, '__name__', 'test')}[{getattr(callspec, 'id', '')}]"
+    # Honor the trace-cache identity contract `_make_item_callable` (the live-session path) already sets,
+    # or this discovery-backend closure is mis-keyed. `trace_cache.test_fingerprint` hashes
+    # `getsource(__wrapped__ or self) + __qualname__`; with BOTH unset here, every parametrized case in
+    # every project hashed to ONE constant (this two-line `run` body + `_bind_item.<locals>.run`), so the
+    # per-test trace cache served whichever case was traced first as the coverage for all of them. The
+    # nodeid discriminates the cases; `__wrapped__` makes getsource() read the USER's test, so a source
+    # edit still invalidates the entry (and distinct tests still differ).
+    run.__qualname__ = str(getattr(item, "nodeid", run.__name__))
+    run.__wrapped__ = fn
     return run
 
 

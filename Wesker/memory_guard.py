@@ -194,7 +194,13 @@ def telemetry(budget_bytes: int | None = None) -> str:
 
 def purge_caches(project_root: str) -> tuple[tuple[str, ...], int]:
     """Delete regeneratable analysis cruft under ``project_root`` — the mutation/mcdc
-    reports a prior run left in ``.wesker/``.
+    reports AND the per-test ``trace_cache.json`` a prior run left in ``.wesker/``.
+
+    ``trace_cache.json`` is a target because it is content-keyed and therefore CAN be poisoned:
+    a stale or collapsed entry (e.g. a parametrized case mis-keyed so one case's coverage is served
+    for all) survives a code change, and `purge` is the documented recovery path — one that must
+    actually remove the file it claims to. It was absent from this list for its whole existence, so
+    `purge` reported "a clean state" while the bad entry stayed; that is now closed.
 
     Returns ``(removed_paths, reclaimed_bytes)``. Generated TEST files are the
     product, not cruft, and are never touched. Everything removed here is rebuilt on
@@ -212,7 +218,7 @@ def purge_caches(project_root: str) -> tuple[tuple[str, ...], int]:
     on the function's hash but NOT its tests', so editing a test served a stale verdict.
     Detective's `verdict_cache` had already rebuilt the same idea keyed on both."""
     wesker_dir = os.path.join(project_root, ".wesker")
-    targets = ("mutation_report.json", "mcdc_report.json")
+    targets = ("mutation_report.json", "mcdc_report.json", "trace_cache.json")
     removed: list[str] = []
     reclaimed = 0
     for name in targets:

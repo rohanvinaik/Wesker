@@ -61,14 +61,15 @@ def test_state_budget_assign_only():
 
 
 def test_value_budget_counts_distinct_constant_types():
-    """VALUE DOF is the distinct constant TYPES, not the constant count.
+    """VALUE DOF is the distinct dimension KEYS, not the constant count.
 
-    Three constants of two types = 2 dimensions. Also pins the argument order of
-    the _record_dimensions call: swapping (func_node, category) resolves no mutator
-    factory and collapses the count to 0.
+    Three constants of two types = 3 dimensions: ints carry a collapse AND an
+    off-by-one key (VALUE:int, VALUE:int~off1), strings one. Also pins the
+    argument order of the _record_dimensions call: swapping (func_node, category)
+    resolves no mutator factory and collapses the count to 0.
     """
     node = _fn("def g():\n    x = 1\n    y = 'a'\n    z = 2\n    return x, y, z")
-    assert dimension_budget(node, MutationCategory.VALUE) == 2
+    assert dimension_budget(node, MutationCategory.VALUE) == 3
 
 
 def test_arithmetic_budget_counts_distinct_operators():

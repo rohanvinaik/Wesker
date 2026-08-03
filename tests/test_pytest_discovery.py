@@ -116,3 +116,30 @@ def test_parametrized_cases_fingerprint_apart(tmp_path):
 
     fps = {test_fingerprint(c) for c in cases}
     assert len(fps) == 2  # sibling cases fingerprint APART
+
+
+def test_collected_callables_carry_origin_tag(tmp_path):
+    """Every collected callable resolves to its defining test FILE via
+    ci.callable_origin — including parametrized closures, whose raw
+    ``co_filename`` is this discovery module, not the test's."""
+    from Wesker.ci import callable_origin
+
+    _write(
+        tmp_path,
+        "origin",
+        """
+        import pytest
+
+        @pytest.mark.parametrize("x", [1, 2])
+        def test_param(x):
+            assert x > 0
+
+        def test_plain():
+            assert True
+        """,
+    )
+    callables = collect_pytest_callables(str(tmp_path))
+    assert callables
+    expected = str(tmp_path / "test_origin.py")
+    for c in callables:
+        assert callable_origin(c) == expected

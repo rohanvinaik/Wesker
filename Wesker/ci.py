@@ -409,6 +409,27 @@ _LIVE_SUITE: ContextVar[list[Any] | None] = ContextVar(
 )
 
 
+def callable_origin(call: Any) -> str | None:
+    """Absolute path of the test FILE a discovered callable came from, or None.
+
+    The single origin contract for every callable shape discovery can hand out:
+    a ``__wesker_origin__`` tag outranks everything (stamped at build time, and
+    the only truth for closures whose code object lives in Wesker's own modules);
+    ``__wrapped__`` is the live-item wrapper's pointer to the real test function;
+    the raw ``__code__.co_filename`` is the plain-function fallback. Consumers
+    that need "which file defines this test" (Detective's ``suite_edit._locate``)
+    MUST resolve through this — reading ``__code__`` directly attributes every
+    wrapper to ``pytest_runner.py``/``pytest_discovery.py``.
+    """
+    tagged = getattr(call, "__wesker_origin__", None)
+    if tagged:
+        return str(tagged)
+    real = getattr(call, "__wrapped__", call)
+    code = getattr(real, "__code__", None)
+    f = getattr(code, "co_filename", None)
+    return os.path.abspath(f) if f else None
+
+
 def discover_test_callables(
     project_root: str,
     source_file: str,
@@ -817,14 +838,10 @@ def refresh_live_suite(project_root: str, path: str) -> int:
         # DEFINING module, which is why the file cannot be recovered from the name.
         return getattr(c, "__name__", "unknown")
 
-    def _origin(c: Any) -> str | None:
-        tagged = getattr(c, "__wesker_origin__", None)
-        if tagged:
-            return str(tagged)
-        real = getattr(c, "__wrapped__", c)
-        code = getattr(real, "__code__", None)
-        f = getattr(code, "co_filename", None)
-        return os.path.abspath(f) if f else None
+    # Origin resolution is the module-level contract — one resolver for every
+    # consumer, so a callable shape added later cannot be recognised here and
+    # missed elsewhere (or vice versa).
+    _origin = callable_origin
 
     # `gone` is held, not just counted: it carries the ids `SessionBaseline.inert` is keyed by,
     # and holding the objects until the splice is done is what stops a freed id being reused by

@@ -21,6 +21,8 @@ import pytest
 from Wesker.engine import (
     _DEAD_DIM,
     MutationCategory,
+    _SwapMutator,
+    _ValueMutator,
     _callee_name,
     _count_targets,
     _greedy_dimension_order,
@@ -138,8 +140,9 @@ def test_record_dimensions_value_keys_by_python_type():
         """
     )
     keys = _record_dimensions(func, MutationCategory.VALUE, set())
-    # bool checked before int; order follows AST/transformer traversal.
-    assert keys == ["VALUE:int", "VALUE:bool", "VALUE:float", "VALUE:str"]
+    # bool checked before int; order follows AST/transformer traversal. Ints
+    # carry the collapse and the off-by-one as adjacent dimensions.
+    assert keys == ["VALUE:int", "VALUE:int~off1", "VALUE:bool", "VALUE:float", "VALUE:str"]
 
 
 def test_record_dimensions_unknown_category_is_empty():
@@ -514,3 +517,72 @@ def test_profiling_uses_func_key_source_path_with_stubbed_original():
     )
     assert res.total_mutants >= 1
     assert res.total_survived == 0
+
+
+# ── VALUE off-by-one and SWAP unwrap/adjacent-pair dimensions ────
+
+
+def _exec_mutant(mutant) -> dict:
+    """Compile and exec a mutant's function AST; returns the namespace."""
+    mod = ast.Module(body=[mutant.mutated_node], type_ignores=[])
+    ast.fix_missing_locations(mod)
+    ns: dict = {}
+    exec(compile(mod, "<mutant>", "exec"), ns)  # noqa: S102 — test-local exec
+    return ns
+
+
+def test_value_off_by_one_dodges_collapse():
+    """The two int dimensions never share a mutant, whatever the value."""
+    assert _ValueMutator._alternatives(2) == [(0, "VALUE:int"), (3, "VALUE:int~off1")]
+    assert _ValueMutator._alternatives(0) == [(1, "VALUE:int"), (-1, "VALUE:int~off1")]
+    assert _ValueMutator._alternatives(-1) == [(0, "VALUE:int"), (-2, "VALUE:int~off1")]
+
+
+def test_value_off_by_one_reaches_round_ndigits():
+    """round(x, 2) -> round(x, 3): the near-miss the 0/1 collapse cannot express.
+
+    A 1-decimal golden value kills the collapse (ndigits 0) while never
+    distinguishing 2 from 3 — this dimension is what forces that witness.
+    """
+    func = _fn("def f(x):\n    return round(x, 2)")
+    muts = generate_mutants(func, {MutationCategory.VALUE}, max_per_category=0)
+    off1 = next(m for m in muts if m.dimension == "VALUE:int~off1")
+    f = _exec_mutant(off1)["f"]
+    assert f(1.9375) == 1.938  # original returns 1.94
+
+
+def test_swap_unwrap_replaces_call_with_first_arg():
+    func = _fn("def f(x):\n    return round(x, 2)")
+    muts = generate_mutants(func, {MutationCategory.SWAP}, max_per_category=0)
+    unwrap = next(m for m in muts if m.dimension == "SWAP:round~unwrap")
+    f = _exec_mutant(unwrap)["f"]
+    assert f(1.2345) == 1.2345  # the call is gone; nothing rounds
+
+
+def test_swap_unwrap_skips_statement_position_calls():
+    """A discarded call is SDL's question; unwrap there is guaranteed-equivalent."""
+    func = _fn("def f(items, y):\n    items.append(y)\n    return len(items)")
+    keys = _record_dimensions(func, MutationCategory.SWAP, set())
+    assert not any("append" in k and k.endswith("~unwrap") for k in keys)
+    assert "SWAP:len~unwrap" in keys  # value-position call keeps the dimension
+
+
+def test_swap_unwrap_skips_starred_first_arg():
+    func = _fn("def f(xs):\n    return max(*xs)")
+    keys = _record_dimensions(func, MutationCategory.SWAP, set())
+    assert not any(k.endswith("~unwrap") for k in keys)
+
+
+def test_swap_adjacent_pairs_one_dimension_each():
+    func = _fn("def f(a, b, c):\n    return g(a, b, c)")
+    keys = _record_dimensions(func, MutationCategory.SWAP, set())
+    assert keys == ["SWAP:g", "SWAP:g~p1", "SWAP:g~unwrap"]
+    assert _count_targets(func, MutationCategory.SWAP) == 3
+
+
+def test_swap_second_pair_transposes_later_neighbors():
+    func = _fn('def f(a, b, c):\n    return "{}{}{}".format(a, b, c)')
+    muts = generate_mutants(func, {MutationCategory.SWAP}, max_per_category=0)
+    p1 = next(m for m in muts if m.dimension.endswith("~p1"))
+    f = _exec_mutant(p1)["f"]
+    assert f(1, 2, 3) == "132"  # (b, c) transposed; (a, b) untouched

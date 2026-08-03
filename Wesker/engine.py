@@ -455,7 +455,17 @@ class _BaseMutator(ast.NodeTransformer):
 
 
 class _ValueMutator(_BaseMutator):
-    """Replace constants with boundary values."""
+    """Replace constants with boundary values.
+
+    Ints carry TWO dimensions: the 0/1 COLLAPSE (is the constant read at all?)
+    and an OFF-BY-ONE (is its exact value pinned?). The collapse alone lets a
+    near-miss hide: ``round(cost, 2) -> round(cost, 0)`` is killed by any
+    1-decimal golden value, while ``2 -> 3`` changes nothing a coarse input can
+    see — only the off-by-one forces the witness that pins the exact value.
+    Ints only: a float/str collapse already forces an exact-value assertion
+    wherever a value test exists, and a threshold used in a comparison is
+    BOUNDARY's job (its endpoint shift generates the same witness ±1 would).
+    """
 
     # Types we can actually mutate — others (None, bytes, complex, Ellipsis)
     # are left unchanged by _mutate_constant, so we must not count them as
@@ -482,32 +492,39 @@ class _ValueMutator(_BaseMutator):
             and (node.lineno, node.col_offset) in self._ds_pos
         ):
             return node
-        self._note(
-            f"VALUE:{'bool' if isinstance(node.value, bool) else type(node.value).__name__}"
-        )
-        if self.current == self.target:
-            mutated = self._mutate_constant(node)
-            if mutated is not node:
-                self._mark_applied(node)
-                return mutated
-            # Defensive: if _mutate_constant somehow returned the original,
-            # do not mark applied — skip this target.
-            return node
-        self.current += 1
+        # One dimension per alternative (mirrors _BoundaryMutator): the counter
+        # derives from _alternatives, so count and visit order cannot drift.
+        for repl, label in self._alternatives(node.value):
+            selected = not self.applied and self.current == self.target
+            self._note(label)
+            self.current += 1
+            if not selected:
+                continue
+            self._mark_applied(node)
+            return ast.Constant(value=repl)
         return node
 
     @staticmethod
-    def _mutate_constant(node: ast.Constant) -> ast.Constant:
-        v = node.value
+    def _alternatives(v: Any) -> list[tuple[Any, str]]:
+        """Ordered (replacement value, dimension label) for one constant.
+
+        Single source of truth: the mutator and ``_count_value_target`` both
+        read it. bool is checked before int — it IS an int, and ``True + 1``
+        is not a boolean dimension.
+        """
         if isinstance(v, bool):
-            return ast.Constant(value=not v)
+            return [(not v, "VALUE:bool")]
         if isinstance(v, int):
-            return ast.Constant(value=0 if v != 0 else 1)
+            collapse = 0 if v != 0 else 1
+            # ±1 dodges the collapse value so the two dimensions never share a
+            # mutant (v=0: collapse 1, off-by-one -1; v=-1: collapse 0, off-by-one -2).
+            off1 = v + 1 if v + 1 != collapse else v - 1
+            return [(collapse, "VALUE:int"), (off1, "VALUE:int~off1")]
         if isinstance(v, float):
-            return ast.Constant(value=0.0 if v else 1.0)
+            return [(0.0 if v else 1.0, "VALUE:float")]
         if isinstance(v, str):
-            return ast.Constant(value="" if v else "mutated")
-        return node
+            return [("" if v else "mutated", "VALUE:str")]
+        return []
 
 
 class _BoundaryMutator(_BaseMutator):
@@ -624,18 +641,85 @@ class _BoundaryMutator(_BaseMutator):
         return self.generic_visit(node)
 
 
+def _stmt_call_ids(root: ast.AST) -> set[int]:
+    """ids of Call nodes in expression-STATEMENT position (``log.info(x)``,
+    ``items.append(y)``). Their value is discarded, so unwrap (call -> first
+    arg) is a guaranteed-equivalent no-op there — and SDL already owns the
+    "does this discarded call do anything?" question by deleting the statement.
+    ids are safe here: the set is built and consumed within one traversal of
+    one live tree, never persisted (contrast ``_deletable_stmt_ids``)."""
+    return {
+        id(stmt.value)
+        for stmt in ast.walk(root)
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+    }
+
+
 class _SwapMutator(_BaseMutator):
-    """Transpose two parameters in a function call."""
+    """Call-shape mutations: transpose adjacent arguments, or unwrap the call.
+
+    Per call site, one dimension per alternative (mirrors _BoundaryMutator):
+
+      * a TRANSPOSITION per adjacent argument pair — ``f(a, b, c)`` carries
+        (a,b) and (b,c). The first pair keeps the bare ``SWAP:<callee>`` label
+        the universe has always had; later pairs get ``~p<i>``.
+      * an UNWRAP (``f(x, ...) -> x``) when the call's value is USED — the
+        "does this call do anything the suite can see?" question. It forces a
+        witness where the call is observable: ``round(cost, 2) -> cost``
+        demands an input with 3+ decimals, which also pins the ndigits
+        constant no VALUE collapse can reach. Skipped in expression-statement
+        position (guaranteed-equivalent there) and for a starred first arg.
+
+    ``_alternatives`` is the single source of truth: the mutator and
+    ``_count_targets``'s SWAP case both read it, so the target count and the
+    visit order cannot drift.
+    """
+
+    def __init__(self, target_index: int = 0):
+        super().__init__(target_index)
+        self._stmt_ids: set[int] | None = None
+
+    def visit(self, node: ast.AST) -> ast.AST:
+        # The first visit sees the root: capture statement-position calls once,
+        # so per-Call eligibility below needs no parent pointers.
+        if self._stmt_ids is None:
+            self._stmt_ids = _stmt_call_ids(node)
+        return super().visit(node)
+
+    @staticmethod
+    def _alternatives(node: ast.Call, stmt_ids: set[int]) -> list[tuple[Any, str]]:
+        """Ordered (spec, dimension label) for one call site — a spec is the
+        left index of the adjacent pair to transpose, or ``"unwrap"``."""
+        name = _callee_name(node)
+        alts: list[tuple[Any, str]] = []
+        for i in range(len(node.args) - 1):
+            alts.append((i, f"SWAP:{name}" if i == 0 else f"SWAP:{name}~p{i}"))
+        if (
+            node.args
+            and not isinstance(node.args[0], ast.Starred)
+            and id(node) not in stmt_ids
+        ):
+            alts.append(("unwrap", f"SWAP:{name}~unwrap"))
+        return alts
 
     def visit_Call(self, node: ast.Call) -> ast.AST:
-        if self.applied or len(node.args) < 2:
+        if self.applied:
             return self.generic_visit(node)
-        if self.current == self.target:
+        for spec, label in self._alternatives(node, self._stmt_ids or set()):
+            selected = not self.applied and self.current == self.target
+            self._note(label)
+            self.current += 1
+            if not selected:
+                continue
             self._mark_applied(node)
+            if spec == "unwrap":
+                # Returned as-is, unvisited: applied is set, so no site after
+                # this one is consumed anywhere in the tree this pass — the
+                # skipped subtree costs nothing (record mode never fires this
+                # branch, so key alignment is untouched).
+                return node.args[0]
             node.args = list(node.args)
-            node.args[0], node.args[1] = node.args[1], node.args[0]
-        self._note(f"SWAP:{_callee_name(node)}")
-        self.current += 1
+            node.args[spec], node.args[spec + 1] = node.args[spec + 1], node.args[spec]
         return self.generic_visit(node)
 
 
@@ -1137,6 +1221,16 @@ def _count_targets(func_node: ast.FunctionDef, category: MutationCategory) -> in
     # counter can see. Same analysis the mutator runs, so the two cannot drift.
     if category == MutationCategory.STMT:
         return len(_deletable_stmt_ids(func_node))
+    # SWAP eligibility (unwrap) depends on statement position, which no per-node
+    # counter can see — same shape as STMT. Derive from _SwapMutator._alternatives
+    # over the same tree, so the count cannot drift from the mutator's _note calls.
+    if category == MutationCategory.SWAP:
+        stmt_ids = _stmt_call_ids(func_node)
+        return sum(
+            len(_SwapMutator._alternatives(node, stmt_ids))
+            for node in ast.walk(func_node)
+            if isinstance(node, ast.Call)
+        )
     # EXCEPTION's sub-modes each have their own target space, and their skip rules
     # (bare re-raise, already-``pass`` handler, untyped ``except:``) live in the
     # mutator — so count by running it, not by re-encoding the rules here.
@@ -1165,7 +1259,9 @@ def _count_value_target(
             and (node.lineno, node.col_offset) in docstring_positions
         ):
             return 0
-        return 1
+        # Derived from _alternatives so the count can never drift from the
+        # mutator's _note calls (ints carry two dimensions, everything else one).
+        return len(_ValueMutator._alternatives(node.value))
     return 0
 
 
@@ -1178,7 +1274,14 @@ def _count_boundary_target(node: ast.AST) -> int:
 
 
 def _count_swap_target(node: ast.AST) -> int:
-    return 1 if isinstance(node, ast.Call) and len(node.args) >= 2 else 0
+    """Per-node SWAP counter — NOT used for SWAP.
+
+    Unwrap eligibility is a statement-position property no per-node counter can
+    see, so ``_count_targets`` special-cases SWAP over the whole function via
+    ``_SwapMutator._alternatives`` (same shape as STMT). Retained only so the
+    ``_TARGET_COUNTERS`` dispatch stays total.
+    """
+    return 0
 
 
 def _is_self_assign(target: ast.AST) -> bool:

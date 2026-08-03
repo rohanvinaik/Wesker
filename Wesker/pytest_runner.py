@@ -225,6 +225,12 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
         # invalidate its cache and stale verdicts would be served as fresh ones — the
         # false-survivor bug that cache exists to prevent.
         run.__wrapped__ = fn
+    origin = getattr(item, "path", None) or getattr(item, "fspath", None)
+    if origin is not None:
+        with contextlib.suppress(Exception):
+            # The origin tag makes `ci.callable_origin` total for this wrapper even
+            # when the item has no `function` (no __wrapped__ to follow).
+            run.__wesker_origin__ = str(origin)
     return run
 
 

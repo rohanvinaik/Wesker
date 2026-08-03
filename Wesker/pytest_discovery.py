@@ -57,6 +57,16 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
         run.__name__ = f"{cls.__name__}.{method}"
         return run
 
+    def _tag_origin(runnable: Callable[..., Any], it: Any) -> Callable[..., Any]:
+        # Every callable this builder hands out is a closure whose code object
+        # lives in THIS module — the origin tag is the only way a consumer
+        # (ci.callable_origin) can recover which test FILE it stands for.
+        origin = getattr(it, "path", None) or getattr(it, "fspath", None)
+        if origin is not None:
+            with contextlib.suppress(Exception):
+                runnable.__wesker_origin__ = str(origin)
+        return runnable
+
     callables: list[Callable[..., Any]] = []
     for it in items:
         cls = getattr(it, "cls", None)
@@ -66,7 +76,7 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
                 or str(getattr(it, "name", "")).split("[")[0]
             )
             if method:
-                callables.append(make_tc_runner(cls, method))
+                callables.append(_tag_origin(make_tc_runner(cls, method), it))
             continue
         fn = getattr(it, "function", None)
         if not callable(fn):
@@ -74,7 +84,7 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
         runnable = _bind_item(it, fn)
         if runnable is None:
             continue  # requires real runtime fixtures we can't supply in-process (v1)
-        callables.append(runnable)
+        callables.append(_tag_origin(runnable, it))
     return callables
 
 

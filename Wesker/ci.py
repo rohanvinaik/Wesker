@@ -253,6 +253,45 @@ def discover_tests(
     return found
 
 
+def relevant_test_files(
+    project_root: str, source_file: str, func_names: list[str]
+) -> list[str]:
+    """Layers 1+2 of :func:`discover_tests` — convention and static impact, WITHOUT the
+    full-tree fallback. The test files plausibly exercising ``source_file``, and no others.
+
+    ``discover_tests`` returns every test file in the project: layer 3 appends the
+    remainder unconditionally, so its three layers RANK relevance, they do not select on
+    it. That is the right contract for a caller that wants the whole suite in a useful
+    order, and the wrong one for scoping a single function — profiling one function in this
+    repo was handed 49 of 49 test files (549 of 637 callables), and every per-mutant and
+    per-trace cost was multiplied by the ~12x of them that cannot reach the target.
+
+    Narrowing can only ever LOSE a covering test — one reached indirectly, through a
+    fixture or a dynamic import that no static scan sees. That direction is safe here: a
+    missing test can only remove kills and remove covered lines, so the report says MORE
+    unpinned behaviour and MORE line gap than the truth. It cannot manufacture a false
+    ``COMPLETE``, which is the only error that would matter. The user is asked to pin one
+    extra mutant; they are never told a function is specified when it is not.
+
+    EMPTY IS A REAL ANSWER, not a reason to widen. When no test file names this target or
+    any function in its file, running the rest of the suite through a full mutant pass
+    measures a set that provably does not mention the code under test: every mutant
+    survives for the same uninformative reason, and any kill it did report would be
+    incidental. The caller's honest move is to synthesize — call sites are harvested from
+    the REPO, not from tests, so de-novo generation loses nothing here that the suite
+    would have supplied.
+    """
+    found = _discover_by_convention(project_root, source_file)
+    found_set = set(found)
+    impact_map = _build_static_impact_map(_discover_all_test_files(project_root))
+    for func_name in func_names:
+        for tf in impact_map.get(func_name, []):
+            if tf not in found_set:
+                found.append(tf)
+                found_set.add(tf)
+    return found
+
+
 # ── Test callable loading ────────────────────────────────────────
 
 
@@ -570,20 +609,45 @@ def discover_test_callables(
     # already collected the whole suite, so the same list serves every file — for as long
     # as the suite is what it was when the session opened. A consumer that WRITES tests
     # must say so via `refresh_live_suite`; see there for what went wrong when it could not.
+    full_path = (
+        os.path.join(project_root, source_file)
+        if not os.path.isabs(source_file)
+        else source_file
+    )
+    # SCOPE FIRST, on every backend. Profiling ONE function was previously handed every
+    # test file in the project, and each of the three backends below then paid for the
+    # ~12x of them that cannot reach the target — in collection, in the traced baseline,
+    # and again per mutant.
+    scoped = relevant_test_files(project_root, full_path, func_names)
+    extra = [os.path.abspath(d) for d in (extra_dirs or []) if os.path.isdir(d)]
+
+    # Nothing statically reaches the target, and no out-of-tree root was named: return the
+    # empty suite rather than the whole tree. Widening here would put every unrelated test
+    # through a full mutant pass to learn what `scoped` already said — that none of them
+    # mention this code. The caller reads [] as "synthesize", which is the honest and far
+    # cheaper answer; see `relevant_test_files`.
+    if not scoped and not extra:
+        return []
+
     live = _LIVE_SUITE.get()
     if live is not None:
-        return live
+        # The session collected the whole suite once; narrowing is a filter over what it
+        # already holds, so the fixtures/conftest/lifecycle that make it outrank the other
+        # backends are preserved. Origin resolves through the contract accessor — a raw
+        # `__code__` read attributes every wrapper to pytest_runner.py.
+        keep = {os.path.abspath(p) for p in scoped}
+        return [c for c in live if (callable_origin(c) or "") in keep]
 
-    extra = [os.path.abspath(d) for d in (extra_dirs or []) if os.path.isdir(d)]
     if backend in ("auto", "pytest"):
         try:
             from Wesker.pytest_discovery import collect_pytest_callables
 
-            # "." resolves to project_root inside the collector's chdir; the extra
-            # roots are absolute so they collect regardless of cwd. No overlap with
-            # "." when out-of-tree, so no double-collection.
+            # Hand pytest the scoped FILES, not the tree: it then collects only those,
+            # so the narrowing is paid back in collection time too, not just afterwards.
+            # The extra roots are absolute so they collect regardless of cwd, and never
+            # overlap the in-tree paths.
             collected = collect_pytest_callables(
-                project_root, paths=["."] + extra if extra else None
+                project_root, paths=list(scoped) + extra
             )
         except Exception:
             collected = None
@@ -591,14 +655,9 @@ def discover_test_callables(
             return collected
         if backend == "pytest":
             return []
-    # Legacy fallback: hand-rolled discovery + loader. Union the project-tree test
+    # Legacy fallback: hand-rolled discovery + loader. Union the scoped project-tree test
     # files with any found under the extra roots so out-of-tree tests still load.
-    full_path = (
-        os.path.join(project_root, source_file)
-        if not os.path.isabs(source_file)
-        else source_file
-    )
-    files = discover_tests(project_root, full_path, func_names)
+    files = list(scoped)
     seen = set(files)
     for d in extra:
         for tf in _discover_all_test_files(d):

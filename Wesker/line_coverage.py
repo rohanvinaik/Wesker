@@ -19,6 +19,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import io
+import os
 import sys
 import threading
 import time
@@ -144,6 +145,47 @@ def _traced_in_thread(
     return True
 
 
+def _target_matcher(target_files: set[str]) -> Callable[[str], str | None]:
+    """``co_filename`` -> the matching TARGET spelling, or None — by file identity.
+
+    ``co_filename`` carries the spelling the module was imported under; the target
+    path carries the spelling the caller typed. On a case-insensitive filesystem
+    (macOS default: ``wesker/engine.py`` vs ``Wesker/engine.py``) or through a
+    symlink, the two open the same file while comparing unequal — the dispatch then
+    never attaches, every line of the target reads uncovered, and the kill
+    measurement (which has no filename filter) proceeds normally: the report says
+    "80/80 killed" and "18-line gap" about the same body. Identity ``(st_dev,
+    st_ino)`` answers what string equality cannot. Deliberately NOT case-folding:
+    spellings are never rewritten, and on a case-sensitive filesystem two paths
+    differing only in case remain the two different files they are.
+
+    The verdict is memoized per ``co_filename`` string, so the per-event dispatch
+    stats each distinct filename once — never per line event.
+    """
+    by_id: dict[tuple[int, int], str] = {}
+    for t in target_files:
+        try:
+            st = os.stat(t)
+        except OSError:
+            continue
+        by_id[(st.st_dev, st.st_ino)] = t
+    verdicts: dict[str, str | None] = {t: t for t in target_files}
+
+    def match(filename: str) -> str | None:
+        if filename in verdicts:
+            return verdicts[filename]
+        try:
+            st = os.stat(filename)
+        except OSError:
+            found = None
+        else:
+            found = by_id.get((st.st_dev, st.st_ino))
+        verdicts[filename] = found
+        return found
+
+    return match
+
+
 def _trace_one(
     test_fn: Callable[..., None],
     target_file: str,
@@ -172,6 +214,7 @@ def _trace_one(
     preempted in-process, and is reported as not-cut rather than pretended away.
     """
     hits: set[int] = set()
+    match = _target_matcher({target_file})
 
     def local(frame, event, _arg):
         if event == "line":
@@ -179,7 +222,7 @@ def _trace_one(
         return local
 
     def dispatch(frame, event, _arg):
-        if event == "call" and frame.f_code.co_filename == target_file:
+        if event == "call" and match(frame.f_code.co_filename) is not None:
             return local
         return None
 
@@ -240,14 +283,20 @@ def _trace_one_multi(
     test stalls the single shared baseline every function then reuses.
     """
     hits: dict[str, set[int]] = {}
+    match = _target_matcher(target_files)
 
     def local(frame, event, _arg):
+        # Key by the caller's TARGET spelling, not co_filename: downstream lookups
+        # (coverage_from_trace, the persisted suite trace) use what the caller typed,
+        # and a same-file-different-spelling key would hide these lines from them.
         if event == "line":
-            hits.setdefault(frame.f_code.co_filename, set()).add(frame.f_lineno)
+            matched = match(frame.f_code.co_filename)
+            if matched is not None:
+                hits.setdefault(matched, set()).add(frame.f_lineno)
         return local
 
     def dispatch(frame, event, _arg):
-        if event == "call" and frame.f_code.co_filename in target_files:
+        if event == "call" and match(frame.f_code.co_filename) is not None:
             return local
         return None
 
@@ -380,10 +429,28 @@ def coverage_from_trace(
     """
     if not target_file or not exec_lines:
         return {}
-    return {
-        name: sorted(files.get(target_file, frozenset()) & exec_lines)
-        for name, files in traced.items()
-    }
+
+    # A persisted suite trace may key this file under another same-file spelling
+    # (case-insensitive filesystem, symlink, or a cache written by a caller who
+    # typed it differently). Exact lookup first; identity comparison as fallback,
+    # memoized across the per-test loop. Spellings are never rewritten.
+    alias: dict[str, str] = {}
+
+    def _lines_for(files: dict[str, set[int]]) -> frozenset[int] | set[int]:
+        got = files.get(target_file)
+        if got is not None:
+            return got
+        for key in files:
+            if key not in alias:
+                try:
+                    alias[key] = key if os.path.samefile(key, target_file) else ""
+                except OSError:
+                    alias[key] = ""
+            if alias[key]:
+                return files[key]
+        return frozenset()
+
+    return {name: sorted(_lines_for(files) & exec_lines) for name, files in traced.items()}
 
 
 def trace_line_coverage(

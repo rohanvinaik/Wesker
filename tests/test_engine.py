@@ -140,12 +140,17 @@ def test_record_dimensions_value_keys_by_python_type():
     )
     keys = _record_dimensions(func, MutationCategory.VALUE, set())
     # bool checked before int; order follows AST/transformer traversal. Ints
-    # carry the collapse and the off-by-one as adjacent dimensions.
+    # carry the collapse and the off-by-one as adjacent dimensions; floats the
+    # collapse and the two hail-mary perturbations.
     assert keys == [
         "VALUE:int",
         "VALUE:int~off1",
         "VALUE:bool",
         "VALUE:float",
+        "VALUE:float~pert+1",
+        "VALUE:float~pert-1",
+        "VALUE:float~pert+01",
+        "VALUE:float~pert-01",
         "VALUE:str",
     ]
 
@@ -771,3 +776,53 @@ def test_swap_dual_bare_floor_without_import_abstains():
     func = _fn("def f(x):\n    return floor(x)")
     keys = _record_dimensions(func, MutationCategory.SWAP, set())
     assert not any(k.endswith("~dual") for k in keys)
+
+
+def test_value_float_perturbations_join_the_collapse():
+    """Floats carry the collapse plus all four hail-mary perturbations."""
+    assert _ValueMutator._alternatives(150.0) == [
+        (0.0, "VALUE:float"),
+        (151.0, "VALUE:float~pert+1"),
+        (149.0, "VALUE:float~pert-1"),
+        (150.1, "VALUE:float~pert+01"),
+        (149.9, "VALUE:float~pert-01"),
+    ]
+    # v=0.0: +1.0 lands on the collapse (1.0) and drops out; the rest survive
+    assert _ValueMutator._alternatives(0.0) == [
+        (1.0, "VALUE:float"),
+        (-1.0, "VALUE:float~pert-1"),
+        (0.1, "VALUE:float~pert+01"),
+        (-0.1, "VALUE:float~pert-01"),
+    ]
+    # v=-1.0: +1.0 lands on the collapse (0.0) and drops out
+    assert _ValueMutator._alternatives(-1.0) == [
+        (0.0, "VALUE:float"),
+        (-2.0, "VALUE:float~pert-1"),
+        (-0.9, "VALUE:float~pert+01"),
+        (-1.1, "VALUE:float~pert-01"),
+    ]
+
+
+def test_value_float_perturbation_drops_out_at_magnitude_and_nan():
+    """A delta swallowed by float magnitude (both directions) is skipped, never
+    emitted as a mutant equal to the original; NaN never perturbs at all."""
+    # at 1e20 the float spacing exceeds every delta in every direction:
+    # each perturbation would equal the original, so only the collapse remains
+    big = _ValueMutator._alternatives(1e20)
+    assert [lab for _, lab in big] == ["VALUE:float"]
+    nan = _ValueMutator._alternatives(float("nan"))
+    assert [lab for _, lab in nan] == ["VALUE:float"]
+
+
+def test_value_float_perturbation_shifts_a_threshold():
+    """150.0 -> 151.0 on a comparison: any input in the shifted interval kills,
+    where BOUNDARY's endpoint shift would need the exact edge."""
+    func = _fn("def free(v):\n    return v >= 150.0")
+    muts = generate_mutants(func, {MutationCategory.VALUE}, max_per_category=0)
+    up = next(m for m in muts if m.dimension == "VALUE:float~pert+1")
+    f_up = _exec_mutant(up)["free"]
+    assert f_up(150.5) is False  # original returns True — in-interval input kills
+    # the down-mutant is the one a 150.0 -> 149.0 hand-bug hides behind
+    down = next(m for m in muts if m.dimension == "VALUE:float~pert-1")
+    f_down = _exec_mutant(down)["free"]
+    assert f_down(149.5) is True  # original returns False

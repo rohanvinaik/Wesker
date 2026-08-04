@@ -521,7 +521,32 @@ class _ValueMutator(_BaseMutator):
             off1 = v + 1 if v + 1 != collapse else v - 1
             return [(collapse, "VALUE:int"), (off1, "VALUE:int~off1")]
         if isinstance(v, float):
-            return [(0.0 if v else 1.0, "VALUE:float")]
+            collapse = 0.0 if v else 1.0
+            alts: list[tuple[Any, str]] = [(collapse, "VALUE:float")]
+            # Hail-mary perturbations (±1.0, ±0.1), BOTH directions per delta. A float
+            # literal has no canonical unit — no perturbation family can be COMPLETE
+            # the way int ±1 is — so these four catch the common magnitudes cheaply
+            # and no more. On a value (a rate, a multiplier) any golden capture kills
+            # them; on a comparison threshold each direction shifts the edge across a
+            # different interval, and only an input INSIDE that interval kills — the
+            # up-mutant pins the upper side, the down-mutant the lower, so one
+            # direction alone leaves half the shift class invisible (measured: a
+            # 150.0 -> 149.0 hand-bug survives a suite that kills only up-perts).
+            # What survives is the ask it is: the human holds the domain knowledge,
+            # and `flag` is how they spend it. NaN never perturbs (x+d is NaN,
+            # ==-invisible); a delta lost to float magnitude (1e20+0.1 == 1e20) or
+            # landing on the collapse drops out rather than duplicating a mutant.
+            if v == v:
+                for delta, label in (
+                    (1.0, "VALUE:float~pert+1"),
+                    (-1.0, "VALUE:float~pert-1"),
+                    (0.1, "VALUE:float~pert+01"),
+                    (-0.1, "VALUE:float~pert-01"),
+                ):
+                    cand = v + delta
+                    if cand != v and cand != collapse:
+                        alts.append((cand, label))
+            return alts
         if isinstance(v, str):
             return [("" if v else "mutated", "VALUE:str")]
         return []

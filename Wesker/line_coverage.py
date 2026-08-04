@@ -222,8 +222,15 @@ def _trace_one(
         return local
 
     def dispatch(frame, event, _arg):
-        if event == "call" and match(frame.f_code.co_filename) is not None:
-            return local
+        # This fires on EVERY call event in the traced program, so the common answer has to
+        # be the cheap one. `co_filename == target_file` settles it for every frame whose
+        # module was imported under the spelling the caller typed — all of them, until a
+        # symlink or a case-insensitive rename is in play. `match` is the identity fallback
+        # and is reached only when the two spellings genuinely differ.
+        if event == "call":
+            filename = frame.f_code.co_filename
+            if filename == target_file or match(filename) is not None:
+                return local
         return None
 
     truncated = _traced_in_thread(test_fn, dispatch, budget_s)
@@ -289,15 +296,23 @@ def _trace_one_multi(
         # Key by the caller's TARGET spelling, not co_filename: downstream lookups
         # (coverage_from_trace, the persisted suite trace) use what the caller typed,
         # and a same-file-different-spelling key would hide these lines from them.
+        # When co_filename IS one of the targets, that spelling is already the caller's,
+        # so the set membership both answers the question and supplies the key — this
+        # fires per LINE event, the hottest callback in the engine.
         if event == "line":
-            matched = match(frame.f_code.co_filename)
+            filename = frame.f_code.co_filename
+            matched = filename if filename in target_files else match(filename)
             if matched is not None:
                 hits.setdefault(matched, set()).add(frame.f_lineno)
         return local
 
     def dispatch(frame, event, _arg):
-        if event == "call" and match(frame.f_code.co_filename) is not None:
-            return local
+        # Per call event; see `local` above and `_trace_one` for why the exact-spelling
+        # check is inline and `match` is the identity fallback behind it.
+        if event == "call":
+            filename = frame.f_code.co_filename
+            if filename in target_files or match(filename) is not None:
+                return local
         return None
 
     truncated = _traced_in_thread(test_fn, dispatch, budget_s)
@@ -431,23 +446,42 @@ def coverage_from_trace(
         return {}
 
     # A persisted suite trace may key this file under another same-file spelling
-    # (case-insensitive filesystem, symlink, or a cache written by a caller who
-    # typed it differently). Exact lookup first; identity comparison as fallback,
-    # memoized across the per-test loop. Spellings are never rewritten.
-    alias: dict[str, str] = {}
+    # (case-insensitive filesystem, symlink, or a cache written by a caller who typed it
+    # differently). WHICH spellings those are is a property of the trace, not of any one
+    # test, so resolve it ONCE here. Doing it inside the per-test lookup meant every test
+    # that did not hit the target — i.e. nearly all of them, which is the normal shape of a
+    # scoped run — walked that test's whole key set before returning empty. Spellings are
+    # never rewritten; the alias only ever adds a place to look.
+    aliases: list[str] = []
+    try:
+        st = os.stat(target_file)
+    except OSError:
+        st = None
+    if st is not None:
+        target_id = (st.st_dev, st.st_ino)
+        checked: set[str] = {target_file}
+        for files in traced.values():
+            for key in files:
+                if key in checked:
+                    continue
+                checked.add(key)
+                # One stat per distinct key, against an identity read once above —
+                # `samefile` would re-stat the target for every comparison.
+                try:
+                    kst = os.stat(key)
+                except OSError:
+                    continue
+                if (kst.st_dev, kst.st_ino) == target_id:
+                    aliases.append(key)
 
     def _lines_for(files: dict[str, set[int]]) -> frozenset[int] | set[int]:
         got = files.get(target_file)
         if got is not None:
             return got
-        for key in files:
-            if key not in alias:
-                try:
-                    alias[key] = key if os.path.samefile(key, target_file) else ""
-                except OSError:
-                    alias[key] = ""
-            if alias[key]:
-                return files[key]
+        for key in aliases:  # empty in the ordinary case — one spelling, one file
+            got = files.get(key)
+            if got is not None:
+                return got
         return frozenset()
 
     return {

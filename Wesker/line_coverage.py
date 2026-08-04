@@ -450,7 +450,9 @@ def coverage_from_trace(
                 return files[key]
         return frozenset()
 
-    return {name: sorted(_lines_for(files) & exec_lines) for name, files in traced.items()}
+    return {
+        name: sorted(_lines_for(files) & exec_lines) for name, files in traced.items()
+    }
 
 
 def trace_line_coverage(

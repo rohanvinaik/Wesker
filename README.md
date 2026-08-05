@@ -9,7 +9,7 @@
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-3367d6.svg" alt="Python 3.10+"></a>
 </p>
 
-`9 semantic categories · 1.00 mutants per behavioral dimension · Zero dependencies · Fully deterministic`
+`10 semantic categories · 1.00 mutants per behavioral dimension · Zero dependencies · Fully deterministic`
 
 Point it at Detective's 25 files and it finds 2,795 behavioral questions your tests could leave open. A traditional tool asks those same questions **8,657 times**:
 
@@ -55,8 +55,9 @@ Each surviving mutant is one specific alteration that changes behavior and goes 
 | **TYPE** | `isinstance(x, T)`→`True` | Tests don't exercise type guards |
 | **STMT** | Deletes a statement (`items.append(y)`, `cfg[k] = v`) | Tests don't notice the statement's effect at all |
 | **EXCEPTION** | Raised type, handler body→`pass`, caught type→`BaseException` | Tests don't pin what raises, what's caught, or what a handler does |
+| **DATAFLOW** | Reference identity (`return x`→`return y`, wrong visible local) | Tests can't tell the right available value from its neighbor |
 
-The category *is* the diagnosis. A VALUE survivor says *assert the exact value, not the shape*. A BOUNDARY survivor says *test at the boundary, not near it*. The fix is always specific, never "write more tests." Together the categories cover the standard operator set from the literature — AOR, ROR, COR, UOI — plus **SDL** (statement deletion, which Delamaro and Offutt rank among the highest-value operators because it catches what operator-*replacement* structurally cannot), and domain operators for state, type guards, and exception behavior. `total = abs(total)` deleted a rebinding no replacement operator would touch; `cfg[k] = v` mutated a caller's object where `STATE` only ever targeted `self.x`; extraction across a `try` boundary changed what raises where. Each is a real refactor that passes every assertion a suite had, and none was a survivor before, because none was in the universe.
+The category *is* the diagnosis. A VALUE survivor says *assert the exact value, not the shape*. A BOUNDARY survivor says *test at the boundary, not near it*. The fix is always specific, never "write more tests." Together the categories cover the standard operator set from the literature — AOR, ROR, COR, UOI — plus **SDL** (statement deletion, which Delamaro and Offutt rank among the highest-value operators because it catches what operator-*replacement* structurally cannot), and domain operators for state, type guards, and exception behavior. `total = abs(total)` deleted a rebinding no replacement operator would touch; `cfg[k] = v` mutated a caller's object where `STATE` only ever targeted `self.x`; extraction across a `try` boundary changed what raises where; `return x` became `return y` in a function whose tests only ever ran `x == y` — the wrong-live-out fault every extraction risks, and no operator or argument swap can express it. Each is a real refactor that passes every assertion a suite had, and none was a survivor before, because none was in the universe.
 
 ---
 
@@ -103,6 +104,7 @@ The numbers above are the ones that matter, and these are the ones that do not:
 - **Wesker is not faster per mutant.** mutmut 3 runs a forking worker pool and did all 8,657 mutants in 81 s on Detective — about 9 ms each. In-process evaluation removes subprocess overhead, but a modern pooled runner has largely removed it too. Any claim of a ~400× per-mutant advantage would be measured against a tool that no longer exists.
 - **Suite time is the real variable.** Detective's suite runs in 0.3 s, the best case for a per-mutant runner. The covering-tests reduction compounds as suite time grows, so the gap widens on slow suites and narrows to nothing on fast ones.
 - **The claim is knowledge per mutant, not mutants per second.** 1.00 is not a speed record. It is the proof that no mutant was spent twice on the same question.
+- **Completeness is first-order, and says so.** Every mutant is one operator applied once to the original AST. Killing all of them identifies the function within that exact, versioned universe — `mutation_policy().policy_id` names it — not within the closure of repeated operator application: adjacent swaps generate every permutation, yet a suite can kill both single swaps of `g(a, b, c)` while never distinguishing the composite `g(c, b, a)`. First-order completeness is the claim; closure completeness would be a different theorem, and Wesker does not assert it.
 
 The reduction is in redundancy, not in rigour. Wesker does not test fewer things. It tests each thing once.
 

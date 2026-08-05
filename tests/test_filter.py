@@ -1,12 +1,13 @@
 """Tests for Wesker's Monty Hall categorical-exclusion layer (filter.py).
 
 A mutation-testing tool that ships an untested exclusion filter is a
-contradiction in terms — these pin every structural-signal branch, the
-Layer-1 category selection, and the Layer-2 predictive priors. Oracles are
-chosen to kill the surviving categories LintGate's profile flagged
-(BOUNDARY, LOGICAL, SWAP, TYPE, VALUE, ARITHMETIC): the per-construct
-matrix catches `isinstance→True` and `"self"→""` mutants because a
-construct that should *not* set a flag asserts it stays False.
+contradiction in terms — these pin the Layer-1 category selection and the
+Layer-2 predictive priors. Layer 1's whole contract is now a single sentence:
+a category is relevant exactly when the engine counts at least one target for
+it, so exclusion is lossless by construction. The structural-signal matrix
+that used to live here died with ``_collect_signals``: the signals were a
+second copy of each mutator's eligibility predicate, and issue #9 showed what
+a second copy costs (a false ``✓ COMPLETE`` over a dropped SWAP universe).
 """
 
 from __future__ import annotations
@@ -14,11 +15,9 @@ from __future__ import annotations
 import ast
 import textwrap
 
-from Wesker.engine import MutationCategory
+from Wesker.engine import MutationCategory, estimate_universe_size, generate_mutants
 from Wesker.filter import (
     CategoryPrior,
-    _classify_signal_node,
-    _collect_signals,
     filter_categories,
     prioritize_categories,
 )
@@ -30,103 +29,35 @@ def _fn(src: str) -> ast.FunctionDef:
     return node
 
 
-# ── Structural signals: one construct sets exactly one flag ──────
-# Each case asserts the target flag True AND leaves the others False, so an
-# isinstance→True mutant (which would flip an unrelated flag) is killed.
-
-
-def test_signals_comparison_only():
-    s = _collect_signals(_fn("def f(a, b):\n    return a < b\n"))
-    assert s.has_comparisons is True
-    assert (s.has_arithmetic, s.has_logical, s.has_isinstance) == (False, False, False)
-    assert s.has_self_assigns is False
-
-
-def test_signals_self_assign_requires_store_context():
-    # self.x = 1 is a Store; reading self.x (Load) must NOT count as a
-    # side-effecting assignment — kills the `and`→`or` mutant on the ctx check.
-    store = _collect_signals(_fn("def f(self):\n    self.x = 1\n"))
-    load = _collect_signals(_fn("def f(self):\n    return self.x\n"))
-    assert store.has_self_assigns is True
-    assert load.has_self_assigns is False
-
-
-def test_signals_self_literal_matters():
-    # `other.x = 1` is an attribute Store but not on self — kills the
-    # VALUE mutant that blanks the "self" literal (it would then match nothing,
-    # or with "self"→"" match empty ids).
-    other = _collect_signals(_fn("def f(other):\n    other.x = 1\n"))
-    assert other.has_self_assigns is False
-
-
-def test_signals_global_and_nonlocal():
-    assert (
-        _collect_signals(_fn("def f():\n    global g\n    g = 1\n")).has_global_nonlocal
-        is True
-    )
-
-
-def test_signals_isinstance():
-    s = _collect_signals(_fn("def f(a):\n    return isinstance(a, int)\n"))
-    assert s.has_isinstance is True
-    # A non-isinstance call must not trip it (kills isinstance-name VALUE mutant).
-    assert (
-        _collect_signals(_fn("def f(a):\n    return len(a)\n")).has_isinstance is False
-    )
-
-
-def test_signals_arithmetic_binop_and_unary():
-    assert (
-        _collect_signals(_fn("def f(a, b):\n    return a + b\n")).has_arithmetic is True
-    )
-    assert _collect_signals(_fn("def f(a):\n    return -a\n")).has_arithmetic is True
-    # Bitwise op is not in the arithmetic set — must stay False.
-    assert (
-        _collect_signals(_fn("def f(a, b):\n    return a & b\n")).has_arithmetic
-        is False
-    )
-
-
-def test_signals_logical_boolop_and_not():
-    assert (
-        _collect_signals(_fn("def f(a, b):\n    return a and b\n")).has_logical is True
-    )
-    assert _collect_signals(_fn("def f(a):\n    return not a\n")).has_logical is True
-
-
-def test_signals_constant_only_sets_nothing():
-    s = _collect_signals(_fn("def f():\n    return 1\n"))
-    assert not any(
-        [
-            s.has_comparisons,
-            s.has_self_assigns,
-            s.has_global_nonlocal,
-            s.has_isinstance,
-            s.has_arithmetic,
-            s.has_logical,
-        ]
-    )
-
-
-def test_collect_signals_counts_params():
-    assert _collect_signals(_fn("def f(a, b, c):\n    return 1\n")).param_count == 3
-    assert _collect_signals(_fn("def f():\n    return 1\n")).param_count == 0
-
-
-def test_classify_signal_node_mutates_in_place():
-    from Wesker.filter import _FunctionSignals
-
-    sig = _FunctionSignals()
-    cmp_node = ast.parse("a < b").body[0].value
-    _classify_signal_node(cmp_node, sig)
-    assert sig.has_comparisons is True
-
-
 # ── Layer 1: filter_categories ───────────────────────────────────
 
 
-def test_filter_value_always_present():
+def test_filter_eligibility_is_the_target_count():
+    """The one contract: cat ∈ filter_categories(f) ⇔ the engine counts ≥ 1
+    target for cat. Checked over EVERY category on a function that exercises
+    several (VALUE, BOUNDARY, ARITHMETIC, STATE) and misses the rest, so a
+    filter branch that drifted from the engine's count fails by name."""
+    fn = _fn(
+        """
+        def f(a, b):
+            if a < b:
+                return a + b
+            return 0
+        """
+    )
+    cats = filter_categories(fn)
+    for cat in MutationCategory:
+        assert (cat in cats) == (estimate_universe_size(fn, {cat}) > 0), cat.value
+
+
+def test_filter_value_follows_constants():
+    # `return 1` carries a VALUE target; a constant-free body carries none.
+    # VALUE used to be unconditionally relevant — harmless (zero targets
+    # generate zero mutants) but a lie about the universe.
     assert MutationCategory.VALUE in filter_categories(_fn("def f():\n    return 1\n"))
+    assert MutationCategory.VALUE not in filter_categories(
+        _fn("def f(a):\n    return a\n")
+    )
 
 
 def test_filter_swap_follows_call_sites_not_formal_parameters():
@@ -162,9 +93,38 @@ def test_filter_boundary_from_comparison():
 def test_filter_state_gated_by_purity():
     src = "def f(self):\n    self.x = 1\n"
     assert MutationCategory.STATE in filter_categories(_fn(src), is_pure=False)
-    # Pure functions cannot have observable state mutation — kills the
-    # `not is_pure and (...)` LOGICAL mutant.
+    # A caller asserting purity asserts self.x writes are unobservable — the
+    # remove_assign sub-mode's targets stop counting, and nothing else in this
+    # function counts toward STATE.
     assert MutationCategory.STATE not in filter_categories(_fn(src), is_pure=True)
+
+
+def test_filter_purity_never_hides_return_none():
+    # Purity suppresses ONLY remove_assign. A pure function that returns a
+    # value still owes its callers the return_none question.
+    src = "def f(a):\n    return a\n"
+    assert MutationCategory.STATE in filter_categories(_fn(src), is_pure=True)
+
+
+def test_filter_loop_flow_without_return_or_state_write():
+    """The silent universe shrink this rewrite closes: `break` is a live
+    loop_flow target, but the old signal gate (has_return_value or
+    self-assign/global) excluded STATE for a procedure with neither — so
+    `break` ↔ `continue` never entered its universe, the same #9 shape in a
+    different category."""
+    fn = _fn(
+        """
+        def drain(q, sink):
+            while True:
+                item = q.get()
+                if item is None:
+                    break
+                sink.append(item)
+        """
+    )
+    assert MutationCategory.STATE in filter_categories(fn)
+    state_mutants = generate_mutants(fn, {MutationCategory.STATE}, max_per_category=0)
+    assert any("swap break/continue" in m.description for m in state_mutants)
 
 
 def test_filter_type_arithmetic_logical():
@@ -177,6 +137,22 @@ def test_filter_type_arithmetic_logical():
     assert MutationCategory.LOGICAL in filter_categories(
         _fn("def f(a, b):\n    return a and b\n")
     )
+
+
+def test_filter_exception_counts_real_targets():
+    assert MutationCategory.EXCEPTION in filter_categories(
+        _fn("def f(a):\n    raise ValueError(a)\n")
+    )
+    assert MutationCategory.EXCEPTION not in filter_categories(
+        _fn("def f(a):\n    return a\n")
+    )
+
+
+def test_filter_empty_universe_is_an_empty_set():
+    # A body with no targets in ANY category filters to nothing at all —
+    # under the old unconditional-VALUE rule this returned {VALUE} and callers
+    # profiled a zero-mutant function.
+    assert filter_categories(_fn("def f():\n    pass\n")) == set()
 
 
 # ── Layer 2: prioritize_categories ───────────────────────────────

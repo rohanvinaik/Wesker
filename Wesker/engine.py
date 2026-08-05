@@ -18,7 +18,7 @@ import types
 from dataclasses import dataclass, field
 from contextvars import ContextVar
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from .interrupt import abandon as _abandon
 from .line_coverage import coverage_from_trace as _coverage_from_trace
@@ -105,6 +105,12 @@ class MutationCategory(str, Enum):
     # three orthogonal sub-modes (see _ExceptionMutator) counted against their own
     # target sets, the same shape STATE uses.
     EXCEPTION = "EXCEPTION"
+    # Reference identity: does this expression use the CORRECT available value
+    # (issue #10)? Two sub-modes (return_sub / name_sub, see _DataflowMutator) —
+    # the wrong-reference fault class that preserves every operator and
+    # control-flow shape, and the signature fault family of extraction
+    # refactors (wrong helper input, wrong live-out).
+    DATAFLOW = "DATAFLOW"
 
 
 @dataclass
@@ -830,11 +836,15 @@ class _SwapMutator(_BaseMutator):
 
 
 class _StateMutator(_BaseMutator):
-    """Remove self.x = ... assignments, replace return with return None, or
-    swap break ↔ continue (loop_flow mode) — "leave the loop" and "skip this
-    iteration" are one keyword apart and a classic transposition bug; no other
-    operator can express it (SDL deletes the statement, which crashes nothing
-    and reads as unreachable-code noise instead of the control-flow question)."""
+    """Remove self.x writes (plain, annotated, and augmented spellings — all
+    three are the same behavioral question per attribute), replace return with
+    return None, or swap break ↔ continue (loop_flow mode) — "leave the loop"
+    and "skip this iteration" are one keyword apart and a classic transposition
+    bug; no other operator can express it (SDL deletes the statement, which
+    crashes nothing and reads as unreachable-code noise instead of the
+    control-flow question). AnnAssign/AugAssign self-writes joined under
+    policy 3 (measured cost: +28 targets / +0.31% on Wesker's own package,
+    +4 / +0.03% on Detective's)."""
 
     def __init__(self, target_index: int = 0, mode: str = "remove_assign"):
         super().__init__(target_index)
@@ -844,16 +854,63 @@ class _StateMutator(_BaseMutator):
         if self.applied or self.mode != "remove_assign":
             return node
         for target in node.targets:
-            if (
-                isinstance(target, ast.Attribute)
-                and isinstance(target.value, ast.Name)
-                and target.value.id == "self"
-            ):
+            # One predicate for "is this a self.x write", shared by all three
+            # write spellings (Assign / AnnAssign / AugAssign below).
+            if _is_self_assign(target):
                 if self.current == self.target:
                     self._mark_applied(node)
-                    return ast.Pass()
+                    # Un-bind exactly THIS target. `self.a = self.b = x` asks
+                    # two distinct questions (is a's write observed? is b's?),
+                    # and replacing the whole statement answered both with ONE
+                    # mutant — two dimensions whose mutants were byte-identical
+                    # (same content id), and a kill via `a` said nothing about
+                    # `b`. Per-target removal mirrors BOUNDARY's chained-
+                    # compare precedent: mutate one part, keep the rest. A
+                    # statement left with no targets becomes `pass`, which
+                    # keeps every single-target mutant byte-identical to the
+                    # policy-3 universe.
+                    remaining = [t for t in node.targets if t is not target]
+                    if not remaining:
+                        return ast.Pass()
+                    node.targets = remaining
+                    return node
                 self._note(f"STATE:remove_assign:{target.attr}")
                 self.current += 1
+        return node
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST:
+        # `self.x: T = v` writes state exactly as the unannotated spelling does
+        # (the annotation on an attribute target has no runtime effect), and it
+        # was invisible to this mode until the counter migration exposed the
+        # gap: the old signal filter listed STATE for annotated-assign
+        # __init__s while the engine had zero targets. A valueless
+        # `self.x: T` declares and writes nothing — not a target. Same
+        # dimension label as the plain spelling: however the write is spelled,
+        # "is the write to self.x observed?" is one behavioral question.
+        if self.applied or self.mode != "remove_assign":
+            return node
+        if node.value is not None and _is_self_assign(node.target):
+            if self.current == self.target:
+                self._mark_applied(node)
+                return ast.Pass()
+            self._note(f"STATE:remove_assign:{node.target.attr}")
+            self.current += 1
+        return node
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST:
+        # `self.x += v` -> pass keeps the PRIOR value — the same rationale as
+        # STMT's rebinding deletion (`total = abs(total)`): in an original
+        # that runs, the attribute was already readable, so dropping the
+        # update cannot raise; what dies is exactly the state change a
+        # refactor most plausibly loses.
+        if self.applied or self.mode != "remove_assign":
+            return node
+        if _is_self_assign(node.target):
+            if self.current == self.target:
+                self._mark_applied(node)
+                return ast.Pass()
+            self._note(f"STATE:remove_assign:{node.target.attr}")
+            self.current += 1
         return node
 
     def visit_Return(self, node: ast.Return) -> ast.AST:
@@ -1005,6 +1062,74 @@ def _handler_is_noop(node: ast.ExceptHandler) -> bool:
     return len(node.body) == 1 and isinstance(node.body[0], ast.Pass)
 
 
+# str methods that return str when the receiver is str. Small and boring on
+# purpose (the _DUALS discipline): every entry widens what `_statically_str`
+# can prove, and a wrong entry would delete a live dimension — the one error
+# the completeness claim cannot survive.
+_STR_RETURNING_METHODS = frozenset(
+    {
+        "join",
+        "format",
+        "replace",
+        "strip",
+        "lstrip",
+        "rstrip",
+        "upper",
+        "lower",
+        "casefold",
+        "title",
+        "capitalize",
+    }
+)
+
+
+def _statically_str(node: ast.AST) -> bool:
+    """True only when ``node`` PROVABLY evaluates to str in an original that
+    runs: a str literal, an f-string, a str-returning method on a provably-str
+    receiver, or an Add of two provably-str operands. Deliberately excludes
+    annotations (they can lie) and one-sided Adds (``'a' + x`` can meet a
+    custom ``__radd__`` returning anything). Issue #12."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str)
+    if isinstance(node, ast.JoinedStr):
+        return True
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _STR_RETURNING_METHODS
+    ):
+        return _statically_str(node.func.value)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _statically_str(node.left) and _statically_str(node.right)
+    return False
+
+
+def _type_impossible_swap(node: ast.BinOp) -> bool:
+    """True when every swap of this operator is crash-only BY TYPE, so the
+    mutant would measure reachability, not specification (issue #12 — the
+    same principle that keeps first-binding deletions and non-mutable
+    constants out of the universe).
+
+    Provable cases only:
+      * ``str + str`` — ``str - str`` fails both dunder lookups on every input;
+      * ``str * int-literal`` (either order) — ``str / int`` likewise.
+    A one-sided ``'a' + x`` stays IN the universe: ``x`` may carry an
+    ``__radd__``/``__rsub__`` that makes the swap behavioral.
+    """
+    if isinstance(node.op, ast.Add):
+        return _statically_str(node.left) and _statically_str(node.right)
+    if isinstance(node.op, ast.Mult):
+
+        def int_literal(n: ast.AST) -> bool:
+            # bool is an int; a bool literal stays in the universe.
+            return isinstance(n, ast.Constant) and type(n.value) is int
+
+        return (_statically_str(node.left) and int_literal(node.right)) or (
+            int_literal(node.left) and _statically_str(node.right)
+        )
+    return False
+
+
 class _ArithmeticMutator(_BaseMutator):
     """Replace arithmetic operators: + ↔ -, * ↔ /, // → /, % → *, ** → *.
 
@@ -1026,7 +1151,12 @@ class _ArithmeticMutator(_BaseMutator):
         if self.applied:
             return self.generic_visit(node)
         swapped = self._BIN_SWAP.get(type(node.op))
-        if swapped:
+        # A swap that is crash-only BY TYPE (`'a' - 'b'`) is not a behavioral
+        # question — skipping it is Monty Hall elimination, not sampling, and
+        # it stops type-impossible mutants from padding the unproven-equivalent
+        # bucket downstream (issue #12: 8 of 12 "modulo" residuals on a string
+        # builder were this shape).
+        if swapped and not _type_impossible_swap(node):
             if self.current == self.target:
                 self._mark_applied(node)
                 node.op = swapped()
@@ -1316,6 +1446,273 @@ class _StmtMutator(_BaseMutator):
         return self._consider(node)
 
 
+# The ENROLLED slice is return_sub alone, and that is a measured decision,
+# not a smaller ambition. Measured on real repos before enrollment (the
+# _DUALS discipline): return_sub costs +2.7% targets on Wesker's own package
+# and +2.5% on Detective's — the wrong-live-out question, the highest-value
+# reference fault for refactor verification. name_sub as implemented below
+# (every eligible load × every visible candidate) costs +239% targets / +217%
+# dimensions on Wesker and +205%/+165% on Detective — it TRIPLES the universe,
+# the exact naive combinatorial explosion issue #10 forbids. The machinery
+# stays implemented, record-countable, and tested (_DataflowMutator(mode=
+# "name_sub")) so the next slice is a candidate-restraint design plus one
+# tuple entry — but it does not enter the universe until a restraint brings
+# its measured cost into curated-table territory.
+_DATAFLOW_SUB_MODES = (("return_sub", "substitute returned reference"),)
+
+
+def _dataflow_candidates(root: ast.AST) -> dict[int, tuple[str, str, tuple[str, ...]]]:
+    """``id(Name-load node) → (sub_mode, original name, candidate names)`` for
+    every reference the DATAFLOW family may substitute (issue #10).
+
+    The behavioral question is "does this expression use the CORRECT available
+    value?" — the wrong-reference fault class that preserves every operator
+    and control-flow shape (``return x`` for ``return y``, the wrong helper
+    input, a captured near-name). No other category can express it: SWAP owns
+    argument ORDER and callable identity, VALUE owns constants; reference
+    IDENTITY was outside the universe entirely.
+
+    Conservatism rules, each in the direction that WITHHOLDS a dimension:
+
+    * the candidate pool is parameters (positional/keyword; never ``*args`` /
+      ``**kwargs``, whose shapes make crash noise) and plain single-name
+      assignment targets — never imports, defs, classes, comprehension or
+      loop targets;
+    * a candidate must be bound BEFORE the load's enclosing statement, under
+      ``_deletable_stmt_ids``'s narrow rule — a parameter, or an earlier
+      statement in the SAME block; sibling and inner-block bindings never
+      escape, so no substitution can manufacture an UnboundLocalError (a
+      guaranteed-crash mutant measures reachability, not specification);
+    * loads inside nested functions, lambdas, and comprehensions are skipped
+      whole — their frames own their names, and shadowing across that
+      boundary is exactly where a cheap analysis fabricates false dimensions;
+    * the callee position of a call is skipped — callable identity belongs to
+      SWAP's curated duals;
+    * only loads whose OWN name is in the pool are substituted — ``math`` in
+      ``math.floor`` is not a value that flows.
+
+    One dimension per substitution QUESTION: the label ``DATAFLOW:x→y``
+    deliberately collapses every site asking "is x distinguished from y" into
+    one behavioral dimension, exactly as ``SWAP:<callee>`` collapses call
+    sites — exhaustive mode still visits every site, DOF mode spends one
+    mutant per question.
+    """
+    sites: dict[int, tuple[str, str, tuple[str, ...]]] = {}
+    if not isinstance(root, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return sites
+
+    pool: dict[str, None] = {}  # insertion-ordered set: signature, then binding order
+    a = root.args
+    for arg in a.posonlyargs + a.args + a.kwonlyargs:
+        # A receiver is not a value that flows: `self.x = 0` asks an aliasing
+        # question (`xs.x = 0`?) this slice does not own, and nearly every
+        # receiver substitution is type-incompatible crash noise.
+        if arg.arg not in ("self", "cls"):
+            pool[arg.arg] = None
+
+    def stmt_bindings(stmt: ast.stmt) -> list[str]:
+        """Plain single-name targets this statement binds — the only binding
+        shape that joins the candidate pool."""
+        names: list[str] = []
+        if isinstance(stmt, ast.Assign):
+            names.extend(t.id for t in stmt.targets if isinstance(t, ast.Name))
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            if isinstance(stmt.target, ast.Name):
+                names.append(stmt.target.id)
+        elif isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name):
+            names.append(stmt.target.id)
+        return names
+
+    def collect_loads(expr: ast.AST, bound: dict[str, None]) -> None:
+        """Register every eligible Name load reachable in ``expr`` without
+        crossing a scope boundary; ``bound`` is the pool bound before the
+        enclosing statement."""
+        stack: list[ast.AST] = [expr]
+        while stack:
+            node = stack.pop()
+            if isinstance(
+                node,
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.Lambda,
+                    ast.ListComp,
+                    ast.SetComp,
+                    ast.DictComp,
+                    ast.GeneratorExp,
+                ),
+            ):
+                continue  # another frame's names — skipped whole
+            if isinstance(node, ast.Call):
+                # The callee is SWAP's question; arguments are ours.
+                stack.extend(node.args)
+                stack.extend(kw.value for kw in node.keywords)
+                if isinstance(node.func, ast.Attribute):
+                    stack.append(node.func.value)  # obj in obj.method(...) flows
+                continue
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                if node.id in bound:
+                    cands = tuple(n for n in bound if n != node.id)
+                    if cands:
+                        sites[id(node)] = ("name_sub", node.id, cands)
+                continue
+            stack.extend(ast.iter_child_nodes(node))
+
+    def walk_block(stmts: list[ast.stmt], bound_in: dict[str, None]) -> None:
+        bound = dict(bound_in)
+        for stmt in stmts:
+            if isinstance(stmt, ast.Return):
+                # return_sub owns the whole-Name return; its operand is not
+                # additionally a name_sub site.
+                if isinstance(stmt.value, ast.Name) and isinstance(
+                    stmt.value.ctx, ast.Load
+                ):
+                    if stmt.value.id in bound:
+                        cands = tuple(n for n in bound if n != stmt.value.id)
+                        if cands:
+                            sites[id(stmt.value)] = (
+                                "return_sub",
+                                stmt.value.id,
+                                cands,
+                            )
+                elif stmt.value is not None:
+                    collect_loads(stmt.value, bound)
+            elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                pass  # nested frame: neither its loads nor its bindings are ours
+            else:
+                # Loads anywhere in this statement's expressions see the
+                # pool as bound BEFORE the statement (RHS evaluates first).
+                for child in ast.iter_child_nodes(stmt):
+                    if isinstance(child, ast.expr):
+                        collect_loads(child, bound)
+                # Inner blocks see this prefix; their bindings never escape.
+                for field in ("body", "orelse", "finalbody"):
+                    inner = getattr(stmt, field, None)
+                    if inner and isinstance(inner[0], ast.stmt):
+                        walk_block(inner, bound)
+                for handler in getattr(stmt, "handlers", []):
+                    walk_block(handler.body, bound)
+            for name in stmt_bindings(stmt):
+                bound[name] = None
+
+    walk_block(root.body, pool)
+    return sites
+
+
+class _DataflowMutator(_BaseMutator):
+    """Substitute one loaded reference for another visible, compatible one.
+
+    Two sub-modes over one analysis (``_dataflow_candidates``): ``return_sub``
+    rewrites ``return x`` to ``return y`` — the highest-value slice for
+    refactor verification, where returning the wrong live-out is the classic
+    extraction fault — and ``name_sub`` rewrites any other eligible load.
+    The analysis is the single source of truth: record mode, target counting,
+    and mutation all read the same site table, so none can drift.
+    """
+
+    def __init__(self, target_index: int = 0, mode: str = "return_sub"):
+        super().__init__(target_index)
+        self.mode = mode
+        self._sites: dict[int, tuple[str, str, tuple[str, ...]]] | None = None
+
+    def visit(self, node: ast.AST) -> ast.AST:
+        if self._sites is None:
+            self._sites = _dataflow_candidates(node)
+        return super().visit(node)
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if self.applied or self._sites is None:
+            return node
+        entry = self._sites.get(id(node))
+        if entry is None or entry[0] != self.mode:
+            return node
+        _mode, orig, candidates = entry
+        tag = "return:" if self.mode == "return_sub" else ""
+        for cand in candidates:
+            selected = not self.applied and self.current == self.target
+            self._note(f"DATAFLOW:{tag}{orig}→{cand}")
+            self.current += 1
+            if not selected:
+                continue
+            self._mark_applied(node)
+            return ast.copy_location(ast.Name(id=cand, ctx=ast.Load()), node)
+        return node
+
+
+def _record_dataflow_dimensions(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> list[str]:
+    """Dimension keys for one DATAFLOW sub-mode, in transformer-visit order."""
+    tree = copy.deepcopy(func_node)
+    mutator = _DataflowMutator(-1, mode)
+    mutator.keys = []
+    mutator.visit(tree)
+    return mutator.keys
+
+
+def _count_dataflow_targets(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> int:
+    """Targets for one DATAFLOW sub-mode — counted by RUNNING the mutator in
+    record mode, the same one-analysis rule as every other category."""
+    return len(_record_dataflow_dimensions(func_node, mode))
+
+
+def _generate_dataflow_mutants(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    max_per_category: int | None,
+    greedy: bool = True,
+    pass_index: int = 0,
+) -> list[Mutant]:
+    """Generate DATAFLOW mutants across the sub-modes (return + loaded refs).
+
+    Mirrors ``_generate_exception_mutants``: independent sub-modes, each with
+    its own target index space, each selected against its own budget.
+    """
+    mutants: list[Mutant] = []
+    cat = MutationCategory.DATAFLOW
+
+    for mode, desc in _DATAFLOW_SUB_MODES:
+        all_keys = _record_dataflow_dimensions(func_node, mode)
+        target_count = len(all_keys)
+        keys = all_keys if greedy else []
+        budget = (
+            _live_dimension_count(keys)
+            if max_per_category is None
+            else max_per_category
+        )
+        limit = min(target_count, budget) if budget > 0 else target_count
+
+        if greedy and budget > 0 and target_count > limit:
+            selected = _select_greedy(keys, target_count, limit, pass_index)
+        else:
+            selected = list(range(limit))
+
+        for i in selected:
+            mutated_tree = copy.deepcopy(func_node)
+            transformer = _DataflowMutator(i, mode)
+            mutated_node = transformer.visit(mutated_tree)
+            ast.fix_missing_locations(mutated_node)
+
+            if transformer.applied:
+                mid = _content_mutant_id(cat, mutated_node)
+                mutants.append(
+                    Mutant(
+                        category=cat,
+                        original_node=func_node,
+                        mutated_node=mutated_node,
+                        description=f"{mid}: {desc}",
+                        location=getattr(func_node, "lineno", 0),
+                        mutant_id=mid,
+                        target_index=i,
+                        mutated_line=transformer.mutated_lineno,
+                        dimension=keys[i] if i < len(keys) else "",
+                    )
+                )
+
+    return mutants
+
+
 # ── Mutant Generation ─────────────────────────────────────────────
 
 
@@ -1343,21 +1740,27 @@ def _docstring_positions(
 def _count_targets(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef, category: MutationCategory
 ) -> int:
-    """Count how many mutation targets exist for a category in a function."""
-    counter = _TARGET_COUNTERS.get(category)
-    if counter is None:
-        return 0
-    # VALUE needs docstring exclusion — pass positions through.
-    if category == MutationCategory.VALUE:
-        ds_pos = _docstring_positions(func_node)
-        return sum(_count_value_target(node, ds_pos) for node in ast.walk(func_node))
-    # STMT deletability depends on what is bound BEFORE a statement, which no per-node
-    # counter can see. Same analysis the mutator runs, so the two cannot drift.
+    """Count how many mutation targets exist for a category in a function.
+
+    Every count derives from the SAME analysis the category's mutator runs —
+    record mode for the single-transformer categories, the per-sub-mode
+    recorders for STATE/EXCEPTION, ``_deletable_stmt_ids`` for STMT,
+    ``_SwapMutator._alternatives`` for SWAP — so the counter and the
+    transformer cannot drift. This function used to dispatch over a table of
+    per-node counters that re-encoded each mutator's eligibility predicate by
+    hand; a second copy of an eligibility predicate is a defect class here,
+    not a style issue — issue #9 shipped a false ``✓ COMPLETE`` because SWAP's
+    filter proxy answered a different question than the mutator. Dead
+    dimensions (a site whose op has no swap) are counted, exactly as
+    generation will see them.
+    """
+    # STMT deletability depends on what is bound BEFORE a statement, which no
+    # per-node view can see. Same analysis the mutator runs.
     if category == MutationCategory.STMT:
         return len(_deletable_stmt_ids(func_node))
-    # SWAP eligibility (unwrap) depends on statement position, which no per-node
-    # counter can see — same shape as STMT. Derive from _SwapMutator._alternatives
-    # over the same tree, so the count cannot drift from the mutator's _note calls.
+    # SWAP eligibility (unwrap) depends on statement position — derive from
+    # _SwapMutator._alternatives over the same tree, so the count cannot drift
+    # from the mutator's _note calls.
     if category == MutationCategory.SWAP:
         stmt_ids = _stmt_call_ids(func_node)
         bindings = _scope_bindings(func_node)
@@ -1366,159 +1769,40 @@ def _count_targets(
             for node in ast.walk(func_node)
             if isinstance(node, ast.Call)
         )
-    # EXCEPTION's sub-modes each have their own target space, and their skip rules
-    # (bare re-raise, already-``pass`` handler, untyped ``except:``) live in the
-    # mutator — so count by running it, not by re-encoding the rules here.
+    # STATE and EXCEPTION carry independent sub-modes, each with its own
+    # target index space; count them the way generation iterates them.
+    if category == MutationCategory.STATE:
+        return sum(
+            _count_state_targets(func_node, mode) for mode, _desc in _STATE_SUB_MODES
+        )
     if category == MutationCategory.EXCEPTION:
         return sum(
             _count_exception_targets(func_node, mode)
             for mode, _desc in _EXCEPTION_SUB_MODES
         )
-    return sum(counter(node) for node in ast.walk(func_node))
+    if category == MutationCategory.DATAFLOW:
+        return sum(
+            _count_dataflow_targets(func_node, mode)
+            for mode, _desc in _DATAFLOW_SUB_MODES
+        )
+    # Single-transformer categories: run the mutator in record mode and count
+    # its notes. VALUE additionally needs docstring positions so documentation
+    # constants stay out of the universe.
+    ds_pos = (
+        _docstring_positions(func_node) if category == MutationCategory.VALUE else None
+    )
+    return len(_record_dimensions(func_node, category, ds_pos))
 
 
-def _count_value_target(
-    node: ast.AST,
-    docstring_positions: set[tuple[int, int]] | None = None,
-) -> int:
-    # Only count constants whose types _ValueMutator can actually mutate.
-    # None, bytes, complex, and Ellipsis are left unchanged by _mutate_constant,
-    # so counting them produces phantom mutants that always survive.
-    # Skip docstring constants — they produce equivalent mutants that waste budget.
-    if isinstance(node, ast.Constant) and isinstance(
-        node.value, _ValueMutator._MUTABLE_TYPES
-    ):
-        if (
-            docstring_positions
-            and isinstance(node.value, str)
-            and (node.lineno, node.col_offset) in docstring_positions
-        ):
-            return 0
-        # Derived from _alternatives so the count can never drift from the
-        # mutator's _note calls (ints carry two dimensions, everything else one).
-        return len(_ValueMutator._alternatives(node.value))
-    return 0
-
-
-def _count_boundary_target(node: ast.AST) -> int:
-    if not isinstance(node, ast.Compare):
-        return 0
-    # One dimension per alternative per op (a dead op still notes once) — derive
-    # from _alternatives so this never drifts from _BoundaryMutator's _note count.
-    return sum(len(_BoundaryMutator._alternatives(op)) or 1 for op in node.ops)
-
-
-def _count_swap_target(node: ast.AST) -> int:
-    """Per-node SWAP counter — NOT used for SWAP.
-
-    Unwrap eligibility is a statement-position property no per-node counter can
-    see, so ``_count_targets`` special-cases SWAP over the whole function via
-    ``_SwapMutator._alternatives`` (same shape as STMT). Retained only so the
-    ``_TARGET_COUNTERS`` dispatch stays total.
-    """
-    return 0
-
-
-def _is_self_assign(target: ast.AST) -> bool:
+def _is_self_assign(target: ast.AST) -> TypeGuard[ast.Attribute]:
+    """True exactly for a ``self.x`` write target. A TypeGuard so the caller
+    keeps the ``ast.Attribute`` narrowing (``target.attr``) the inline
+    isinstance chain used to provide."""
     return (
         isinstance(target, ast.Attribute)
         and isinstance(target.value, ast.Name)
         and target.value.id == "self"
     )
-
-
-def _count_state_assign_target(node: ast.AST) -> int:
-    """Count self.x = ... assignments (remove_assign mode)."""
-    if isinstance(node, ast.Assign):
-        return sum(1 for t in node.targets if _is_self_assign(t))
-    return 0
-
-
-def _count_state_return_target(node: ast.AST) -> int:
-    """Count return-with-value nodes (return_none mode)."""
-    if isinstance(node, ast.Return) and node.value is not None:
-        return 1
-    return 0
-
-
-def _count_state_loop_target(node: ast.AST) -> int:
-    """Count break/continue statements (loop_flow mode)."""
-    return 1 if isinstance(node, (ast.Break, ast.Continue)) else 0
-
-
-def _count_state_target(node: ast.AST) -> int:
-    return (
-        _count_state_assign_target(node)
-        + _count_state_return_target(node)
-        + _count_state_loop_target(node)
-    )
-
-
-def _count_type_target(node: ast.AST) -> int:
-    return (
-        1
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "isinstance"
-        else 0
-    )
-
-
-def _count_arithmetic_target(node: ast.AST) -> int:
-    """Count arithmetic mutation targets (BinOp + AugAssign + unary negation).
-
-    Must stay in lockstep with ``_ArithmeticMutator``'s ``visit_*`` methods —
-    the count defines the index range generation iterates, and it has to equal
-    the number of ``_note`` calls the mutator makes over the same constructs.
-    """
-    if isinstance(node, ast.BinOp) and type(node.op) in _ArithmeticMutator._BIN_SWAP:
-        return 1
-    if (
-        isinstance(node, ast.AugAssign)
-        and type(node.op) in _ArithmeticMutator._BIN_SWAP
-    ):
-        return 1
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-        return 1
-    return 0
-
-
-def _count_logical_target(node: ast.AST) -> int:
-    """Count logical mutation targets (BoolOp + not removal)."""
-    if isinstance(node, ast.BoolOp) and type(node.op) in _LogicalMutator._BOOL_SWAP:
-        return 1
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-        return 1
-    return 0
-
-
-def _count_stmt_target(node: ast.AST) -> int:
-    """Per-node STMT counter — NOT used for STMT.
-
-    STMT deletability is a FUNCTION-level property (is this name already bound?), so it
-    cannot be decided from a node in isolation the way every other category's counter can.
-    ``_count_targets`` therefore special-cases STMT and calls :func:`_deletable_stmt_ids`
-    over the whole function, exactly as ``_StmtMutator`` does — one analysis, so the
-    counter and the mutator cannot disagree about how many targets exist.
-
-    Retained only so the ``_TARGET_COUNTERS`` dispatch stays total.
-    """
-    return 0
-
-
-_TARGET_COUNTERS: dict[MutationCategory, Callable[[ast.AST], int]] = {
-    MutationCategory.VALUE: _count_value_target,
-    MutationCategory.BOUNDARY: _count_boundary_target,
-    MutationCategory.SWAP: _count_swap_target,
-    MutationCategory.STATE: _count_state_target,
-    MutationCategory.TYPE: _count_type_target,
-    MutationCategory.ARITHMETIC: _count_arithmetic_target,
-    MutationCategory.LOGICAL: _count_logical_target,
-    MutationCategory.STMT: _count_stmt_target,
-    # Like STMT, a stub: EXCEPTION is counted per sub-mode in _count_targets, which
-    # cannot be expressed as a per-node function. Present so the dispatch stays total.
-    MutationCategory.EXCEPTION: lambda _node: 0,
-}
 
 
 def _content_mutant_id(category: MutationCategory, mutated_node: ast.AST) -> str:
@@ -1551,27 +1835,26 @@ def _generate_state_mutants(
     - loop_flow: swaps ``break`` ↔ ``continue``
 
     Each sub-mode gets its own target count and transformer pass so that
-    target indices align correctly with what the transformer visits. Under
-    ``greedy`` the assign sub-mode is ordered by distinct attribute (its
-    behavioral dimension) so a budget spreads across state fields before
-    repeating one; both sub-modes are always represented (they are two
-    distinct dimensions the greedy never collapses).
+    target indices align correctly with what the transformer visits. The
+    target count IS the record run's note count — one analysis, so the count
+    and the visit order cannot disagree. Under ``greedy`` the assign sub-mode
+    is ordered by distinct attribute (its behavioral dimension) so a budget
+    spreads across state fields before repeating one; both sub-modes are
+    always represented (they are two distinct dimensions the greedy never
+    collapses).
     """
     mutants: list[Mutant] = []
     cat = MutationCategory.STATE
 
-    sub_modes = [
-        ("remove_assign", "remove state assignment", _count_state_assign_target),
-        ("return_none", "replace return with None", _count_state_return_target),
-        ("loop_flow", "swap break/continue", _count_state_loop_target),
-    ]
-
-    for mode, desc, counter in sub_modes:
-        target_count = sum(counter(node) for node in ast.walk(func_node))
+    for mode, desc in _STATE_SUB_MODES:
+        all_keys = _record_state_dimensions(func_node, mode)
+        target_count = len(all_keys)
+        # Greedy selection consumes the keys; the non-greedy path never did,
+        # and keeps its historical empty list so mutant.dimension stays "".
+        keys = all_keys if greedy else []
         # Each sub-mode is selected against its own budget; in DOF mode that is
         # the sub-mode's own degrees of freedom (distinct state fields, or the
         # single return_none dimension).
-        keys = _record_state_dimensions(func_node, mode) if greedy else []
         budget = (
             _live_dimension_count(keys)
             if max_per_category is None
@@ -1757,6 +2040,22 @@ def _record_state_dimensions(
     mutator.keys = []
     mutator.visit(tree)
     return mutator.keys
+
+
+_STATE_SUB_MODES = (
+    ("remove_assign", "remove state assignment"),
+    ("return_none", "replace return with None"),
+    ("loop_flow", "swap break/continue"),
+)
+
+
+def _count_state_targets(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> int:
+    """Targets for one STATE sub-mode. Counted by RUNNING the mutator in record
+    mode — the same one-analysis rule as ``_count_exception_targets``, so the
+    counter and the transformer cannot drift."""
+    return len(_record_state_dimensions(func_node, mode))
 
 
 def _record_exception_dimensions(
@@ -2382,12 +2681,17 @@ def dimension_budget(
     if category is MutationCategory.STATE:
         return sum(
             _live_dimension_count(_record_state_dimensions(func_node, mode))
-            for mode in ("remove_assign", "return_none", "loop_flow")
+            for mode, _desc in _STATE_SUB_MODES
         )
     if category is MutationCategory.EXCEPTION:
         return sum(
             _live_dimension_count(_record_exception_dimensions(func_node, mode))
             for mode, _desc in _EXCEPTION_SUB_MODES
+        )
+    if category is MutationCategory.DATAFLOW:
+        return sum(
+            _live_dimension_count(_record_dataflow_dimensions(func_node, mode))
+            for mode, _desc in _DATAFLOW_SUB_MODES
         )
     return _live_dimension_count(
         _record_dimensions(func_node, category, docstring_positions)
@@ -2532,6 +2836,14 @@ def generate_mutants(
                 )
             )
             continue
+        # DATAFLOW: same independent-sub-mode shape (return_sub / name_sub).
+        if cat == MutationCategory.DATAFLOW:
+            mutants.extend(
+                _generate_dataflow_mutants(
+                    func_node, max_per_category, greedy=greedy, pass_index=pass_index
+                )
+            )
+            continue
 
         target_count = _count_targets(func_node, cat)
         # DOF mode (max_per_category is None): the budget IS this category's
@@ -2624,6 +2936,10 @@ def _make_transformer(
         # Reached only by a caller doing single-transformer generation; the normal path
         # routes EXCEPTION through _generate_exception_mutants (independent sub-modes).
         return _ExceptionMutator(index, "raise_type"), "replace raised exception type"
+    if category == MutationCategory.DATAFLOW:
+        # Same caveat: the normal path routes DATAFLOW through
+        # _generate_dataflow_mutants (independent sub-modes).
+        return _DataflowMutator(index, "return_sub"), "substitute returned reference"
     msg = f"Unknown category: {category}"
     raise ValueError(msg)
 

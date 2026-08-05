@@ -28,12 +28,17 @@ that the selection is optimal, not a claim about anyone's tests.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _DETECTIVE_PKG = "detective-spec"
 
@@ -312,6 +317,41 @@ def _annotate(report: dict) -> None:
 # ── Entry point ──────────────────────────────────────────────────
 
 
+def _stream_reentry() -> "Callable[[], None]":
+    """Snapshot the REAL stdout/stderr fds; return the hand that re-enters them.
+
+    Self-profiling runs mutants OF the fd-capture machinery in-process
+    (line_coverage, pytest_runner), and a mutant that breaks fd restoration
+    leaves fd 1 a corpse for the rest of the PROCESS — the engine's unpatch
+    restores the function, not the file descriptor. Measured (2026-08-05,
+    the first whole-codebase run after DATAFLOW grew that universe): the
+    badge run completed its measurement and then died at the first
+    ``::warning`` annotation with EBADF, taking the report down with it.
+    Same belt-and-braces as ``ci._body`` re-entering the streams around the
+    baseline, one layer up: the MEASUREMENT may fight hostile mutants — the
+    REPORT must not. Per-file progress lines during the run stay best-effort;
+    the GitHub-protocol lines (annotations, outputs, summary, banner) are the
+    contract and are written only after re-entry.
+    """
+    saved_out, saved_err = os.dup(1), os.dup(2)
+
+    def reenter() -> None:
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
+        # The fd is necessary but not sufficient: sys.stdout is a Python
+        # object wrapping the old fd state and may itself be closed. Rebind
+        # both onto the restored descriptors, line-buffered so workflow
+        # commands land as they are emitted.
+        sys.stdout = io.TextIOWrapper(
+            io.FileIO(1, "w", closefd=False), line_buffering=True
+        )
+        sys.stderr = io.TextIOWrapper(
+            io.FileIO(2, "w", closefd=False), line_buffering=True
+        )
+
+    return reenter
+
+
 def _fail(reason: str) -> int:
     print("\n::error::Wesker could not produce a trustworthy number", file=sys.stderr)
     print(f"\nWESKER REFUSED TO REPORT: {reason}\n", file=sys.stderr)
@@ -382,14 +422,21 @@ def main(argv: list[str] | None = None) -> int:
     # mutated are not the ones executing the run. Any other project resolves to the public
     # engine here, exactly as before.
     profile_codebase_live = profiler_for_targets(targets)
-    report = profile_codebase_live(
-        ".",
-        targets,
-        budget_ms_per_file=args.budget,
-        max_per_category=config.get("max_per_category"),
-        passes=config.get("convergence_passes", 1),
-        verbose=True,
-    )
+    reenter_streams = _stream_reentry()
+    try:
+        report = profile_codebase_live(
+            ".",
+            targets,
+            budget_ms_per_file=args.budget,
+            max_per_category=config.get("max_per_category"),
+            passes=config.get("convergence_passes", 1),
+            verbose=True,
+        )
+    finally:
+        # Everything from here down is the REPORT — gates, SARIF, annotations,
+        # outputs, summary, banner — and must not inherit a corpse fd from a
+        # hostile mutant of the capture machinery.
+        reenter_streams()
     if report is None:
         return _fail(
             gate_execution_mode({"execution_mode": "legacy-direct-call"}) or ""

@@ -37,7 +37,12 @@ jobs:
         id: spec
         uses: ./
         with:
-          budget: "30000"
+          # Raised 30000 → 120000 when policy 2–5 grew the universe (~+270
+          # targets; engine.py alone is 4,330 mutants and two of its functions
+          # outran 30s). Per the header: raise the budget, never the claim —
+          # this run has no deadline, and 4× headroom means the next growth
+          # spurt doesn't re-trip it immediately.
+          budget: "120000"
           sarif: .wesker/wesker.sarif
 
       - name: Upload survivors as code-scanning alerts

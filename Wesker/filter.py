@@ -14,7 +14,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 
-from Wesker.engine import MutationCategory
+from Wesker.engine import MutationCategory, estimate_universe_size
 
 
 @dataclass
@@ -87,7 +87,7 @@ def _classify_signal_node(node: ast.AST, signals: _FunctionSignals) -> None:
         signals.has_return_value = True
 
 
-def _collect_signals(func_node: ast.FunctionDef) -> _FunctionSignals:
+def _collect_signals(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> _FunctionSignals:
     """Walk the function AST to collect structural signals."""
     signals = _FunctionSignals(param_count=len(func_node.args.args))
     for node in ast.walk(func_node):
@@ -106,7 +106,7 @@ def _collect_signals(func_node: ast.FunctionDef) -> _FunctionSignals:
 
 
 def filter_categories(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     is_pure: bool = False,
 ) -> set[MutationCategory]:
     """Layer 1: Exclusionary filtering (§6.1).
@@ -117,7 +117,18 @@ def filter_categories(
     sig = _collect_signals(func_node)
     relevant: set[MutationCategory] = {MutationCategory.VALUE}
 
-    if sig.param_count >= 2:
+    # SWAP is asked of the MUTATOR, not guessed from the signature. `_SwapMutator` does not
+    # touch formal parameters at all — it transposes adjacent positional ARGUMENTS at call
+    # sites, unwraps used calls, and substitutes curated callee duals. Gating on
+    # `param_count >= 2` therefore answered a different question than the one that decides
+    # whether a target exists, and answered it wrong in both directions: `def square(x):
+    # return pow(x, 2)` has one formal parameter and two live SWAP targets, so the category was
+    # dropped and `pow(x, 2) -> pow(2, x)` never entered the universe. A suite testing only
+    # x == 2 then reported `✓ COMPLETE (operator universe) · 3/3 killed` — unqualified, not even
+    # "modulo unproven-equivalent" — while failing to distinguish a mutant that differs at every
+    # other x. That is a false SC = 1, which is the one error the completeness claim cannot
+    # survive. Counting the real targets is the same walk `estimate_universe_size` already does.
+    if estimate_universe_size(func_node, {MutationCategory.SWAP}):
         relevant.add(MutationCategory.SWAP)
     if sig.has_comparisons:
         relevant.add(MutationCategory.BOUNDARY)

@@ -64,7 +64,9 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
         origin = getattr(it, "path", None) or getattr(it, "fspath", None)
         if origin is not None:
             with contextlib.suppress(Exception):
-                runnable.__wesker_origin__ = str(origin)
+                # Dynamic metadata on a function object: valid Python, absent from
+                # FunctionType's stub, so the checker needs telling.
+                runnable.__wesker_origin__ = str(origin)  # type: ignore[attr-defined]
         return runnable
 
     callables: list[Callable[..., Any]] = []
@@ -127,7 +129,7 @@ def _bind_item(item: Any, fn: Callable[..., Any]) -> Callable[..., Any] | None:
     # nodeid discriminates the cases; `__wrapped__` makes getsource() read the USER's test, so a source
     # edit still invalidates the entry (and distinct tests still differ).
     run.__qualname__ = str(getattr(item, "nodeid", run.__name__))
-    run.__wrapped__ = fn
+    run.__wrapped__ = fn  # type: ignore[attr-defined]  # set by functools.wraps too; not in the stub
     return run
 
 

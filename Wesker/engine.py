@@ -812,11 +812,17 @@ class _SwapMutator(_BaseMutator):
                     node.func = ast.copy_location(
                         ast.Name(id=dual, ctx=ast.Load()), node.func
                     )
-                else:  # Attribute — swap only the attr, keep the value (math.floor -> math.ceil)
+                elif isinstance(node.func, ast.Attribute):
+                    # Swap only the attr, keep the value (math.floor -> math.ceil).
                     node.func = ast.copy_location(
                         ast.Attribute(value=node.func.value, attr=dual, ctx=ast.Load()),
                         node.func,
                     )
+                # No third case TODAY: `_callee_name` reports anything that is neither a Name
+                # nor an Attribute as "call", and "call" is not a dual. It was a bare `else`
+                # reading `node.func.value`, so the day someone adds "call" to `_DUALS` the
+                # mutator raises AttributeError on `f[i](x)` instead of declining to mutate it.
+                # Naming the branch it actually handles keeps the invariant checkable.
                 continue
             node.args = list(node.args)
             node.args[spec], node.args[spec + 1] = node.args[spec + 1], node.args[spec]
@@ -1313,7 +1319,7 @@ class _StmtMutator(_BaseMutator):
 # ── Mutant Generation ─────────────────────────────────────────────
 
 
-def _docstring_positions(func_node: ast.FunctionDef) -> set[tuple[int, int]]:
+def _docstring_positions(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[tuple[int, int]]:
     """Return (lineno, col_offset) of docstring Constant nodes in a function.
 
     A docstring is the first statement if it's ``Expr(Constant(str))``.
@@ -1332,7 +1338,7 @@ def _docstring_positions(func_node: ast.FunctionDef) -> set[tuple[int, int]]:
     return positions
 
 
-def _count_targets(func_node: ast.FunctionDef, category: MutationCategory) -> int:
+def _count_targets(func_node: ast.FunctionDef | ast.AsyncFunctionDef, category: MutationCategory) -> int:
     """Count how many mutation targets exist for a category in a function."""
     counter = _TARGET_COUNTERS.get(category)
     if counter is None:
@@ -1528,7 +1534,7 @@ def _content_mutant_id(category: MutationCategory, mutated_node: ast.AST) -> str
 
 
 def _generate_state_mutants(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     max_per_category: int | None,
     greedy: bool = True,
     pass_index: int = 0,
@@ -1716,7 +1722,7 @@ _RECORD_MUTATOR_FACTORIES: dict[
 
 
 def _record_dimensions(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     category: MutationCategory,
     docstring_positions: set[tuple[int, int]] | None = None,
 ) -> list[str]:
@@ -1738,7 +1744,7 @@ def _record_dimensions(
     return mutator.keys
 
 
-def _record_state_dimensions(func_node: ast.FunctionDef, mode: str) -> list[str]:
+def _record_state_dimensions(func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str) -> list[str]:
     """Dimension keys for one STATE sub-mode, in transformer-visit order."""
     tree = copy.deepcopy(func_node)
     mutator = _StateMutator(-1, mode)
@@ -1747,7 +1753,7 @@ def _record_state_dimensions(func_node: ast.FunctionDef, mode: str) -> list[str]
     return mutator.keys
 
 
-def _record_exception_dimensions(func_node: ast.FunctionDef, mode: str) -> list[str]:
+def _record_exception_dimensions(func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str) -> list[str]:
     """Dimension keys for one EXCEPTION sub-mode, in transformer-visit order."""
     tree = copy.deepcopy(func_node)
     mutator = _ExceptionMutator(-1, mode)
@@ -1756,7 +1762,7 @@ def _record_exception_dimensions(func_node: ast.FunctionDef, mode: str) -> list[
     return mutator.keys
 
 
-def _count_exception_targets(func_node: ast.FunctionDef, mode: str) -> int:
+def _count_exception_targets(func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str) -> int:
     """Targets for one EXCEPTION sub-mode. Counted by RUNNING the mutator in record
     mode, so the counter and the transformer cannot drift — the skip rules (a bare
     ``raise``, an already-``pass`` handler, an untyped ``except:``) live in one place."""
@@ -1771,7 +1777,7 @@ _EXCEPTION_SUB_MODES = (
 
 
 def _generate_exception_mutants(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     max_per_category: int | None,
     greedy: bool = True,
     pass_index: int = 0,
@@ -2218,7 +2224,7 @@ def _baseline_failures(
 
 
 def _build_test_scope(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     test_functions: list[Callable[..., None]],
     original_func: Callable[..., Any] | None,
     scope_tests: bool,
@@ -2338,7 +2344,7 @@ def _build_test_scope(
 
 
 def dimension_budget(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     category: MutationCategory,
     docstring_positions: set[tuple[int, int]] | None = None,
 ) -> int:
@@ -2379,7 +2385,7 @@ def dimension_budget(
 
 
 def dof_universe(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     categories: set[MutationCategory],
 ) -> int:
     """Total degrees of freedom of a function — the DOF-coverage denominator.
@@ -2451,7 +2457,7 @@ def _select_greedy(
 
 
 def generate_mutants(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     categories: set[MutationCategory],
     max_per_category: int | None = 0,
     seed: int | None = None,
@@ -3048,7 +3054,10 @@ def _unpatch_mutant(
 def evaluate_mutant(
     mutant: Mutant,
     test_functions: list[Callable[..., None]],
-    original_func: Callable[..., Any],
+    # Optional in fact: the namespace seed below is `getattr(original_func, "__globals__",
+    # None) or {}`, which is documented to degrade to an empty namespace when no original is
+    # supplied. `run_function_profiling` passes whatever its own caller had, including None.
+    original_func: Callable[..., Any] | None,
     timeout_ms: float = 5000,
     qualname: str | None = None,
     record_all_killers: bool = False,
@@ -3104,7 +3113,10 @@ def evaluate_mutant(
         exec(code, namespace)  # noqa: S102  # nosec B102 — intentional: compiling AST mutants
         func_name = getattr(mutant.mutated_node, "name", None)
         mutated_obj = namespace.get(func_name) if func_name else None
-        if mutated_obj is None:
+        # `func_name is None` is already implied (the lookup above yields None without it), but
+        # saying it here is what narrows the name for the patch/restore code below — where an
+        # unrestored binding would leak this mutant into the NEXT one's evaluation.
+        if mutated_obj is None or func_name is None:
             return MutantResult(
                 mutant=mutant,
                 killed=True,
@@ -3275,6 +3287,14 @@ def _outcome_on_original(
     The live patched objects are captured and re-installed verbatim afterwards, which keeps
     the descriptor shape ``_patch_module_qualified`` built for class-method owners.
     """
+    if func_name is None:
+        # Without a name there is nothing to rebind, and the loop below would fail on every
+        # target INSIDE its own `except: continue` — leaving the mutant installed and running
+        # this control against itself. The two runs would then agree trivially and the caller
+        # would discard a real kill, which is the exact artifact this function exists to
+        # prevent. `None` cannot equal the caller's `result` (it checks `is not None` first),
+        # so declining here preserves the kill rather than silently erasing it.
+        return None
     live: list[tuple[Any, Any]] = []
     for target, saved in module_saved:
         try:
@@ -3476,7 +3496,7 @@ def _mutant_diff(mutant: Mutant) -> str:
 
 
 def run_function_sampling(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     func_key: str,
     categories: set[MutationCategory],
     test_functions: list[Callable[..., None]],
@@ -3573,11 +3593,14 @@ def run_function_sampling(
 
 
 def run_function_profiling(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     func_key: str,
     categories: set[MutationCategory],
     test_functions: list[Callable[..., None]],
-    original_func: Callable[..., Any],
+    # Optional in fact and by design: `evaluate_mutant` degrades to an empty namespace when
+    # no original is supplied, and says so. Declaring it required made every honest caller
+    # silence the checker at the call site, which is where a real type error would have shown.
+    original_func: Callable[..., Any] | None,
     per_mutant_timeout_ms: float = 5000,
     budget_ms: float | None = None,
     mem_budget_mb: int | None = None,
@@ -3805,7 +3828,7 @@ def run_function_profiling(
 
 
 def estimate_universe_size(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     categories: set[MutationCategory],
 ) -> int:
     """Count total possible mutation targets without generating mutants.
@@ -3854,7 +3877,7 @@ def coverage_floor(
 
 
 def greedy_coverage_guarantee(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     categories: set[MutationCategory],
     max_per_category: int,
     passes: int,
@@ -3872,7 +3895,7 @@ def greedy_coverage_guarantee(
 
 
 def _generate_boundary_inputs(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> list[tuple]:
     """Generate boundary test inputs based on parameter count.
 
@@ -3906,7 +3929,7 @@ def _generate_boundary_inputs(
 
 
 def check_equivalent(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     mutant: Mutant,
 ) -> bool:
     """Check if a surviving mutant is semantically equivalent.
@@ -3981,7 +4004,7 @@ def check_equivalent(
 
 
 def run_function_converged(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     func_key: str,
     categories: set[MutationCategory],
     test_functions: list[Callable[..., None]],

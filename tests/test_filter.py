@@ -129,12 +129,25 @@ def test_filter_value_always_present():
     assert MutationCategory.VALUE in filter_categories(_fn("def f():\n    return 1\n"))
 
 
-def test_filter_swap_needs_two_params():
-    # Boundary at param_count >= 2 — kills the </<= mutant on the arity check.
-    one = filter_categories(_fn("def f(a):\n    return a\n"))
-    two = filter_categories(_fn("def f(a, b):\n    return a\n"))
-    assert MutationCategory.SWAP not in one
-    assert MutationCategory.SWAP in two
+def test_filter_swap_follows_call_sites_not_formal_parameters():
+    """`_SwapMutator` mutates CALL SITES — adjacent argument transpositions, used-call
+    unwrapping, curated callee duals. It never touches formal parameters, so `param_count >= 2`
+    answered a different question and got both directions wrong.
+
+    Under-enumeration is the dangerous one: `square` below has ONE formal parameter and a live
+    `pow(x, 2) -> pow(2, x)` target. With the category filtered out, that mutant never entered
+    the universe, and a suite testing only `x == 2` (where both spellings give 4) reported
+    `✓ COMPLETE (operator universe) · 3/3 killed` — unqualified — while failing to distinguish a
+    mutant that differs at every other x. A false SC = 1."""
+    one_param_with_a_call = filter_categories(_fn("def f(x):\n    return pow(x, 2)\n"))
+    assert MutationCategory.SWAP in one_param_with_a_call
+
+    # And the other direction: two parameters but nothing to transpose is not a SWAP target.
+    two_params_no_calls = filter_categories(_fn("def f(a, b):\n    return a\n"))
+    assert MutationCategory.SWAP not in two_params_no_calls
+
+    no_params_no_calls = filter_categories(_fn("def f():\n    return 1\n"))
+    assert MutationCategory.SWAP not in no_params_no_calls
 
 
 def test_filter_boundary_from_comparison():

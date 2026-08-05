@@ -48,7 +48,10 @@ __all__ = ["session_callables", "run_in_session"]
 try:  # pytest is an OPTIONAL dependency — this module degrades to a no-op without it.
     import pytest as _pytest
 
-    _hookwrapper = _pytest.hookimpl(hookwrapper=True)
+    # The no-pytest fallback below is a `def`, so the checker reads THAT as the declaration
+    # and this real decorator as a conflicting reassignment. Both are "callable that returns
+    # its argument"; only the fallback's shape is expressible here.
+    _hookwrapper = _pytest.hookimpl(hookwrapper=True)  # type: ignore[assignment]
 except Exception:  # pragma: no cover — no pytest: run_in_session returns None anyway
 
     def _hookwrapper(fn):  # type: ignore[misc]
@@ -224,13 +227,13 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
         # so a constant source collapses the fingerprint: editing a test would no longer
         # invalidate its cache and stale verdicts would be served as fresh ones — the
         # false-survivor bug that cache exists to prevent.
-        run.__wrapped__ = fn
+        run.__wrapped__ = fn  # type: ignore[attr-defined]  # functools.wraps sets it; not in the stub
     origin = getattr(item, "path", None) or getattr(item, "fspath", None)
     if origin is not None:
         with contextlib.suppress(Exception):
             # The origin tag makes `ci.callable_origin` total for this wrapper even
             # when the item has no `function` (no __wrapped__ to follow).
-            run.__wesker_origin__ = str(origin)
+            run.__wesker_origin__ = str(origin)  # type: ignore[attr-defined]
     return run
 
 

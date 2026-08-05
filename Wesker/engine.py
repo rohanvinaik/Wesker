@@ -1319,7 +1319,9 @@ class _StmtMutator(_BaseMutator):
 # ── Mutant Generation ─────────────────────────────────────────────
 
 
-def _docstring_positions(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[tuple[int, int]]:
+def _docstring_positions(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> set[tuple[int, int]]:
     """Return (lineno, col_offset) of docstring Constant nodes in a function.
 
     A docstring is the first statement if it's ``Expr(Constant(str))``.
@@ -1338,7 +1340,9 @@ def _docstring_positions(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> s
     return positions
 
 
-def _count_targets(func_node: ast.FunctionDef | ast.AsyncFunctionDef, category: MutationCategory) -> int:
+def _count_targets(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, category: MutationCategory
+) -> int:
     """Count how many mutation targets exist for a category in a function."""
     counter = _TARGET_COUNTERS.get(category)
     if counter is None:
@@ -1744,7 +1748,9 @@ def _record_dimensions(
     return mutator.keys
 
 
-def _record_state_dimensions(func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str) -> list[str]:
+def _record_state_dimensions(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> list[str]:
     """Dimension keys for one STATE sub-mode, in transformer-visit order."""
     tree = copy.deepcopy(func_node)
     mutator = _StateMutator(-1, mode)
@@ -1753,7 +1759,9 @@ def _record_state_dimensions(func_node: ast.FunctionDef | ast.AsyncFunctionDef, 
     return mutator.keys
 
 
-def _record_exception_dimensions(func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str) -> list[str]:
+def _record_exception_dimensions(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> list[str]:
     """Dimension keys for one EXCEPTION sub-mode, in transformer-visit order."""
     tree = copy.deepcopy(func_node)
     mutator = _ExceptionMutator(-1, mode)
@@ -1762,7 +1770,9 @@ def _record_exception_dimensions(func_node: ast.FunctionDef | ast.AsyncFunctionD
     return mutator.keys
 
 
-def _count_exception_targets(func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str) -> int:
+def _count_exception_targets(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> int:
     """Targets for one EXCEPTION sub-mode. Counted by RUNNING the mutator in record
     mode, so the counter and the transformer cannot drift — the skip rules (a bare
     ``raise``, an already-``pass`` handler, an untyped ``except:``) live in one place."""

@@ -103,4 +103,9 @@ def test_a_target_that_refuses_rebinding_does_not_take_the_control_run_down_with
     target = _Frozen()
     object.__setattr__(target, "target", _original)
 
-    assert _outcome_on_original(_test_fn, _original, [(target, _original)], "target", 1000.0) is None
+    assert (
+        _outcome_on_original(
+            _test_fn, _original, [(target, _original)], "target", 1000.0
+        )
+        is None
+    )

@@ -87,7 +87,9 @@ def _classify_signal_node(node: ast.AST, signals: _FunctionSignals) -> None:
         signals.has_return_value = True
 
 
-def _collect_signals(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> _FunctionSignals:
+def _collect_signals(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> _FunctionSignals:
     """Walk the function AST to collect structural signals."""
     signals = _FunctionSignals(param_count=len(func_node.args.args))
     for node in ast.walk(func_node):

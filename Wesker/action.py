@@ -161,15 +161,18 @@ def gate_suite_health(report: dict, max_inert_pct: int = 50) -> str | None:
 
 
 def gate_truncation(report: dict) -> str | None:
-    """Refuse to call a budget-limited sample a completeness measurement."""
+    """Refuse to call a CUT measurement a completeness measurement — whether it was cut by the budget
+    or by a worker that could not be contained (Wesker #13/#14). ``total_truncated`` now counts both."""
     truncated = report.get("total_truncated", 0)
     if not truncated:
         return None
     return (
-        f"{truncated} function(s) hit the per-file budget and were only partially evaluated.\n"
-        "Their unevaluated mutants are missing from both sides of the ratio, so this is a "
-        "sample, not a completeness measurement.\n"
-        "Raise `budget` (or set [tool.wesker] max_per_category) before quoting the number."
+        f"{truncated} function(s) were only PARTIALLY evaluated — cut by the per-file budget, or by "
+        "a timed-out worker that could not be stopped (an uncontained, invalid measurement).\n"
+        "Their unevaluated mutants are missing from both sides of the ratio, so this is a sample, "
+        "not a completeness measurement.\n"
+        "Raise `budget` (or set [tool.wesker] max_per_category); an uncontained worker needs the "
+        "target's blocking call bounded or run in a killable process."
     )
 
 

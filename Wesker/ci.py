@@ -1293,6 +1293,20 @@ def suite_health() -> dict | None:
     }
 
 
+def is_truncated_measurement(coverage_depth: str, budget_exhausted: bool) -> bool:
+    """Whether one function's profile is a TRUNCATED/INVALID measurement the completeness gate must
+    drop rather than count (Wesker #14, aggregation layer).
+
+    The rollup previously counted only ``budget_exhausted``, so a run the engine had already flagged
+    non-gateable for a CONTAINMENT reason — an uncontained worker, ``coverage_depth="cut"`` with
+    ``budget_exhausted=False`` — sailed through: ``total_truncated=0``, ``spec_pct=100``, gate None.
+    The containment signal was computed correctly and then dropped before the badge decision, the
+    exact measurement/decision gap. The gate now consumes the engine's own ``coverage_depth`` — "cut"
+    is the universal invalid marker (budget OR containment, both paths) — so no invalid measurement
+    reaches the badge as a completeness number. Pure — Detective-pinned."""
+    return coverage_depth == "cut" or budget_exhausted
+
+
 def profile_codebase(
     project_root: str,
     targets: list[str],
@@ -1383,7 +1397,16 @@ def profile_codebase(
         # sample of the cheap-to-reach mutants, not a mutation score. Aggregated here
         # because the per-function flag never reached the report — a truncated run and a
         # complete one published byte-identical badges.
-        total_truncated += sum(1 for r in results if r.get("budget_exhausted"))
+        # #14 (aggregation): consume the engine's COMPUTED signal, not a budget-only proxy. A run cut
+        # for CONTAINMENT (an uncontained worker: coverage_depth="cut", budget_exhausted=False) is a
+        # truncated measurement too — counting only budget_exhausted dropped it before the gate.
+        total_truncated += sum(
+            1
+            for r in results
+            if is_truncated_measurement(
+                r.get("coverage_depth", ""), bool(r.get("budget_exhausted"))
+            )
+        )
 
         # Carry each survivor up with the function it came from. ``function_key`` is
         # "path::qualname", so the record is self-locating: file, line, and the dimension

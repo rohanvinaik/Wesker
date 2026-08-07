@@ -4707,7 +4707,14 @@ def run_function_converged(
     budget_exhausted = _elapsed(start) > budget_ms
 
     # Determine coverage depth
-    if total >= universe > 0:
+    if budget_exhausted or not all_contained:
+        # An INVALIDATED measurement — the budget overran or a worker could not be contained
+        # (#13/#14) — is CUT, not a legitimate sample: `is_gateable` is already False, and marking
+        # the depth "cut" (as the exhaustive path does) is what lets the codebase rollup and the CI
+        # gate DROP it rather than count it as a completeness measurement. A clean sample keeps its
+        # own depth below; only invalidation overrides to "cut".
+        depth = "cut"
+    elif total >= universe > 0:
         depth = "profiled"
     elif passes > 1:
         depth = "converged"

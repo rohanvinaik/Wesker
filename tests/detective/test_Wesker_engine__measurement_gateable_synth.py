@@ -13,12 +13,16 @@ from Wesker.engine import _measurement_gateable
 @pytest.mark.detective
 def test__measurement_gateable_value_0():
     """VALUE survivor — golden capture (pure + deterministic) (confidence 0.9)."""
-    result = _measurement_gateable(base_gateable=True, all_contained=True)
+    result = _measurement_gateable(
+        base_gateable=True, all_contained=True, budget_ok=True
+    )
     assert result is True
 
 
 @pytest.mark.detective
 def test__measurement_gateable_value_1():
     """VALUE survivor — distinguishing witness (equivalence search) (confidence 0.95)."""
-    result = _measurement_gateable(base_gateable=False, all_contained=True)
+    result = _measurement_gateable(
+        base_gateable=False, all_contained=False, budget_ok=True
+    )
     assert result is False

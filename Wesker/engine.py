@@ -3382,15 +3382,59 @@ def _unpatch_mutant(
         setattr(patch_target, func_name, saved)
 
 
-def _measurement_gateable(base_gateable: bool, all_contained: bool) -> bool:
+# Adaptive per-mutant timeout (#13): a single mutant's allowance is derived from how fast the
+# ORIGINAL runs the same tests, not a flat cap — so a millisecond-scale function's runaway mutant
+# is cut in milliseconds, not seconds. The multiplier tolerates legitimate variance and slower
+# mutant paths; the floor absorbs thread/patch startup and timer granularity. Both are calibration
+# targets tested against the corpus (see the #13 regression tests), not magic constants.
+_MUTANT_ALLOWANCE_FLOOR_MS = 50.0
+_MUTANT_ALLOWANCE_MULTIPLIER = 50.0
+
+
+def _adaptive_allowance(baseline_ms: float | None, cap_ms: float, remaining_ms: float) -> float:
+    """The wall-clock a single mutant evaluation gets (#13).
+
+    ``baseline_ms`` is the ORIGINAL's live runtime over the same tests, or None when no trustworthy
+    baseline exists (no original, or a red one) — then fall back to the configured cap rather than
+    invent precision. The allowance is at least the floor and at most the cap, and it NEVER exceeds
+    ``remaining_ms``, the remaining aggregate deadline, which is always the final upper bound.
+    """
+    if baseline_ms is None:
+        base = cap_ms
+    else:
+        base = max(_MUTANT_ALLOWANCE_FLOOR_MS, baseline_ms * _MUTANT_ALLOWANCE_MULTIPLIER)
+    return min(base, cap_ms, remaining_ms)
+
+
+def _measurement_gateable(base_gateable: bool, all_contained: bool, budget_ok: bool) -> bool:
     """Whether a profiling result may gate a downstream verdict (COMPLETE, auto-apply, CI).
 
-    ``base_gateable`` is the coverage-depth basis — an exhaustive/profiled run, not a sampled one.
-    ``all_contained`` is False when any timed-out worker could not be stopped (#14): an uncontained
-    runaway may still be executing, so its counts are a floor, not a verdict. A gateable result
-    needs both — a COMPLETE measurement and a VALID one.
+    A gateable result must be COMPLETE and VALID. ``base_gateable`` is the coverage-depth basis —
+    an exhaustive/profiled run, not a sampled one. ``all_contained`` is False when any timed-out
+    worker could not be stopped (#14). ``budget_ok`` is False when the aggregate or memory budget
+    was cut (#13). Any one False makes the counts a floor, not a verdict.
     """
-    return base_gateable and all_contained
+    return base_gateable and all_contained and budget_ok
+
+
+def _measure_scoped_baseline(
+    test_functions: list[Callable[..., None]],
+    original_func: Callable[..., Any] | None,
+    cap_ms: float,
+) -> float | None:
+    """The ORIGINAL's live wall-clock over ``test_functions``, UNTRACED like the mutant loop, for
+    sizing an adaptive per-mutant allowance (#13). None when there is no trustworthy baseline — no
+    original, no tests, or a test that does not pass cleanly on the original (a red baseline is not
+    a clock). Each test is bounded by ``cap_ms`` so a pathological baseline test cannot hang the
+    sizing itself.
+    """
+    if original_func is None or not test_functions:
+        return None
+    t0 = time.monotonic()
+    for test_fn in test_functions:
+        if _run_test_with_timeout(test_fn, original_func, True, cap_ms) is not None:
+            return None
+    return _elapsed(t0)
 
 
 def evaluate_mutant(
@@ -4049,6 +4093,10 @@ def run_function_profiling(
         trace_session_budget_s,
     )
 
+    # Live baseline for the adaptive per-mutant allowance (#13): time the ORIGINAL over the tests
+    # once, untraced (the mutant loop is untraced too). None → fall back to the configured cap.
+    baseline_ms = _measure_scoped_baseline(test_functions, original_func, per_mutant_timeout_ms)
+
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
     kill_matrix: dict[str, list[str]] = {}
     survivor_records: list[dict] = []
@@ -4071,12 +4119,19 @@ def run_function_profiling(
             _reclaim()
             break
 
+        # The allowance is derived from the live baseline and — critically — never exceeds the
+        # remaining aggregate deadline, so a single mutant cannot overshoot the budget by a full
+        # cap (#13). No budget → the cap is the bound.
+        remaining_ms = (
+            budget_ms - _elapsed(start) if budget_ms is not None else per_mutant_timeout_ms
+        )
+        allowance_ms = _adaptive_allowance(baseline_ms, per_mutant_timeout_ms, remaining_ms)
         try:
             result = evaluate_mutant(
                 mutant,
                 _tests_for(mutant),
                 original_func,
-                timeout_ms=per_mutant_timeout_ms,
+                timeout_ms=allowance_ms,
                 qualname=qualname,
                 source_path=source_path,
             )
@@ -4177,7 +4232,8 @@ def run_function_profiling(
         survivor_records=survivor_records,
         killed_records=killed_records,
         budget_exhausted=budget_exhausted,
-        is_gateable=_measurement_gateable(True, all_contained),
+        is_gateable=_measurement_gateable(True, all_contained, not budget_exhausted),
+        coverage_depth="cut" if budget_exhausted else "profiled",
         elapsed_ms=_elapsed(start),
         line_coverage=line_cov,
         executable_lines=exec_lines,
@@ -4644,7 +4700,7 @@ def run_function_converged(
         dof_covered=len(dims_covered),
         dof_pinned=len(dims_pinned),
         coverage_depth=depth,
-        is_gateable=_measurement_gateable(depth == "profiled", all_contained),
+        is_gateable=_measurement_gateable(depth == "profiled", all_contained, not budget_exhausted),
         per_category=per_cat,
         kill_matrix=kill_matrix,
         survivor_records=survivor_records,

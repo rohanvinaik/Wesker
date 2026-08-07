@@ -150,7 +150,12 @@ class MutantResult:
     equivalent: bool = False
     killed_by_tests: list[str] = field(
         default_factory=list
-    )  # all killers (full-matrix mode)
+    )
+    # False when a timed-out worker could not be stopped — blocked outside the interpreter
+    # (subprocess/socket/C-extension), where the async-exception injection cannot land (#14). The
+    # kill still counts as a run-only timeout, but the measurement is UNCONTAINED: the runaway may
+    # still be executing and mutating shared state, so a profile that contains it is not gateable.
+    contained: bool = True  # all killers (full-matrix mode)
 
 
 @dataclass
@@ -3377,6 +3382,17 @@ def _unpatch_mutant(
         setattr(patch_target, func_name, saved)
 
 
+def _measurement_gateable(base_gateable: bool, all_contained: bool) -> bool:
+    """Whether a profiling result may gate a downstream verdict (COMPLETE, auto-apply, CI).
+
+    ``base_gateable`` is the coverage-depth basis — an exhaustive/profiled run, not a sampled one.
+    ``all_contained`` is False when any timed-out worker could not be stopped (#14): an uncontained
+    runaway may still be executing, so its counts are a floor, not a verdict. A gateable result
+    needs both — a COMPLETE measurement and a VALID one.
+    """
+    return base_gateable and all_contained
+
+
 def evaluate_mutant(
     mutant: Mutant,
     test_functions: list[Callable[..., None]],
@@ -3473,6 +3489,7 @@ def evaluate_mutant(
             None  # provisional crash/timeout kill (no assertion yet)
         )
         first_killer: str | None = None
+        saw_uncontained = False  # a timed-out worker that could not be stopped (#14)
         for test_fn in test_functions:
             remaining_ms = timeout_ms - _elapsed(start)
             if remaining_ms <= 0:
@@ -3484,6 +3501,7 @@ def evaluate_mutant(
                     mutant=mutant,
                     killed=True,
                     killed_by="timeout",
+                    contained=not saw_uncontained,
                     elapsed_ms=_elapsed(start),
                 )
             # Strategy: monkey-patch the mutated function into the test's namespace
@@ -3502,6 +3520,12 @@ def evaluate_mutant(
                     patched,
                     remaining_ms,
                 )
+                if result == "uncontained":
+                    # Timed out AND the worker could not be stopped. It still counts as a run-only
+                    # timeout kill, but the measurement is uncontained — carry the fact so the
+                    # profile refuses to gate on it (#14). Normalize to "timeout" for kill counting.
+                    saw_uncontained = True
+                    result = "timeout"
                 # A failure is only a KILL if the mutation CAUSED it. When the mutant
                 # could not be patched into the test's namespace, the unpatched path
                 # INJECTS it as a positional argument — a contract only Wesker's own
@@ -3549,6 +3573,7 @@ def evaluate_mutant(
                             killed=True,
                             killed_by=result,
                             test_name=tname,
+                            contained=not saw_uncontained,
                             elapsed_ms=_elapsed(start),
                         )
                     elif first_reason is None:
@@ -3571,6 +3596,7 @@ def evaluate_mutant(
                 ),
                 test_name=killers[0],
                 killed_by_tests=killers,
+                contained=not saw_uncontained,
                 elapsed_ms=_elapsed(start),
             )
         if first_reason is not None:
@@ -3580,6 +3606,7 @@ def evaluate_mutant(
                 killed=True,
                 killed_by=first_reason,
                 test_name=first_killer,
+                contained=not saw_uncontained,
                 elapsed_ms=_elapsed(start),
             )
         return MutantResult(mutant=mutant, killed=False, elapsed_ms=_elapsed(start))
@@ -3728,6 +3755,7 @@ def _run_test_with_timeout(
     # report. Set up in the main thread around start+join so restoration is
     # guaranteed even when the worker hangs and is abandoned as a timeout.
     timed_out = False
+    contained = True
     with (
         contextlib.redirect_stdout(io.StringIO()),
         contextlib.redirect_stderr(io.StringIO()),
@@ -3756,9 +3784,15 @@ def _run_test_with_timeout(
             # `__exit__` is the last writer.
             _abandon(thread)
             thread.join(timeout=_ABANDON_UNWIND_S)
+            # `abandon` injects an async exception that CANNOT land while the worker is blocked
+            # OUTSIDE the interpreter (subprocess/socket/C-extension) — it only lands at the next
+            # bytecode. If the thread is still alive after the unwind allowance, the timed-out work
+            # is UNCONTAINED: it may still be running and mutating shared state, so reporting it as
+            # a clean "timeout" is a false measurement. The caller must refuse to gate on it (#14).
+            contained = not thread.is_alive()
 
     if timed_out:
-        return "timeout"
+        return "timeout" if contained else "uncontained"
 
     return result_box[0]
 
@@ -4020,7 +4054,7 @@ def run_function_profiling(
     survivor_records: list[dict] = []
     killed_records: list[dict] = []
     budget_exhausted = False
-
+    all_contained = True  # #14: cleared if any timed-out worker could not be stopped
     mem_budget = _resolve_budget(mem_budget_mb)
     total_m = len(mutants)
     for count, mutant in enumerate(mutants):
@@ -4072,6 +4106,8 @@ def run_function_profiling(
             )
             continue
 
+        if not result.contained:
+            all_contained = False
         cr = results_by_cat.setdefault(
             mutant.category, CategoryResult(category=mutant.category)
         )
@@ -4141,6 +4177,7 @@ def run_function_profiling(
         survivor_records=survivor_records,
         killed_records=killed_records,
         budget_exhausted=budget_exhausted,
+        is_gateable=_measurement_gateable(True, all_contained),
         elapsed_ms=_elapsed(start),
         line_coverage=line_cov,
         executable_lines=exec_lines,
@@ -4554,7 +4591,10 @@ def run_function_converged(
 
     # Aggregate by category
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
+    all_contained = True  # #14: cleared if any timed-out worker could not be stopped
     for result in seen.values():
+        if not result.contained:
+            all_contained = False
         cat = result.mutant.category
         cr = results_by_cat.setdefault(cat, CategoryResult(category=cat))
         cr.total += 1
@@ -4604,7 +4644,7 @@ def run_function_converged(
         dof_covered=len(dims_covered),
         dof_pinned=len(dims_pinned),
         coverage_depth=depth,
-        is_gateable=depth == "profiled",
+        is_gateable=_measurement_gateable(depth == "profiled", all_contained),
         per_category=per_cat,
         kill_matrix=kill_matrix,
         survivor_records=survivor_records,

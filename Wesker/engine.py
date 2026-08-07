@@ -148,9 +148,7 @@ class MutantResult:
     test_name: str | None = None  # first killing test (first-killer mode)
     elapsed_ms: float = 0.0
     equivalent: bool = False
-    killed_by_tests: list[str] = field(
-        default_factory=list
-    )
+    killed_by_tests: list[str] = field(default_factory=list)
     # False when a timed-out worker could not be stopped — blocked outside the interpreter
     # (subprocess/socket/C-extension), where the async-exception injection cannot land (#14). The
     # kill still counts as a run-only timeout, but the measurement is UNCONTAINED: the runaway may
@@ -3391,7 +3389,9 @@ _MUTANT_ALLOWANCE_FLOOR_MS = 50.0
 _MUTANT_ALLOWANCE_MULTIPLIER = 50.0
 
 
-def _adaptive_allowance(baseline_ms: float | None, cap_ms: float, remaining_ms: float) -> float:
+def _adaptive_allowance(
+    baseline_ms: float | None, cap_ms: float, remaining_ms: float
+) -> float:
     """The wall-clock a single mutant evaluation gets (#13).
 
     ``baseline_ms`` is the ORIGINAL's live runtime over the same tests, or None when no trustworthy
@@ -3402,11 +3402,15 @@ def _adaptive_allowance(baseline_ms: float | None, cap_ms: float, remaining_ms: 
     if baseline_ms is None:
         base = cap_ms
     else:
-        base = max(_MUTANT_ALLOWANCE_FLOOR_MS, baseline_ms * _MUTANT_ALLOWANCE_MULTIPLIER)
+        base = max(
+            _MUTANT_ALLOWANCE_FLOOR_MS, baseline_ms * _MUTANT_ALLOWANCE_MULTIPLIER
+        )
     return min(base, cap_ms, remaining_ms)
 
 
-def _measurement_gateable(base_gateable: bool, all_contained: bool, budget_ok: bool) -> bool:
+def _measurement_gateable(
+    base_gateable: bool, all_contained: bool, budget_ok: bool
+) -> bool:
     """Whether a profiling result may gate a downstream verdict (COMPLETE, auto-apply, CI).
 
     A gateable result must be COMPLETE and VALID. ``base_gateable`` is the coverage-depth basis —
@@ -4095,7 +4099,9 @@ def run_function_profiling(
 
     # Live baseline for the adaptive per-mutant allowance (#13): time the ORIGINAL over the tests
     # once, untraced (the mutant loop is untraced too). None → fall back to the configured cap.
-    baseline_ms = _measure_scoped_baseline(test_functions, original_func, per_mutant_timeout_ms)
+    baseline_ms = _measure_scoped_baseline(
+        test_functions, original_func, per_mutant_timeout_ms
+    )
 
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
     kill_matrix: dict[str, list[str]] = {}
@@ -4123,9 +4129,13 @@ def run_function_profiling(
         # remaining aggregate deadline, so a single mutant cannot overshoot the budget by a full
         # cap (#13). No budget → the cap is the bound.
         remaining_ms = (
-            budget_ms - _elapsed(start) if budget_ms is not None else per_mutant_timeout_ms
+            budget_ms - _elapsed(start)
+            if budget_ms is not None
+            else per_mutant_timeout_ms
         )
-        allowance_ms = _adaptive_allowance(baseline_ms, per_mutant_timeout_ms, remaining_ms)
+        allowance_ms = _adaptive_allowance(
+            baseline_ms, per_mutant_timeout_ms, remaining_ms
+        )
         try:
             result = evaluate_mutant(
                 mutant,
@@ -4213,6 +4223,20 @@ def run_function_profiling(
                 }
             )
 
+        # #14 (reopened): an uncontained worker (abandon could not stop it) is STILL ALIVE — burning
+        # a core and able to perturb every later mutant's timing. This mutant's result is kept
+        # (partial evidence), but stop NOW rather than measure more against a compromised process:
+        # `all_contained` already forces non-gateable, and coverage_depth becomes "cut" below.
+        if not result.contained:
+            break
+        # #13 (reopened): the aggregate deadline is checked AFTER evaluation too. The pre-loop check
+        # catches an overrun only before the NEXT iteration, and the FINAL mutant has none — so a run
+        # whose last mutant crossed the wall would otherwise stay budget_exhausted=False /
+        # coverage_depth="profiled" / gateable. Mark it cut here so the overrun is honestly non-gateable.
+        if budget_ms is not None and _elapsed(start) > budget_ms:
+            budget_exhausted = True
+            break
+
     if progress is not None:
         progress(total_m, total_m, _elapsed(start))
     per_cat = list(results_by_cat.values())
@@ -4233,7 +4257,10 @@ def run_function_profiling(
         killed_records=killed_records,
         budget_exhausted=budget_exhausted,
         is_gateable=_measurement_gateable(True, all_contained, not budget_exhausted),
-        coverage_depth="cut" if budget_exhausted else "profiled",
+        # A cut is any invalid measurement — budget overrun OR an uncontained worker (#13/#14): the
+        # depth must not read "profiled" when the run stopped short or ran against a live abandoned
+        # worker. is_gateable already reflects both; coverage_depth now agrees.
+        coverage_depth="cut" if (budget_exhausted or not all_contained) else "profiled",
         elapsed_ms=_elapsed(start),
         line_coverage=line_cov,
         executable_lines=exec_lines,
@@ -4700,7 +4727,9 @@ def run_function_converged(
         dof_covered=len(dims_covered),
         dof_pinned=len(dims_pinned),
         coverage_depth=depth,
-        is_gateable=_measurement_gateable(depth == "profiled", all_contained, not budget_exhausted),
+        is_gateable=_measurement_gateable(
+            depth == "profiled", all_contained, not budget_exhausted
+        ),
         per_category=per_cat,
         kill_matrix=kill_matrix,
         survivor_records=survivor_records,

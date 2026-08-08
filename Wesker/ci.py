@@ -755,8 +755,15 @@ def discover_test_callables(
         # already holds, so the fixtures/conftest/lifecycle that make it outrank the other
         # backends are preserved. Origin resolves through the contract accessor — a raw
         # `__code__` read attributes every wrapper to pytest_runner.py.
-        keep = {os.path.abspath(p) for p in scoped}
-        return [c for c in live if (callable_origin(c) or "") in keep]
+        # `realpath`, not `abspath` (#15). A live item's origin comes from pytest, which
+        # CANONICALISES it, while `scoped` carries whatever spelling the caller typed — so on
+        # any symlinked root (`/var` -> `/private/var` on macOS, a symlinked checkout, a
+        # case-insensitive rename) the two never match and this filter silently returns the
+        # EMPTY suite. A discovery that finds nothing reads downstream as "no test reaches this
+        # target", which is the synthesize path: the run would quietly stop measuring the suite
+        # it has and start inventing one.
+        keep = {os.path.realpath(p) for p in scoped}
+        return [c for c in live if os.path.realpath(callable_origin(c) or "") in keep]
 
     if backend in ("auto", "pytest"):
         try:
@@ -766,6 +773,18 @@ def discover_test_callables(
             # so the narrowing is paid back in collection time too, not just afterwards.
             # The extra roots are absolute so they collect regardless of cwd, and never
             # overlap the in-tree paths.
+            #
+            # #15 IS REAL AND IS NOT FIXED HERE. Explicit arguments are not the repo's ordinary
+            # invocation: they bypass the `testpaths`/recursion route and can load a different
+            # conftest/plugin surface. But the two routes were MEASURED against each other while
+            # attempting the swap, and they differ in IMPORT BEHAVIOUR, not merely in conftest
+            # surface — collecting from the root drops a test whose module-level
+            # `from <target> import ...` cannot resolve, because `sys.path` is seeded
+            # differently. Switching naively therefore LOSES exactly the tests that reach the
+            # target and reports "nothing reaches this" — the false-negative direction, which is
+            # worse than the defect. Doing this properly needs the runner-derived import
+            # identity and effective import mode that Detective #58 specifies; it is not a
+            # matter of which paths are passed.
             collected = collect_pytest_callables(
                 project_root, paths=list(scoped) + extra
             )

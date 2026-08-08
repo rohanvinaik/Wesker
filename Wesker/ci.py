@@ -183,6 +183,26 @@ def _build_static_impact_map(test_files: list[str]) -> dict[str, list[str]]:
     return {k: sorted(v) for k, v in impact.items()}
 
 
+def _impact_lookup_keys(func_name: str) -> tuple[str, ...]:
+    """The identifier keys a test may reference ``func_name`` under, for the static impact map.
+
+    The map (:func:`_build_static_impact_map`) keys on BARE ast identifiers — a ``Name``
+    (``free_tier``, ``Basket``) or an ``Attribute`` (``.tier``). A METHOD target, however, arrives
+    here as a DOTTED qualname (``Basket.tier``), which no test ever spells as one token: the call
+    site is ``Basket().tier(...)`` — a ``Basket`` Name and a ``tier`` Attribute, never a
+    ``Basket.tier`` Name. So a bare ``impact.get("Basket.tier")`` always missed, the method's own
+    generated test was never associated, and its mutants were then measured against unrelated tests
+    and read a misleading ``0/N killed``. Expanding the dotted qualname to its trailing attribute
+    (the ``.method`` access every call site carries, regardless of how the receiver is built)
+    recovers that test. A plain function name is returned unchanged. Over-inclusion is safe here — an
+    extra test file that does not reach the target contributes no kills and none of its lines, so it
+    can never manufacture a false ``COMPLETE`` (the same one-directional safety the caller relies on);
+    the per-mutant line scoping narrows it back down."""
+    if "." not in func_name:
+        return (func_name,)
+    return (func_name, func_name.rsplit(".", 1)[1])
+
+
 # ── Layer 3: Full fallback ───────────────────────────────────────
 
 
@@ -285,10 +305,14 @@ def relevant_test_files(
     found_set = set(found)
     impact_map = _build_static_impact_map(_discover_all_test_files(project_root))
     for func_name in func_names:
-        for tf in impact_map.get(func_name, []):
-            if tf not in found_set:
-                found.append(tf)
-                found_set.add(tf)
+        # A dotted method qualname (`Basket.tier`) is looked up under its trailing attribute too,
+        # because the impact map keys on the bare `.tier` a test's call site carries, never the
+        # dotted name (issue #25 — methods otherwise associated with no test and read 0/N killed).
+        for key in _impact_lookup_keys(func_name):
+            for tf in impact_map.get(key, []):
+                if tf not in found_set:
+                    found.append(tf)
+                    found_set.add(tf)
     return found
 
 

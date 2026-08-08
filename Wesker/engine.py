@@ -3340,16 +3340,31 @@ def _unwrap_descriptor(obj: Any) -> Any:
 
 
 def _preserve_descriptor_shape(original: Any, mutated_obj: Any) -> Any:
-    """Wrap the mutant to match the original descriptor semantics."""
+    """Wrap the mutant to match the original descriptor semantics.
+
+    A classmethod mutant can arrive here already BOUND: accessing ``Class.method`` for a
+    ``@classmethod`` yields a bound ``method`` object with ``cls`` captured (signature ``(n)``, not
+    ``(cls, n)``). Wrapping THAT in ``classmethod(...)`` binds ``cls`` a SECOND time, so the patched
+    call passes an extra positional and raises ``TypeError`` — which the runner reads as a spurious
+    ``crash`` instead of the ``assertion`` that would credit the kill, and every such classmethod
+    mutant then reads as a false survivor (issue #25: a method target's kills weren't counted). So
+    peel a bound method to its underlying function before re-wrapping, so ``cls``/``self`` is bound
+    exactly once. A raw classmethod/staticmethod mutant is still returned as-is (already the right
+    shape); a plain function is unchanged."""
+    raw = (
+        mutated_obj.__func__
+        if isinstance(mutated_obj, types.MethodType)
+        else _unwrap_descriptor(mutated_obj)
+    )
     if isinstance(original, classmethod):
         if isinstance(mutated_obj, classmethod):
             return mutated_obj
-        return classmethod(_unwrap_descriptor(mutated_obj))
+        return classmethod(raw)
     if isinstance(original, staticmethod):
         if isinstance(mutated_obj, staticmethod):
             return mutated_obj
-        return staticmethod(_unwrap_descriptor(mutated_obj))
-    return _unwrap_descriptor(mutated_obj)
+        return staticmethod(raw)
+    return raw
 
 
 def _preserve_closure_binding_shape(original: Any, mutated_obj: Any) -> Any:

@@ -21,6 +21,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, TypeGuard
 
 from .interrupt import abandon as _abandon
+from .line_coverage import admissible_coverage as _admissible_coverage
 from .line_coverage import coverage_from_trace as _coverage_from_trace
 from .line_coverage import executable_lines as _executable_lines
 from .line_coverage import failing_on_baseline as _failing_on_baseline
@@ -367,6 +368,16 @@ class ProfilingResult:
     is_gateable: bool = True
     per_category: list[CategoryResult] = field(default_factory=list)
     kill_matrix: dict[str, list[str]] = field(default_factory=dict)
+    # The PROOF view of `line_coverage` (issue #17): the same map with the entries whose owner
+    # cannot discharge an obligation removed — baseline-failing, truncated, or uncontained.
+    #
+    # A SECOND FIELD rather than a redefinition of `line_coverage`, on purpose. That field is
+    # what Detective judges line completeness from, and narrowing it here would make every
+    # consumer report more gaps the moment this engine updated — a behaviour change arriving
+    # ahead of the change that handles it (Detective #59). `line_coverage` stays the OBSERVED
+    # reach, which is also what `_build_test_scope` correctly scopes on: routing wants a test
+    # that reaches the line even when it cannot prove anything about it.
+    admissible_line_coverage: dict[str, list[int]] = field(default_factory=dict)
     survivor_records: list[dict] = field(default_factory=list)
     killed_records: list[dict] = field(default_factory=list)
     budget_exhausted: bool = False
@@ -541,6 +552,12 @@ class ProfilingResult:
             d["killed_records"] = self.killed_records
         if self.line_coverage:
             d["line_coverage"] = self.line_coverage
+        # The proof view alongside the observed one (#17), never instead of it. A consumer
+        # deciding COMPLETENESS reads this; one deciding what to RUN reads `line_coverage`.
+        # Emitted only when non-empty, matching the surrounding convention — and note the
+        # converged entry point emits no line data at all, so neither key appears there.
+        if self.admissible_line_coverage:
+            d["admissible_line_coverage"] = self.admissible_line_coverage
         if self.executable_lines:
             d["executable_lines"] = self.executable_lines
         if self.failing_tests:
@@ -4540,6 +4557,17 @@ def run_function_profiling(
     killed = sum(cr.killed for cr in per_cat)
     survived = total - killed
 
+    # Who may not discharge a line obligation (#17). Read from the SAME baseline
+    # `_build_test_scope` resolved, so the proof view and the scoping view disagree only where
+    # they are meant to. Without a live session the per-function pass computed `failing` and
+    # `_trace_truncated` directly and those are the whole story.
+    _sb = session_baseline()
+    _barred = sorted(
+        (_sb.inert_ids | _sb.truncated)
+        if _sb is not None
+        else (set(failing) | set(_trace_truncated))
+    )
+
     return ProfilingResult(
         function_key=func_key,
         categories_tested=len(per_cat),
@@ -4559,6 +4587,7 @@ def run_function_profiling(
         coverage_depth="cut" if (budget_exhausted or not all_contained) else "profiled",
         elapsed_ms=_elapsed(start),
         line_coverage=line_cov,
+        admissible_line_coverage=_admissible_coverage(line_cov, _barred),
         executable_lines=exec_lines,
         failing_tests=failing,
         tests_discovered=len(test_functions),

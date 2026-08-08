@@ -251,6 +251,13 @@ def failing_on_baseline(
     since it may be the only thing catching a genuine bug."""
     if getattr(original_func, "__code__", None) is None:
         return []
+    # TEST IDS, not `__name__` (issue #16, missed on the first pass). This is the per-function
+    # path; `build_session_baseline` computes the same list for the live-session path and moved
+    # to ids there. Both write `ProfilingResult.failing_tests`, so leaving one behind meant that
+    # ONE field spoke a different vocabulary depending on which path produced it — and a
+    # consumer matching it against the traced map (which is id-keyed) silently matched nothing.
+    from Wesker.ci import callable_test_id  # local: ci imports lazily the other way
+
     failing: list[str] = []
     # Isolate each discovered test's own stdout/stderr (argparse usage banners from
     # a `pytest.raises(SystemExit)` CLI test, prints, logging) so consumer-test
@@ -264,7 +271,7 @@ def failing_on_baseline(
             try:
                 test_fn()
             except AssertionError:
-                failing.append(getattr(test_fn, "__name__", "unknown"))
+                failing.append(callable_test_id(test_fn))
             except BaseException:  # noqa: BLE001,S110 — ambiguous (fixtures/imports); not a wrong assertion
                 pass
     return failing

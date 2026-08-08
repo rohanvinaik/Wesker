@@ -477,6 +477,19 @@ _LIVE_SUITE: ContextVar[list[Any] | None] = ContextVar(
     "wesker_live_suite", default=None
 )
 
+# The root that `callable_test_id` relativizes a legacy origin against (issue #16).
+#
+# A ContextVar rather than a parameter because the SAME test must produce the SAME id at
+# every site or the suite-wide maps stop intersecting. Coverage is keyed in `trace_suite`,
+# which has a project root to hand; the kill vocabulary is keyed inside `evaluate_mutant`,
+# which is per-mutant, hot, and several frames from any caller that knows the root.
+# Threading a parameter down that path makes agreement a discipline every future call site
+# has to remember — and the failure is silent: relative-vs-absolute ids simply intersect to
+# nothing, reporting every mutant a covered test kills as an unpinned survivor. Read from
+# one place, the two vocabularies cannot disagree by construction. Same reason `_LIVE_SUITE`
+# and `_SESSION_BASELINE` are session state rather than arguments.
+_PROJECT_ROOT: ContextVar[str | None] = ContextVar("wesker_project_root", default=None)
+
 
 DISCOVERED_CALLABLE_CONTRACT = """What every discovered test callable guarantees — THE single reference (issue #6).
 
@@ -595,6 +608,89 @@ def callable_node_id(call: Any) -> str:
     apart.
     """
     return str(getattr(call, "__qualname__", "") or getattr(call, "__name__", "") or "")
+
+
+def resolve_test_id(
+    node_id: str,
+    display_name: str,
+    origin: str,
+    project_root: str | None,
+    case: str,
+) -> str:
+    """The pure DECISION behind :func:`callable_test_id`: five observed facts about a
+    test in, one suite-wide identity string out.
+
+    Split from the accessor so the decision is PINNABLE. ``callable_test_id`` takes an
+    arbitrary object, and Detective's ``--input`` parses a literal allowlist on purpose
+    (no arbitrary code execution), so a callable argument cannot be expressed and three
+    branches here were unreachable by input synthesis. Taking only ``str``/``None`` moves
+    the whole contract inside the literal grammar; the accessor above keeps the object
+    handling and holds no decision of its own. Same split as the exit-contract extraction
+    in Detective #50 — the reason this repo can claim a mutation-complete pin at all.
+
+    ``::`` means the collection produced a real pytest nodeid, which is already unique and
+    root-relative, so it is returned untouched. Otherwise the id is synthesized and
+    namespaced ``legacy:`` so the two can never be confused for one another.
+
+    THE ``#`` SUFFIX IS A CORRECTNESS FLOOR, NOT DECORATION. The replacement id must never
+    merge two tests the old ``__name__`` key kept apart, or #16 regresses the very property
+    it exists to establish. ``__qualname__`` is normally the more discriminating of the two,
+    but not always: closures minted by a factory all share ``factory.<locals>.inner`` while
+    carrying distinct ``__name__``s. Caught by ``test_session_budget_names_the_tests_it_never_reached``,
+    where ``heavy_1`` and ``heavy_2`` collapsed onto one entry and a 2-test cut reported as 1.
+    So when ``display_name`` is not the final dotted segment of the qualname the two carry
+    INDEPENDENT information, and both are kept. For an ordinary function they agree and the
+    id stays clean.
+
+    ``origin`` is relativized only when a root is supplied; a ``ValueError`` (a Windows
+    cross-drive path) leaves the absolute origin standing rather than failing the run —
+    still unique, merely not portable, and visibly so in the returned string.
+    """
+    if "::" in node_id:
+        return node_id
+    if origin and project_root:
+        with contextlib.suppress(ValueError):
+            origin = os.path.relpath(origin, project_root)
+    base = node_id.split("[", 1)[0] or display_name or "unknown"
+    if display_name and display_name != base.rsplit(".", 1)[-1]:
+        base = f"{base}#{display_name}"
+    return f"legacy:{origin or '?'}::{base}{f'[{case}]' if case else ''}"
+
+
+def callable_test_id(call: Any, project_root: str | None = None) -> str:
+    """The SUITE-WIDE identity of a discovered test: its pytest nodeid when the
+    collection produced one, else an explicitly namespaced ``legacy:`` fallback that
+    can never be mistaken for a nodeid.
+
+    Accessor of :data:`DISCOVERED_CALLABLE_CONTRACT` — the axis every suite-wide map
+    keys on (issue #16). :func:`callable_node_id` is the RAW accessor and is not
+    sufficient as a key: it degrades silently to a display ``__name__``, so a legacy row
+    and a real nodeid become indistinguishable strings and two different tests can
+    collide on one entry. Maps keyed here can always name WHICH pytest item supplied an
+    observation, which is the whole content of #16; ``__name__`` keying could not, and
+    unioned the collision instead (see :meth:`SessionBaseline.replaced`).
+
+    NAMED ``callable_test_id``, not ``test_id``: pytest collects ``test_*`` from any module
+    it imports, so the shorter name would be collected as a test the moment a test module
+    imported it — erroring on unfillable ``call``/``project_root`` fixtures. It also joins the
+    accessor family (:func:`callable_node_id`, :func:`callable_origin`,
+    :func:`callable_base_name`, :func:`callable_case_id`) that this contract already uses.
+
+    This function READS; :func:`resolve_test_id` DECIDES. Every branch lives there so it can
+    be pinned against a literal grammar — see that docstring for why the split exists.
+
+    ``project_root`` defaults to :data:`_PROJECT_ROOT`, the session's root, so that a caller
+    deep in the mutant loop yields the same id as the baseline tracer without threading an
+    argument between them. Pass it explicitly only to compute an id OUTSIDE a session.
+    """
+    root = project_root if project_root is not None else _PROJECT_ROOT.get()
+    return resolve_test_id(
+        callable_node_id(call),
+        str(getattr(call, "__name__", "") or ""),
+        callable_origin(call) or "",
+        root,
+        callable_case_id(call),
+    )
 
 
 def discover_test_callables(
@@ -1019,11 +1115,16 @@ def refresh_live_suite(project_root: str, path: str) -> int:
     target = os.path.abspath(path)
 
     def _name(c: Any) -> str:
-        # The key `SessionBaseline.traced` / `.failing` / `.truncated` use — `trace_suite` reads
-        # the same attribute with the same fallback, so a splice keyed here lines up with what
-        # the full build wrote. Not `_origin`: a parametrized case's code object names its
-        # DEFINING module, which is why the file cannot be recovered from the name.
-        return getattr(c, "__name__", "unknown")
+        # The key `SessionBaseline.traced` / `.failing` / `.truncated` use — `trace_suite`
+        # resolves identity through the SAME accessor, so a splice keyed here lines up with
+        # what the full build wrote. Not `_origin`: a parametrized case's code object names
+        # its DEFINING module, which is why the file cannot be recovered from the id.
+        #
+        # Since issue #16 this is a per-ITEM id, which shrinks the splice rather than widening
+        # it: the `affected` set below had to include every current owner of a shared NAME,
+        # because dropping one owner's entry took the other's coverage with it. Distinct ids
+        # mean a written file's tests can only collide with themselves.
+        return callable_test_id(c)
 
     # Origin resolution is the module-level contract — one resolver for every
     # consumer, so a callable shape added later cannot be recognised here and

@@ -173,11 +173,17 @@ def _write(tmp_path, name, body):
 def test_refreshing_one_file_keeps_a_same_named_test_in_another_module(
     tmp_path, monkeypatch
 ):
-    """`traced` is keyed by __name__ and UNIONS duplicates across files.
+    """A same-named test in ANOTHER module must not lose its coverage when one file is written.
 
-    So a name the written file merely SHARES cannot be dropped on its own — the other
-    owner's coverage would vanish with it, and every mutant that test kills would then
-    read as a survivor. The splice must re-trace every CURRENT owner of an affected name.
+    That loss is what the `__name__` union existed to prevent: dropping a shared name took the
+    other owner's coverage with it, and every mutant that test killed then read as a survivor.
+    Since issue #16 `traced` is keyed per ITEM, so the two owners occupy different entries and
+    the written file's splice cannot reach the other one at all.
+
+    THE INVARIANT IS UNCHANGED and is still what this asserts. What changed is that it now holds
+    STRUCTURALLY rather than being bought by re-tracing every current owner of the name — so the
+    second assertion below is the inverse of the one it replaces: the other owner must NOT be
+    re-traced, because there is no longer anything to compensate for.
     """
     target = _write(tmp_path, "test_written.py", "def test_shared():\n    pass\n")
 
@@ -187,16 +193,17 @@ def test_refreshing_one_file_keeps_a_same_named_test_in_another_module(
 
     other = _write(tmp_path, "test_other.py", "def test_shared():\n    pass\n")
     test_shared.__wesker_origin__ = other
+    other_id = ci.callable_test_id(test_shared)
 
     traced_with: list[list[str]] = []
 
     def build(subset=None):
-        names = [getattr(c, "__name__", "?") for c in (subset or [])]
-        traced_with.append(names)
-        return _bl({n: {"f.py": {1}} for n in names}, n_tests=len(names))
+        ids = [ci.callable_test_id(c) for c in (subset or [])]
+        traced_with.append(ids)
+        return _bl({i: {"f.py": {1}} for i in ids}, n_tests=len(ids))
 
     holder = LazySessionBaseline(build)
-    holder._value = _bl({"test_shared": {"f.py": {1}}}, n_tests=2)
+    holder._value = _bl({other_id: {"f.py": {1}}}, n_tests=2)
     holder._built = True
 
     suite_token = ci._LIVE_SUITE.set([test_shared])
@@ -208,12 +215,13 @@ def test_refreshing_one_file_keeps_a_same_named_test_in_another_module(
         _SESSION_BASELINE.reset(base_token)
 
     assert traced_with, "the splice never ran"
-    # The other module's same-named test is re-traced ALONGSIDE the written file's, so the
-    # union under that key still accounts for it. Dropping the key and re-adding only the
-    # written file's test would silently delete it.
-    assert "test_shared" in holder.get().traced
-    assert sum(n == "test_shared" for n in traced_with[-1]) >= 2, (
-        f"both owners of the shared name must be re-traced, got {traced_with[-1]}"
+    # THE INVARIANT: the other module's entry survives the write untouched.
+    assert other_id in holder.get().traced
+    # AND it cost nothing to keep. Distinct ids mean `affected` never contained the other
+    # owner, so the splice could not reach it — where the union had to re-trace every current
+    # owner of the name to protect exactly this entry.
+    assert other_id not in traced_with[-1], (
+        f"the other owner must not need re-tracing, got {traced_with[-1]}"
     )
 
 

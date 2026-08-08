@@ -31,8 +31,11 @@ WHAT IS KEYED, and why each part is load-bearing:
   test reaches this line".
 
 WHAT IS NOT STORED: `inert`, keyed by `id()`. An id is a fact about one process's heap and means
-nothing in the next. The NAMES are stored and the ids rebuilt on load against the live callables
-— the same information, addressed by something that survives a process boundary.
+nothing in the next. The TEST IDS are stored and the `id()`s rebuilt on load against the live
+callables — the same information, addressed by something that survives a process boundary.
+Those are `ci.callable_test_id` values since issue #16, not `__name__`s: matching on a name
+readmitted every test that merely SHARED a name with an inert one, which is a false kill
+attribution produced only on a warm cache.
 
 ON DISK under `.wesker/`, and `memory_guard.purge_caches` owns its lifecycle — it targets
 `trace_cache.json` by name (it did NOT for this file's whole early life, so `purge` reported "clean"
@@ -52,7 +55,12 @@ from typing import Any
 _CACHE_DIR = ".wesker"
 _CACHE_FILE = "trace_cache.json"
 _VERSION = (
-    2  # the on-disk shape; bump to orphan every prior entry rather than misread one
+    # 3 (issue #16): `failing` and `inert` are stored as TEST IDS, not `__name__`s. The two are
+    # both bare strings, so a v2 file would LOAD cleanly and be read as ids — every entry
+    # missing its match, every previously-inert test silently readmitted to kill attribution.
+    # A misread is worse than a miss: the miss costs one cold trace, the misread is wrong and
+    # says nothing. This is the case the version field exists for.
+    3  # the on-disk shape; bump to orphan every prior entry rather than misread one
 )
 
 
@@ -73,9 +81,11 @@ def test_fingerprint(fn: Callable[..., Any]) -> str:
     Unwrapping alone is NOT enough: a parametrized case shares its underlying function's SOURCE with
     every sibling case, so `getsource(real)` is byte-identical across them → one fingerprint → the
     trace cache serves case 0's coverage for case 1, and case 1's own branch lines silently vanish
-    from the union (`trace_suite` keys the union on `__name__`, which is RIGHT — the base name — but
-    the cache keys on THIS, so only both being right keeps the two consistent; keyed on source alone
-    they disagree and a parametrized golden profiles as one case). The live-item wrapper carries the
+    from the union. Since issue #16 `trace_suite` keys per ITEM (`ci.callable_test_id`) rather than
+    on the base `__name__`, so the two agree because BOTH discriminate a case — where previously
+    they agreed only because a coarse key and this fine one were deliberately paired, and that
+    pairing was the reason a traced entry could not name which item produced it. Keyed on source
+    alone they still disagree and a parametrized golden still profiles as one case. The live-item wrapper carries the
     full nodeid on `__qualname__` (`test[args0-…]`) — the per-case discriminator; fold it in so sibling
     cases fingerprint APART, while a source edit still invalidates every case (source stays in the
     hash) and the same nodeid still warms the cache across runs. Non-parametrized tests are unaffected:

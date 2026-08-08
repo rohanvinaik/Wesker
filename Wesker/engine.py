@@ -2417,6 +2417,13 @@ def build_session_baseline(
     silent hang, not a slow answer. ``None`` = unbounded = the historical behavior.
     """
     from Wesker import trace_cache  # local: trace_cache imports nothing from engine
+    from Wesker.ci import _PROJECT_ROOT, callable_test_id
+
+    # Publish the session root BEFORE anything is keyed. Every id minted from here on —
+    # the traced map below, and the kill vocabulary inside `evaluate_mutant` several frames
+    # away — reads it, so the two agree by construction rather than by threading (issue #16).
+    if project_root is not None:
+        _PROJECT_ROOT.set(project_root)
 
     # Both passes below measure a CONSTANT: the trace is function-independent (see `trace_suite`),
     # and so is "does this test pass on the unmutated original". They were re-run per invocation
@@ -2453,21 +2460,24 @@ def build_session_baseline(
     if reuse_outcomes:
         inert_names = set(cached_inert)
         failing = list(cached_failing)
-        inert = {
-            id(t) for t in test_functions if getattr(t, "__name__", "") in inert_names
-        }
+        # Match by TEST ID, not ``__name__`` (issue #16). Under name matching, two tests
+        # sharing a name and one of them inert marked BOTH inert on every cache reload —
+        # and an inert test is barred from kill attribution, so the innocent one's kills
+        # silently became survivors. The bug only appeared on a WARM cache, which is why
+        # it survived: the cold path keys by `id()` of the actual callable and is exact.
+        inert = {id(t) for t in test_functions if callable_test_id(t) in inert_names}
     else:
         inert_names_out: list[str] = []
         for test_fn in test_functions:
             outcome = _run_test_with_timeout(test_fn, None, True, timeout_ms)
             if outcome is not None:
                 inert.add(id(test_fn))
-                inert_names_out.append(getattr(test_fn, "__name__", "unknown"))
+                inert_names_out.append(callable_test_id(test_fn))
                 if outcome == "assertion":
                     # An assertion that fails on correct code is a WRONG EXPECTATION — the
                     # narrower thing failing_on_baseline reports to a human. Other outcomes
                     # are ambiguous and are barred from attribution without accusation.
-                    failing.append(getattr(test_fn, "__name__", "unknown"))
+                    failing.append(callable_test_id(test_fn))
         cached_inert = inert_names_out
     if project_root and cache is not None and not truncated:
         # Never persist a truncated pass: what a budget cut is absent, not zero, and a cache
@@ -2632,10 +2642,22 @@ def _build_test_scope(
         [t for t in test_functions if id(t) not in inert] if inert else test_functions
     )
 
-    # Parametrized cases share a __name__, so one name maps to many callables.
+    # Keyed by TEST ID, because `line_cov` is (issue #16) — `trace_suite` and
+    # `trace_line_coverage` both key on `ci.callable_test_id`, and this table is what those
+    # keys are looked up IN. Keyed by `__name__` against TestId keys every lookup misses,
+    # `covering_by_line` comes back empty, and every mutant is evaluated against no tests at
+    # all: a silent 0-killed verdict under `scope_tests=True` that still agrees with itself.
+    # `test_scoped_and_unscoped_verdicts_agree` is the guard that catches exactly this.
+    #
+    # The list value is retained though a TestId now identifies ONE item: a backend that
+    # yields the same id twice must not lose an owner, and the cost is a one-element list.
+    from Wesker.ci import (
+        callable_test_id,
+    )  # local: `ci` imports this module at module scope
+
     tests_by_name: dict[str, list[Callable[..., None]]] = {}
     for _tf in usable:
-        tests_by_name.setdefault(getattr(_tf, "__name__", "unknown"), []).append(_tf)
+        tests_by_name.setdefault(callable_test_id(_tf), []).append(_tf)
     covering_by_line: dict[int, list[Callable[..., None]]] = {}
     if scope_tests and line_cov:
         for tname, lines in line_cov.items():
@@ -3619,7 +3641,19 @@ def evaluate_mutant(
                         else result
                     )
                 if result is not None:
-                    tname = getattr(test_fn, "__name__", "unknown")
+                    # The kill vocabulary (issue #16). Coverage is keyed the same way in
+                    # `trace_suite`, and a caller runs set-cover over BOTH — two vocabularies
+                    # would intersect to nothing and report every mutant a covered test kills
+                    # as an unpinned survivor. Root comes from `ci._PROJECT_ROOT`, not an
+                    # argument, so the two sites cannot drift apart.
+                    #
+                    # Imported HERE, not at module scope: `ci` imports `run_function_converged`
+                    # from this module at module scope, so the reverse edge can only ever be
+                    # lazy. This branch runs on a KILL, not per test, and the cost after the
+                    # first is a `sys.modules` lookup.
+                    from Wesker.ci import callable_test_id
+
+                    tname = callable_test_id(test_fn)
                     if record_all_killers:
                         killers.append(tname)
                         reasons.append(result)

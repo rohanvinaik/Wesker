@@ -328,7 +328,7 @@ def trace_suite(
     session_budget_s: float | None = None,
     cache: dict[str, dict[str, list[int]]] | None = None,
 ) -> dict[str, dict[str, set[int]]]:
-    """Trace the WHOLE suite ONCE: ``{test_name: {file: lines}}``.
+    """Trace the WHOLE suite ONCE: ``{test_id: {file: lines}}``.
 
     WHY: ``trace_line_coverage`` traces the entire suite and then keeps only one
     function's lines, so profiling F functions traced the suite F times to answer F
@@ -342,8 +342,14 @@ def trace_suite(
     "refuse work that provably cannot change a result" reduction the engine already
     applies to mutants, applied to the baseline.
 
-    Union across duplicate test names (parametrized cases share a ``__name__``), to
-    match the keying ``trace_line_coverage`` uses.
+    Keyed by ``ci.callable_test_id`` — the pytest nodeid, or a namespaced ``legacy:`` id
+    (issue #16). It was keyed by ``__name__``, which is NOT unique: two tests in different
+    modules sharing a name, and every parametrized case of one test, collapsed onto one
+    entry, and the union below existed to stop that collision LOSING an owner's coverage.
+    Under a per-item id the collision cannot arise, so the union is now a structural
+    no-op retained only for a backend that yields one id twice — it compensates for
+    nothing. What this buys is the thing the union could not: an entry can name WHICH
+    pytest item observed it, which is what a proof basis has to be able to say.
 
     ``budget_s`` bounds EACH test's tracing (None = unbounded = the historical behavior). This is
     the one place a budget is load-bearing rather than defensive: the whole point of tracing once
@@ -380,6 +386,10 @@ def trace_suite(
     walk. A CUT trace is never stored: it is under-counted by construction, and a cache that
     remembers a truncation makes a timing accident permanent.
     """
+    # Local imports: `ci` and `trace_cache` both import lazily in the other direction, and
+    # the identity accessor must be the CONTRACT one — a raw attribute read here is exactly
+    # the divergence issue #16 exists to remove.
+    from Wesker.ci import callable_test_id
     from Wesker.trace_cache import test_fingerprint
 
     out: dict[str, dict[str, set[int]]] = {}
@@ -393,14 +403,14 @@ def trace_suite(
         else None
     )
     for i, test_fn in enumerate(test_functions):
-        name = getattr(test_fn, "__name__", "unknown")
+        name = callable_test_id(test_fn)
         if session_deadline is not None and time.monotonic() > session_deadline:
             # Out of session budget: the REST go untraced. Name them — an untraced test's
             # coverage is absent, not zero, and the two are indistinguishable downstream.
+            # Identified the same way as the traced ones: a `truncated` entry that could not
+            # be matched against a `traced` key would report the cut against nothing.
             if truncated is not None:
-                truncated.update(
-                    getattr(t, "__name__", "unknown") for t in test_functions[i:]
-                )
+                truncated.update(callable_test_id(t) for t in test_functions[i:])
             break
         fp = test_fingerprint(test_fn) if cache is not None else None
         hit = cache.get(fp) if (cache is not None and fp is not None) else None
@@ -498,10 +508,12 @@ def trace_line_coverage(
     progress: Callable[[int, int, float], None] | None = None,
     session_budget_s: float | None = None,
 ) -> dict[str, list[int]]:
-    """Map each test name to the target lines it covers, over the UNMUTATED function.
+    """Map each test id to the target lines it covers, over the UNMUTATED function.
 
-    Keyed by ``test_fn.__name__`` to match the kill matrix, so a caller can run
-    set-cover over ``kill_matrix`` and this together. The target file is taken from
+    Keyed by ``ci.callable_test_id`` (issue #16) — and the kill matrix's test VALUES are
+    keyed the same way, because a caller runs set-cover over ``kill_matrix`` and this
+    together and two different vocabularies would silently intersect to nothing. That
+    coupling is the reason the two must move in one commit, not two. The target file is taken from
     the original function's own code object — authoritative and absolute, the same
     identity ``evaluate_mutant`` patches against — so coverage attributes to the
     real function under test, not a same-named sibling. Empty when the function's
@@ -520,6 +532,8 @@ def trace_line_coverage(
     target_file = getattr(code, "co_filename", None)
     if not target_file or not exec_lines:
         return {}
+    from Wesker.ci import callable_test_id  # local: ci imports lazily the other way
+
     coverage: dict[str, list[int]] = {}
     total = len(test_functions)
     started = time.monotonic()
@@ -529,14 +543,12 @@ def trace_line_coverage(
         else None
     )
     for i, test_fn in enumerate(test_functions):
-        name = getattr(test_fn, "__name__", "unknown")
+        name = callable_test_id(test_fn)
         if session_deadline is not None and time.monotonic() > session_deadline:
             if (
                 truncated is not None
             ):  # the rest go untraced — say so, never imply "covered"
-                truncated.update(
-                    getattr(t, "__name__", "unknown") for t in test_functions[i:]
-                )
+                truncated.update(callable_test_id(t) for t in test_functions[i:])
             break
         # Isolate consumer-test stdout/stderr during the traced baseline pass (see
         # failing_on_baseline) so a test's prints/argparse banners never leak into the

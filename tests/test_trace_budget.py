@@ -39,6 +39,8 @@ from Wesker.line_coverage import (  # noqa: E402
     trace_line_coverage,
     trace_suite,
 )
+
+from Wesker.ci import callable_test_id
 from _trace_budget_target import spin  # noqa: E402
 
 _FILE = spin.__code__.co_filename
@@ -119,13 +121,18 @@ def test_a_cut_test_is_stopped_not_leaked():
 
 
 def test_trace_line_coverage_names_every_test_the_budget_cut():
-    """No silent caps: the caller learns WHICH tests are under-counted, by name."""
+    """No silent caps: the caller learns WHICH tests are under-counted, by test id.
+
+    Asserted through `callable_test_id` rather than a literal: the cut set and the coverage
+    map must speak ONE vocabulary (issue #16), and hardcoding either spelling would let them
+    drift apart while the test still passed."""
     cut: set[str] = set()
     cov = trace_line_coverage(
         [_fast, _slow], spin, _LINES, budget_s=0.25, truncated=cut
     )
-    assert cut == {"_slow"}
-    assert cov["_fast"] and cov["_slow"]  # both still contribute coverage
+    assert cut == {callable_test_id(_slow)}
+    # both still contribute coverage
+    assert cov[callable_test_id(_fast)] and cov[callable_test_id(_slow)]
 
 
 def test_trace_line_coverage_reports_nothing_cut_when_unbudgeted():
@@ -139,9 +146,10 @@ def test_trace_suite_budgets_each_test_and_reports_the_cuts():
     and reused by every function, so one heavy test stalls the whole session before any mutant."""
     cut: set[str] = set()
     traced = trace_suite([_fast, _slow], {_FILE}, budget_s=0.25, truncated=cut)
-    assert cut == {"_slow"}
-    assert set(traced) == {"_fast", "_slow"}
-    assert traced["_fast"][_FILE]  # the fast test's lines survive intact
+    assert cut == {callable_test_id(_slow)}
+    assert set(traced) == {callable_test_id(_fast), callable_test_id(_slow)}
+    # the fast test's lines survive intact
+    assert traced[callable_test_id(_fast)][_FILE]
 
 
 def test_trace_one_multi_reports_its_own_cut_rather_than_the_caller_timing_it():
@@ -190,8 +198,14 @@ def test_session_budget_names_the_tests_it_never_reached():
     traced = trace_suite(
         tests, {_FILE}, budget_s=50.0, truncated=cut, session_budget_s=0.01
     )
-    assert cut == {"heavy_1", "heavy_2"}  # the entire untraced tail, by name
-    assert set(traced) == {"heavy_0"}  # and only the one that ran is reported as traced
+    ids = [callable_test_id(t) for t in tests]
+    # These three are closures minted by ONE factory, so they share `__qualname__` and differ
+    # only in `__name__`. That is precisely the shape that collapsed onto a single id while
+    # #16 was being written — a 2-test cut reporting as 1 — so the distinctness is asserted
+    # here rather than assumed by the two set comparisons below.
+    assert len(set(ids)) == 3, f"factory closures must not share an id: {ids}"
+    assert set(cut) == {ids[1], ids[2]}  # the entire untraced tail, by id
+    assert set(traced) == {ids[0]}  # and only the one that ran is reported as traced
 
 
 # --- progress: the half that makes the phase legible rather than merely finite ------------------

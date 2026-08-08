@@ -5047,17 +5047,27 @@ def run_function_converged(
             # Only the tests that EXECUTE this mutant's line can kill it; the rest
             # behave identically under the mutation, so running them is pure cost.
             scoped = _tests_for(mutant)
+            # Full-matrix mode runs every test, so budget for the whole suite (~50ms/test)
+            # rather than the first-killer per-mutant cap.
+            _cap_ms = (
+                max(per_mutant_timeout_ms, 50.0 * len(scoped))
+                if full_matrix
+                else per_mutant_timeout_ms
+            )
+            # …and the cap NEVER exceeds the remaining aggregate deadline, exactly as the
+            # exhaustive path does it (#13). This loop checked the budget before each mutant and
+            # then handed `evaluate_mutant` the flat cap, so one mutant could overrun the entire
+            # remaining wall. Measured on the same function and suite: this path's elapsed time
+            # was INVARIANT to the budget (25ms -> 525ms, 150ms -> 524ms) while the exhaustive
+            # path tracked it (25ms -> 40ms, 150ms -> 165ms). #13 reached the exhaustive path
+            # only — and this is the one `ci.profile_function` -> `profile_file` ->
+            # `profile_codebase` -> the GitHub Action actually runs.
+            _remaining_ms = budget_ms - _elapsed(start)
             result = evaluate_mutant(
                 mutant,
                 scoped,
                 original_func,  # type: ignore[arg-type]
-                # Full-matrix mode runs every test, so budget for the whole
-                # suite (~50ms/test) rather than the first-killer per-mutant cap.
-                timeout_ms=(
-                    max(per_mutant_timeout_ms, 50.0 * len(scoped))
-                    if full_matrix
-                    else per_mutant_timeout_ms
-                ),
+                timeout_ms=_adaptive_allowance(None, _cap_ms, _remaining_ms),
                 qualname=qualname,
                 record_all_killers=full_matrix,
                 source_path=source_path,

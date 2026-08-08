@@ -32,7 +32,30 @@ import inspect
 import io
 import os
 import sys
-from typing import Any, Callable
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from Wesker.session_manifest import PytestSessionManifest
+
+# The regime the most recent collection ran under (Detective #58). A ContextVar rather than a
+# return value because `collect_pytest_callables` has one caller contract — it returns
+# CALLABLES — and threading a second value through every path would change every signature to
+# carry something most callers do not read. Same session-state idiom as `ci._LIVE_SUITE`.
+_LAST_MANIFEST: ContextVar[PytestSessionManifest | None] = ContextVar(
+    "wesker_last_session_manifest", default=None
+)
+
+
+def last_session_manifest() -> PytestSessionManifest | None:
+    """The manifest of the most recent collection in this context, or None.
+
+    None is a REAL answer and callers must treat it as one: it means no collection has happened
+    here, or the capture itself failed. Falling back to a re-derived regime is the exact
+    substitution #58 exists to end — a consumer that cannot get the runner's own answer should
+    say so, not quietly compute a lookalike.
+    """
+    return _LAST_MANIFEST.get()
 
 
 def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
@@ -154,6 +177,18 @@ def collect_pytest_callables(
 
         def pytest_collection_modifyitems(self, session, config, items) -> None:
             self.items = list(items)
+            # Record the regime this collection RAN under, from the live Config/Session that
+            # ran it (Detective #58). The hook already received all three arguments and used
+            # one; the other two are the only authoritative description of the regime that
+            # exists, and every consumer was otherwise re-deriving it from files on disk.
+            # Never allowed to fail the collection: the measurement is the product, its
+            # description is not.
+            try:
+                from Wesker.session_manifest import capture_manifest
+
+                _LAST_MANIFEST.set(capture_manifest(session, config, items))
+            except Exception:  # noqa: BLE001 — a manifest that raises breaks a working run
+                pass
 
     # Evict already-imported test modules whose source lives under any collection
     # root so pytest re-imports the CURRENT on-disk file. Repeated in-process

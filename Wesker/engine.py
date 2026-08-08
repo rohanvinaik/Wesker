@@ -27,6 +27,7 @@ from .line_coverage import executable_lines as _executable_lines
 from .line_coverage import failing_on_baseline as _failing_on_baseline
 from .line_coverage import trace_line_coverage as _trace_line_coverage
 from .line_coverage import trace_suite as _trace_suite
+from .tce import WARRANT_BYTECODE, nodes_equivalent
 from .memory_guard import over_budget as _over_budget
 from .memory_guard import reclaim as _reclaim
 from .memory_guard import resolve_budget as _resolve_budget
@@ -171,6 +172,13 @@ class MutantResult:
     # where that withholds a mutation dimension, never fabricate one). A False here is a
     # positive observation that the test never called the mutant.
     entered: bool | None = None
+    # HOW an equivalence was established, "" when none was (issue #24). `equivalent` alone
+    # cannot say whether the engine PROVED it or merely failed to refute it, and those are
+    # different claims: boundary-probe agreement means no input Wesker tried distinguished the
+    # two, while bytecode identity means none exists. Sharing one flag would promote
+    # `candidate-equivalent — UNPROVEN` to `equivalent` by assertion, which is precisely the
+    # move this tool refuses everywhere else.
+    equivalence_warrant: str = ""
 
 
 # Dispositions that belong in the mutation-score denominator. A mutant only measures the SUITE
@@ -4964,7 +4972,17 @@ def run_function_converged(
 
             # Integrated equivalence: check survivors immediately
             if not result.killed:
-                if check_equivalent(func_node, mutant):
+                # TCE first (#24): a pure function of two code objects — no execution, no test
+                # run — and SOUND, since identical bytecode cannot behave differently. It is
+                # both cheaper than the boundary probes and strictly stronger, so it decides
+                # before they run. A miss falls through and costs nothing; different bytecode
+                # is not evidence of inequivalence, so the probes still get their turn.
+                _warrant = (
+                    WARRANT_BYTECODE
+                    if nodes_equivalent(func_node, mutant.mutated_node)
+                    else ""
+                )
+                if _warrant or check_equivalent(func_node, mutant):
                     # Carry the execution phases across (#18). Rebuilding the result from
                     # scratch here silently restored the dataclass DEFAULTS — `constructed=True,
                     # installed=True, entered=None` — so a mutant that was never built or never
@@ -4976,6 +4994,7 @@ def run_function_converged(
                         mutant=mutant,
                         killed=False,
                         equivalent=True,
+                        equivalence_warrant=_warrant,
                         constructed=result.constructed,
                         installed=result.installed,
                         entered=result.entered,

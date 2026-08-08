@@ -69,7 +69,7 @@ def test_trace_one_attaches_through_a_differently_spelled_target(tmp_path):
     def t():
         assert mod.double(3) == 6
 
-    hits, _ = _trace_one(t, str(link), {2, 3, 4, 5})
+    hits, *_ = _trace_one(t, str(link), {2, 3, 4, 5})
     assert hits  # the old string-equality dispatch collected nothing here
 
 
@@ -82,7 +82,7 @@ def test_trace_one_multi_keys_hits_by_the_callers_spelling(tmp_path):
     def t():
         assert mod.double(2) == 4
 
-    hits, _ = _trace_one_multi(t, {str(link)})
+    hits, *_ = _trace_one_multi(t, {str(link)})
     assert set(hits) == {str(link)}  # never the co_filename spelling
     assert hits[str(link)]
 
@@ -125,5 +125,5 @@ def test_executable_lines_and_trace_agree_on_a_method_target(tmp_path):
 
     link = tmp_path / "cls_alias.py"
     link.symlink_to(p)
-    hits, _ = _trace_one(t, str(link), exec_lines)
+    hits, *_ = _trace_one(t, str(link), exec_lines)
     assert hits == {5, 6}

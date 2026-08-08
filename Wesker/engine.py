@@ -2325,7 +2325,15 @@ class SessionBaseline:
     which would turn a timing accident into a false completeness verdict.
     """
 
-    __slots__ = ("traced", "failing", "inert", "n_tests", "truncated", "inert_ids")
+    __slots__ = (
+        "traced",
+        "failing",
+        "inert",
+        "n_tests",
+        "truncated",
+        "inert_ids",
+        "uncontained",
+    )
 
     def __init__(
         self,
@@ -2335,6 +2343,7 @@ class SessionBaseline:
         n_tests: int,
         truncated: set[str] | None = None,
         inert_ids: set[str] | None = None,
+        uncontained: set[str] | None = None,
     ) -> None:
         self.traced = traced
         self.failing = failing
@@ -2348,6 +2357,12 @@ class SessionBaseline:
         # ENTRIES they owned. Both are kept — `inert` stays the attribution filter (exact, and
         # cheap on object identity), this is the evidence filter.
         self.inert_ids = inert_ids or set()
+        # Tests whose traced worker hit the budget and could NOT be confirmed stopped (#19).
+        # Strictly worse than `truncated`: that one is under-counted coverage, this one means a
+        # runaway is still executing in this process, so every LATER measurement in the session
+        # shares it. #14 made the mutation runner refuse to gate on that condition; the baseline
+        # trace reached it through a path that discarded the answer.
+        self.uncontained = uncontained or set()
 
     def replaced(
         self,
@@ -2391,6 +2406,11 @@ class SessionBaseline:
             # is addressed by test id, so a re-measured test's old verdict must drop with its
             # old trace entry or a rewritten test keeps the previous version's outcome.
             {n for n in self.inert_ids if n not in affected} | partial.inert_ids,
+            # NOT spliced by `affected`: a runaway this session could not stop is a fact about
+            # the PROCESS, not about the test that started it. Re-tracing that test cannot
+            # retract it, and dropping the entry would let a rewritten file quietly restore
+            # gateability to a session that is still hosting the thread.
+            self.uncontained | partial.uncontained,
         )
 
 
@@ -2590,6 +2610,7 @@ def build_session_baseline(
     before = len(cache) if cache is not None else 0
 
     truncated: set[str] = set()
+    uncontained: set[str] = set()
     traced = _trace_suite(
         test_functions,
         target_files,
@@ -2598,6 +2619,7 @@ def build_session_baseline(
         trace_progress,
         trace_session_budget_s,
         cache,
+        uncontained,
     )
     failing: list[str] = []
     inert: set[int] = set()
@@ -2648,6 +2670,7 @@ def build_session_baseline(
         len(test_functions),
         truncated,
         set(cached_inert),
+        uncontained,
     )
 
 
@@ -4567,6 +4590,12 @@ def run_function_profiling(
         if _sb is not None
         else (set(failing) | set(_trace_truncated))
     )
+    # `all_contained` tracks the MUTATION loop. A worker the BASELINE trace could not stop is
+    # the same condition one phase earlier, and it was invisible here (#19): the run reported
+    # gateable while a runaway from the trace was still executing in the process, perturbing
+    # every mutant timing that followed. Containment is absorbing — one failure anywhere in the
+    # measurement invalidates the whole of it.
+    _contained = all_contained and not (_sb.uncontained if _sb is not None else set())
 
     return ProfilingResult(
         function_key=func_key,
@@ -4580,11 +4609,12 @@ def run_function_profiling(
         survivor_records=survivor_records,
         killed_records=killed_records,
         budget_exhausted=budget_exhausted,
-        is_gateable=_measurement_gateable(True, all_contained, not budget_exhausted),
-        # A cut is any invalid measurement — budget overrun OR an uncontained worker (#13/#14): the
-        # depth must not read "profiled" when the run stopped short or ran against a live abandoned
-        # worker. is_gateable already reflects both; coverage_depth now agrees.
-        coverage_depth="cut" if (budget_exhausted or not all_contained) else "profiled",
+        is_gateable=_measurement_gateable(True, _contained, not budget_exhausted),
+        # A cut is any invalid measurement — budget overrun OR an uncontained worker (#13/#14),
+        # from the mutation loop OR the baseline trace (#19): the depth must not read "profiled"
+        # when the run stopped short or ran against a live abandoned worker. is_gateable already
+        # reflects both; coverage_depth now agrees.
+        coverage_depth="cut" if (budget_exhausted or not _contained) else "profiled",
         elapsed_ms=_elapsed(start),
         line_coverage=line_cov,
         admissible_line_coverage=_admissible_coverage(line_cov, _barred),

@@ -74,14 +74,14 @@ def _slow_elsewhere() -> None:
 
 def test_unbudgeted_is_the_historical_unbounded_pass():
     """None (the default) must not change what the tracer does — only what it is ALLOWED to cost."""
-    covered, truncated = _trace_one(_fast, _FILE, _LINES)
+    covered, truncated, *_ = _trace_one(_fast, _FILE, _LINES)
     assert truncated is False
     assert covered == _LINES  # the whole function body was reached
 
 
 def test_budget_cuts_a_heavy_test_and_keeps_its_partial_coverage():
     """The cut is not a failure — the lines reached before it are real and are kept."""
-    covered, truncated = _trace_one(_slow, _FILE, _LINES, budget_s=0.25)
+    covered, truncated, *_ = _trace_one(_slow, _FILE, _LINES, budget_s=0.25)
     assert truncated is True
     assert covered  # partial coverage is real coverage
     assert covered <= _LINES
@@ -93,7 +93,7 @@ def test_budget_binds_work_outside_the_target_file():
     sailed through untouched (measured 4.2s under a 1.0s budget). Bounding by wall-clock in
     another thread does not care which module is running."""
     t0 = time.monotonic()
-    _covered, truncated = _trace_one(_slow_elsewhere, _FILE, _LINES, budget_s=0.5)
+    _covered, truncated, *_ = _trace_one(_slow_elsewhere, _FILE, _LINES, budget_s=0.5)
     elapsed = time.monotonic() - t0
     assert truncated is True
     assert elapsed < 3.0, (
@@ -103,8 +103,8 @@ def test_budget_binds_work_outside_the_target_file():
 
 def test_budget_does_not_touch_a_test_that_fits_in_it():
     """The common case pays nothing: a fast test's coverage is identical budgeted or not."""
-    unbudgeted, _ = _trace_one(_fast, _FILE, _LINES)
-    budgeted, truncated = _trace_one(_fast, _FILE, _LINES, budget_s=5.0)
+    unbudgeted, *_ = _trace_one(_fast, _FILE, _LINES)
+    budgeted, truncated, *_ = _trace_one(_fast, _FILE, _LINES, budget_s=5.0)
     assert budgeted == unbudgeted and truncated is False
 
 
@@ -155,9 +155,9 @@ def test_trace_suite_budgets_each_test_and_reports_the_cuts():
 def test_trace_one_multi_reports_its_own_cut_rather_than_the_caller_timing_it():
     """The trace reports the cut it made; the caller never infers it from a clock (which would
     false-positive on a test that merely happens to take about the budget)."""
-    per_file, truncated = _trace_one_multi(_slow, {_FILE}, budget_s=0.25)
+    per_file, truncated, *_ = _trace_one_multi(_slow, {_FILE}, budget_s=0.25)
     assert truncated is True and per_file[_FILE]
-    per_file2, truncated2 = _trace_one_multi(_fast, {_FILE})
+    per_file2, truncated2, *_ = _trace_one_multi(_fast, {_FILE})
     assert truncated2 is False and per_file2[_FILE]
 
 

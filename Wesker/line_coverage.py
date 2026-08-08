@@ -107,8 +107,19 @@ def _traced_in_thread(
     body: Callable[[], None],
     dispatch: Callable,
     budget_s: float | None,
-) -> bool:
-    """Run ``body`` under ``dispatch`` in a worker thread, bounded by ``budget_s``. True if CUT.
+) -> tuple[bool, bool]:
+    """Run ``body`` under ``dispatch`` in a worker thread, bounded by ``budget_s``.
+
+    Returns ``(cut, contained)``. ``contained`` is False when the budget fired and the worker
+    could NOT be confirmed stopped — issue #19, the baseline-trace half of the containment
+    boundary #14 closed for the mutation runner.
+
+    `abandon` already reports honestly whether the thread is gone; this function used to throw
+    that answer away and return a bare `True`, so a worker blocked in a subprocess, socket or C
+    extension stayed alive while the trace reported an ordinary cut. Every later test in the
+    baseline then measured against a process with a runaway still executing in it — the exact
+    condition `all_contained` exists to make non-gateable, arriving through a path that had no
+    way to say so.
 
     The test runs in a WORKER because that is the only way to bound it wherever it spends its time.
     The obvious alternative — tick a deadline from the trace callback — bounds only code the tracer
@@ -140,9 +151,10 @@ def _traced_in_thread(
     thread.start()
     thread.join(timeout=budget_s if budget_s and budget_s > 0 else None)
     if not thread.is_alive():
-        return False
-    abandon(thread)  # cut: stop it, don't leak it. Partial coverage is kept either way.
-    return True
+        return False, True
+    # Cut: stop it, don't leak it. Partial coverage is kept either way — and whether the stop
+    # actually LANDED travels with the result instead of being discarded (#19).
+    return True, abandon(thread)
 
 
 def _target_matcher(target_files: set[str]) -> Callable[[str], str | None]:
@@ -233,8 +245,8 @@ def _trace_one(
                 return local
         return None
 
-    truncated = _traced_in_thread(test_fn, dispatch, budget_s)
-    return hits & exec_lines, truncated
+    truncated, contained = _traced_in_thread(test_fn, dispatch, budget_s)
+    return hits & exec_lines, truncated, contained
 
 
 def failing_on_baseline(
@@ -322,8 +334,8 @@ def _trace_one_multi(
                 return local
         return None
 
-    truncated = _traced_in_thread(test_fn, dispatch, budget_s)
-    return hits, truncated
+    truncated, contained = _traced_in_thread(test_fn, dispatch, budget_s)
+    return hits, truncated, contained
 
 
 def trace_suite(
@@ -334,6 +346,7 @@ def trace_suite(
     progress: Callable[[int, int, float], None] | None = None,
     session_budget_s: float | None = None,
     cache: dict[str, dict[str, list[int]]] | None = None,
+    uncontained: set[str] | None = None,
 ) -> dict[str, dict[str, set[int]]]:
     """Trace the WHOLE suite ONCE: ``{test_id: {file: lines}}``.
 
@@ -435,7 +448,12 @@ def trace_suite(
                 contextlib.redirect_stdout(io.StringIO()),
                 contextlib.redirect_stderr(io.StringIO()),
             ):
-                per_file, was_cut = _trace_one_multi(test_fn, target_files, budget_s)
+                per_file, was_cut, contained = _trace_one_multi(
+                    test_fn, target_files, budget_s
+                )
+            # See `trace_line_coverage`: an unstoppable worker is not an ordinary cut (#19).
+            if not contained and uncontained is not None:
+                uncontained.add(name)
             if cache is not None and fp is not None and not was_cut:
                 # NOT when cut: a truncated trace is under-counted, and downstream that is
                 # indistinguishable from "no test reaches this line". Storing it would make one
@@ -580,6 +598,7 @@ def trace_line_coverage(
     truncated: set[str] | None = None,
     progress: Callable[[int, int, float], None] | None = None,
     session_budget_s: float | None = None,
+    uncontained: set[str] | None = None,
 ) -> dict[str, list[int]]:
     """Map each test id to the target lines it covers, over the UNMUTATED function.
 
@@ -632,9 +651,17 @@ def trace_line_coverage(
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
         ):
-            covered, was_cut = _trace_one(test_fn, target_file, exec_lines, budget_s)
+            covered, was_cut, contained = _trace_one(
+                test_fn, target_file, exec_lines, budget_s
+            )
         if was_cut and truncated is not None:
             truncated.add(name)
+        # A cut that could not be STOPPED is a different fact from a cut (#19): the worker is
+        # still running, so every later measurement in this process shares it. Reported by name
+        # for the same reason `truncated` is — silently folding it in makes a live runaway
+        # indistinguishable from an ordinary budget trim.
+        if not contained and uncontained is not None:
+            uncontained.add(name)
         # Union across duplicate test names (parametrized cases share a __name__).
         merged = set(coverage.get(name, ())) | covered
         coverage[name] = sorted(merged)

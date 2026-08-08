@@ -36,6 +36,34 @@ class CategoryPrior:
     prior: float  # 0.0 = never survives, 1.0 = always survives
 
 
+def operator_disposition(generated: int, withheld: int) -> str:
+    """What the policy DID to one operator on one target (issue #22).
+
+    An internal assertion that record-mode count equals generator count proves the two
+    implementations agree; it cannot prove they agree on the RIGHT set, because both can omit
+    the same site class and still match. Auditability needs the census to say what happened to
+    every candidate, and the three answers are not interchangeable:
+
+    * ``generated``      — at least one mutant was produced. The universe covers this operator.
+    * ``withheld``       — candidate sites EXIST and policy suppressed all of them. The only
+      case a reader must be able to see and disagree with, because it is a judgement rather
+      than a structural fact: `filter_categories`' ``is_pure`` overlay asserts that
+      ``self.x = ...`` writes are unobservable and stops remove_assign counting. If that
+      assertion is wrong the behaviour is real and unmeasured, and today nothing says so.
+    * ``not_applicable`` — no candidate site exists at all. Nothing was decided and nothing is
+      missing; skipping an empty category loses exactly nothing.
+
+    ``generated`` wins when both are positive: policy suppressed SOME sites and the operator is
+    still represented, so the universe is not missing it. The withheld count still travels
+    alongside for a reader who wants the partial suppression.
+    """
+    if generated > 0:
+        return "generated"
+    if withheld > 0:
+        return "withheld"
+    return "not_applicable"
+
+
 def filter_categories(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     is_pure: bool = False,
@@ -63,19 +91,69 @@ def filter_categories(
     return_none and loop_flow are value/control-flow questions and count
     either way.
     """
-    relevant: set[MutationCategory] = set()
+    return {
+        cat
+        for cat, row in category_census(func_node, is_pure).items()
+        if row["disposition"] == "generated"
+    }
+
+
+def category_census(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, is_pure: bool = False
+) -> dict[MutationCategory, dict]:
+    """What the policy did to EVERY candidate operator on this target (issue #22).
+
+    The engine could say which categories are in the universe and not why the others are out,
+    and those are different questions. A category absent because the function has no candidate
+    site is nothing to worry about; a category absent because a policy overlay SUPPRESSED its
+    sites is a judgement the reader may want to disagree with — and the two were indistinguishable
+    from the report.
+
+    `filter_categories` is DERIVED from this rather than computing the counts alongside it. The
+    repo treats a second predicate for one fact as a defect class, not a style question: issue #9
+    shipped a false ✓ COMPLETE exactly that way, when SWAP's structural proxy answered a different
+    question than its mutator and silently dropped `pow(x, 2) -> pow(2, x)` from the universe.
+    A census that could disagree with the filter it explains would be the same defect wearing a
+    report.
+
+    The withheld count is per SUB-MODE for STATE, because that is the granularity policy acts at:
+    ``is_pure`` suppresses only ``remove_assign`` (a caller asserting purity asserts that
+    ``self.x = ...`` writes are unobservable), while ``return_none`` and ``loop_flow`` are
+    value/control-flow questions and count either way. Naming the suppressed alternatives is what
+    makes the assertion reviewable — if purity was asserted wrongly, that behaviour is real,
+    unmeasured, and currently invisible.
+    """
+    census: dict[MutationCategory, dict] = {}
     for cat in MutationCategory:
         if cat is MutationCategory.STATE:
-            count = sum(
-                _count_state_targets(func_node, mode)
-                for mode, _desc in _STATE_SUB_MODES
-                if not (is_pure and mode == "remove_assign")
-            )
+            sub_modes: dict[str, dict] = {}
+            generated = withheld = 0
+            for mode, _desc in _STATE_SUB_MODES:
+                targets = _count_state_targets(func_node, mode)
+                suppressed = bool(is_pure and mode == "remove_assign")
+                if suppressed:
+                    withheld += targets
+                else:
+                    generated += targets
+                sub_modes[mode] = {
+                    "targets": targets,
+                    # Empty unless policy actually removed something: a reason attached to a
+                    # sub-mode with no sites would read as a suppression that never happened.
+                    "withheld_by": "purity_overlay" if (suppressed and targets) else "",
+                }
+            row: dict = {
+                "generated": generated,
+                "withheld": withheld,
+                "sub_modes": sub_modes,
+            }
         else:
-            count = estimate_universe_size(func_node, {cat})
-        if count:
-            relevant.add(cat)
-    return relevant
+            row = {
+                "generated": estimate_universe_size(func_node, {cat}),
+                "withheld": 0,
+            }
+        row["disposition"] = operator_disposition(row["generated"], row["withheld"])
+        census[cat] = row
+    return census
 
 
 # ── Layer 2: Predictive priors (§6.2) ────────────────────────────────

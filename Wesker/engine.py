@@ -2682,14 +2682,51 @@ def build_session_baseline(
     )
 
 
+def baseline_probe_disposition(outcome: str | None) -> str:
+    """What a baseline probe's outcome MEANS for the measurement (#14, pure — pinned).
+
+    ``_run_test_with_timeout`` answers two different questions through one ``str | None``
+    channel, and that conflation is the whole defect this splits. Four of its values name a
+    KILL REASON — the test did not pass, so it cannot distinguish a mutant from the original
+    and is inert for attribution. ``"uncontained"`` is not a kill reason at all: it says the
+    worker is STILL RUNNING, may still be mutating shared state, and therefore that no
+    measurement taken afterwards can be trusted. Its docstring listed only the four, so every
+    caller written against the documented contract read ``is not None`` as "some kill reason"
+    and filed a live worker as merely inert. That is exactly what happened at three call
+    sites, and why #14's fix reached the mutant loop — the only caller it rewrote — and
+    nowhere else.
+
+    Returns a NAMED state rather than a bool because the three are not two. "passed", "did
+    not pass", and "we could not tell, and the process is now untrustworthy" have genuinely
+    different consequences: the first is usable evidence, the second is dropped from
+    attribution, the third must invalidate the whole run. Collapsing any pair reintroduces
+    the bug — folding uncontained into inert silently discards a containment failure, and
+    folding it into usable credits a kill to a test that may not have finished.
+
+    Total over the channel: an outcome this does not recognise is INERT, not usable. A new
+    kill reason added later is by construction "did not pass", so the conservative default is
+    the correct one; only ``None`` — an actual clean pass — earns ``usable``.
+    """
+    if outcome is None:
+        return "usable"
+    if outcome == "uncontained":
+        return "uncontained"
+    return "inert"
+
+
 def _baseline_failures(
     test_functions: list[Callable[..., None]],
     original_func: Callable[..., Any] | None,
     qualname: str | None,
     timeout_ms: float = 5000,
-) -> set[int]:
+) -> tuple[set[int], bool]:
     """``id()`` of every test that FAILS against the UNMUTATED function, under
-    ``evaluate_mutant``'s own call convention.
+    ``evaluate_mutant``'s own call convention, AND whether any probe went uncontained.
+
+    The second element is not decoration. This runs the suite BEFORE any mutant exists, so an
+    uncontained worker here poisons every measurement that follows — and the old ``set[int]``
+    return had nowhere to say so, which is precisely why it said nothing and the caller
+    reported a gateable profile over zero usable tests (#14).
 
     Such a test fails no matter what the mutation does, so crediting it with a kill
     measures the harness, not the suite. It cannot distinguish correct code from a
@@ -2713,7 +2750,7 @@ def _baseline_failures(
     TypeError before reaching the function under test, identically on the original.
     """
     if original_func is None or not qualname:
-        return set()
+        return set(), False
     func_name = qualname.split(".")[-1]
     # A baseline is only meaningful against the GENUINE original. Several callers
     # deliberately STUB original_func (e.g. ``lambda *_a: None``) when they only want
@@ -2723,20 +2760,30 @@ def _baseline_failures(
     # the callable must actually be the function we are mutating.
     probe = _unwrap_descriptor(original_func)
     if getattr(probe, "__name__", None) != func_name:
-        return set()
+        return set(), False
     inert: set[int] = set()
+    uncontained = False
     for test_fn in test_functions:
         patched, saved, patch_target = _patch_mutant_into_test(
             test_fn, qualname, original_func
         )
         try:
-            if _run_test_with_timeout(test_fn, probe, patched, timeout_ms) is not None:
+            disposition = baseline_probe_disposition(
+                _run_test_with_timeout(test_fn, probe, patched, timeout_ms)
+            )
+            # An uncontained probe is BOTH: inert, because a test that never finished cannot be
+            # credited with distinguishing anything; and a containment failure, because the
+            # worker is still live. Recording only the first is the bug — it is what let a
+            # live thread read as an ordinary unrunnable test.
+            if disposition == "uncontained":
+                uncontained = True
+            if disposition != "usable":
                 inert.add(id(test_fn))
         except Exception:  # noqa: BLE001 — an unrunnable baseline is itself inert
             inert.add(id(test_fn))
         finally:
             _unpatch_mutant(patched, saved, patch_target, func_name)
-    return inert
+    return inert, uncontained
 
 
 def _build_test_scope(
@@ -2750,6 +2797,7 @@ def _build_test_scope(
     truncated: set[str] | None = None,
     trace_progress: Callable[[int, int, float], None] | None = None,
     trace_session_budget_s: float | None = None,
+    uncontained: set[str] | None = None,
 ) -> tuple[
     Callable[[Mutant], list[Callable[..., None]]],
     dict[str, list[int]],
@@ -2800,7 +2848,9 @@ def _build_test_scope(
         # reuse it so a probe + follow-up run don't trace twice. Deterministic, so the
         # reused map is identical to what a fresh trace would produce here.
         line_cov, failing = precomputed_line_data
-        inert = _baseline_failures(test_functions, original_func, qualname)
+        inert, _unc = _baseline_failures(test_functions, original_func, qualname)
+        if _unc and uncontained is not None:
+            uncontained.add("baseline_probe")
     elif session is not None:
         # Suite-global baseline, already paid for once. Only the per-function
         # intersection is left, and it is a set operation over data in hand.
@@ -2816,6 +2866,12 @@ def _build_test_scope(
             truncated |= (
                 session.truncated
             )  # the suite-level cut is this function's cut too
+        # The suite-level containment failure is this function's too, for the same reason. It
+        # was computed once for the whole session and read by ONE of the two profiling paths
+        # (#19 wired it into the exhaustive one only), so routing it through the shared scope
+        # builder is what stops the two drifting apart again.
+        if session.uncontained and uncontained is not None:
+            uncontained.add("session_baseline")
     elif original_func is not None:
         line_cov = _trace_line_coverage(
             test_functions,
@@ -2827,7 +2883,9 @@ def _build_test_scope(
             trace_session_budget_s,
         )
         failing = _failing_on_baseline(test_functions, original_func)
-        inert = _baseline_failures(test_functions, original_func, qualname)
+        inert, _unc = _baseline_failures(test_functions, original_func, qualname)
+        if _unc and uncontained is not None:
+            uncontained.add("baseline_probe")
     else:
         line_cov, failing = {}, []
 
@@ -3692,20 +3750,32 @@ def _measure_scoped_baseline(
     test_functions: list[Callable[..., None]],
     original_func: Callable[..., Any] | None,
     cap_ms: float,
-) -> float | None:
+) -> tuple[float | None, bool]:
     """The ORIGINAL's live wall-clock over ``test_functions``, UNTRACED like the mutant loop, for
-    sizing an adaptive per-mutant allowance (#13). None when there is no trustworthy baseline — no
-    original, no tests, or a test that does not pass cleanly on the original (a red baseline is not
-    a clock). Each test is bounded by ``cap_ms`` so a pathological baseline test cannot hang the
-    sizing itself.
+    sizing an adaptive per-mutant allowance (#13), AND whether any probe went uncontained.
+
+    The clock is None when there is no trustworthy baseline — no original, no tests, or a test
+    that does not pass cleanly on the original (a red baseline is not a clock). Each test is
+    bounded by ``cap_ms`` so a pathological baseline test cannot hang the sizing itself.
+
+    The second element exists because #13's fix introduced this function and gave it a single
+    ``float | None`` channel, so an uncontained probe here — a live worker — was indistinguishable
+    from the benign "this baseline is red, fall back to the configured cap". A sizing failure is
+    recoverable; a containment failure is not, and folding the second into the first is how a
+    fix for one issue opened a new door into another (#14).
     """
     if original_func is None or not test_functions:
-        return None
+        return None, False
     t0 = time.monotonic()
     for test_fn in test_functions:
-        if _run_test_with_timeout(test_fn, original_func, True, cap_ms) is not None:
-            return None
-    return _elapsed(t0)
+        disposition = baseline_probe_disposition(
+            _run_test_with_timeout(test_fn, original_func, True, cap_ms)
+        )
+        if disposition == "uncontained":
+            return None, True
+        if disposition != "usable":
+            return None, False
+    return _elapsed(t0), False
 
 
 def evaluate_mutant(
@@ -3973,6 +4043,12 @@ def evaluate_mutant(
         return MutantResult(
             mutant=mutant,
             killed=False,
+            # The plain-survivor return, and the ONE of the five that omitted this — so it took
+            # the dataclass default `True` and reported a survivor as contained even when a
+            # worker had outlived `abandon`. Reachable whenever an uncontained timeout is nulled
+            # by the `_outcome_on_original` attribution control, i.e. the `patched is False`
+            # path this function's own comment names as every parametrized test.
+            contained=not saw_uncontained,
             entered=(getattr(mutated_obj, "entered", None) if ran else None),
             elapsed_ms=_elapsed(start),
         )
@@ -4081,6 +4157,14 @@ def _run_test_with_timeout(
 
     Returns the kill reason ("assertion", "exception", "crash", "timeout") if killed,
     or None if the test passed (mutant survived this test).
+
+    AND ONE VALUE THAT IS NOT A KILL REASON: "uncontained" (#14). It means the timed-out
+    worker outlived `abandon` and may still be running, so nothing measured after it is
+    trustworthy. This list omitted it for a release, and three baseline callers written
+    against the omission read `is not None` as "some kill reason" and filed a live worker as
+    an inert test — a zero-evidence profile that then reported itself gateable. Callers must
+    route the outcome through `baseline_probe_disposition`, which names the three states,
+    rather than testing it against None.
 
     The timeout bounds the WAIT and, via `interrupt.abandon`, the thread itself — see there for what
     that can and cannot reach.
@@ -4413,6 +4497,7 @@ def run_function_profiling(
     source_path = func_key.split("::", 1)[0] if "::" in func_key else None
 
     _trace_truncated: set[str] = set()
+    _baseline_uncontained: set[str] = set()
     _tests_for, line_cov, exec_lines, failing = _build_test_scope(
         func_node,
         test_functions,
@@ -4424,13 +4509,16 @@ def run_function_profiling(
         _trace_truncated,
         trace_progress,
         trace_session_budget_s,
+        _baseline_uncontained,
     )
 
     # Live baseline for the adaptive per-mutant allowance (#13): time the ORIGINAL over the tests
     # once, untraced (the mutant loop is untraced too). None → fall back to the configured cap.
-    baseline_ms = _measure_scoped_baseline(
+    baseline_ms, _sizing_uncontained = _measure_scoped_baseline(
         test_functions, original_func, per_mutant_timeout_ms
     )
+    if _sizing_uncontained:
+        _baseline_uncontained.add("baseline_sizing")
 
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
     kill_matrix: dict[str, list[str]] = {}
@@ -4603,7 +4691,10 @@ def run_function_profiling(
     # gateable while a runaway from the trace was still executing in the process, perturbing
     # every mutant timing that followed. Containment is absorbing — one failure anywhere in the
     # measurement invalidates the whole of it.
-    _contained = all_contained and not (_sb.uncontained if _sb is not None else set())
+    # `_baseline_uncontained` now carries every pre-mutation source — the session baseline this
+    # line used to read directly, the per-function inert probe, and #13's sizing pass — because
+    # reading ONE of them is how the other two stayed invisible.
+    _contained = all_contained and not _baseline_uncontained
 
     return ProfilingResult(
         function_key=func_key,
@@ -4914,6 +5005,7 @@ def run_function_converged(
     # real callable to trace against; callers that stub it get the full test set, which
     # is always sound, just slower.
     _trace_truncated: set[str] = set()
+    _baseline_uncontained: set[str] = set()
     _tests_for, line_cov, exec_lines, failing = _build_test_scope(
         func_node,
         test_functions,
@@ -4925,6 +5017,7 @@ def run_function_converged(
         _trace_truncated,
         trace_progress,
         trace_session_budget_s,
+        _baseline_uncontained,
     )
 
     seen: dict[str, MutantResult] = {}
@@ -5089,7 +5182,13 @@ def run_function_converged(
 
     # Aggregate by category
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
-    all_contained = True  # #14: cleared if any timed-out worker could not be stopped
+    # #14: cleared if any timed-out worker could not be stopped. Seeded from the BASELINE
+    # phases, not just the mutation loop — this path read only its own `seen` records, so #19's
+    # baseline-containment fix existed on `run_function_profiling` and was absent here, on the
+    # path `ci.profile_function` -> `profile_file` -> `profile_codebase` -> the GitHub Action
+    # actually runs. A zero-mutant run (`seen` empty) therefore left this True and published a
+    # clean badge over a live runaway.
+    all_contained = not _baseline_uncontained
     for result in seen.values():
         if not result.contained:
             all_contained = False

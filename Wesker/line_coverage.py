@@ -444,6 +444,72 @@ def trace_suite(
     return out
 
 
+def trace_evidence_admissible(
+    baseline_outcome: str, truncated: bool, contained: bool
+) -> tuple[bool, str]:
+    """Whether one test's traced observation may discharge a PROOF obligation (issue #17).
+
+    "A trace observed this line" and "this line is pinned under the certificate regime" are
+    different facts, and the engine returned only the first. `_build_test_scope` already bars a
+    baseline-failing test from KILL attribution — a test that fails on correct code cannot
+    distinguish a mutant from it — and then judges LINE completeness from a union that still
+    contains that same test's coverage. One body of evidence, two admissibility rules, and the
+    weaker one silently decides completeness.
+
+    The counterexample in #17 is three lines long: a green test covering the true branch and a
+    FAILING test that is the only observation of the false branch. Every executable line appears
+    covered; the admissible union covers two of three. The failing test is correctly known to be
+    failing — the defect is that its trace still counts as proof.
+
+    Returns ``(admissible, reason)`` with an EMPTY reason when admissible, so a caller can
+    record why an observation was refused without a second lookup. Reasons are stable strings,
+    not prose: they are consumed, not read.
+
+    ``skipped``/``xfailed`` are inadmissible rather than ignored. A skipped test asserts nothing
+    about the code, so counting its (nonexistent) reach as proof is vacuous, and treating it as
+    a negative reach claim would be worse — it would report a line as unreachable that simply
+    was not run. Both directions are wrong; naming it is the only honest option.
+
+    A TRUNCATED trace is under-counted by construction, and containment failure means the
+    process may still have been mutating state while the trace ran (#14). Neither is evidence of
+    absence, which is exactly why they cannot be evidence of presence either.
+    """
+    if not contained:
+        return False, "uncontained"
+    if truncated:
+        return False, "truncated"
+    if baseline_outcome != "passed":
+        return False, f"baseline_{baseline_outcome}"
+    return True, ""
+
+
+def admissible_coverage(
+    observed: dict[str, list[int]], inadmissible: list[str]
+) -> dict[str, list[int]]:
+    """The PROOF view of a coverage map: observed reach minus the entries whose owner may not
+    discharge an obligation (issue #17).
+
+    Two views, deliberately, and they must not be collapsed:
+
+    * OBSERVED is what `_build_test_scope` scopes mutants with. Routing wants it conservative —
+      including a test that cannot kill costs a little time, excluding one that can turns a
+      real kill into a reported gap. A baseline-failing test still REACHES the line, so it
+      still belongs there.
+    * ADMISSIBLE is what a completeness claim may rest on. The same failing test proves nothing
+      about the line it touched, because it fails on the unmutated program too.
+
+    Returning a filtered MAP rather than a union is the point of #17's "do not union before
+    outcome qualification": once the per-test structure is flattened, the reason an entry was
+    dropped is gone, and a consumer can no longer name which item owns an obligation — which is
+    exactly what a proof basis has to be able to do.
+
+    Entries are dropped whole, never emptied to ``[]``. An empty list is a positive claim that
+    the test reached nothing; absence says the engine holds no admissible observation from it.
+    """
+    barred = set(inadmissible)
+    return {tid: lines for tid, lines in observed.items() if tid not in barred}
+
+
 def coverage_from_trace(
     traced: dict[str, dict[str, set[int]]], target_file: str, exec_lines: set[int]
 ) -> dict[str, list[int]]:

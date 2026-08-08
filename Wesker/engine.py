@@ -154,6 +154,97 @@ class MutantResult:
     # kill still counts as a run-only timeout, but the measurement is UNCONTAINED: the runaway may
     # still be executing and mutating shared state, so a profile that contains it is not gateable.
     contained: bool = True  # all killers (full-matrix mode)
+    # --- execution phases (issue #18) -------------------------------------------------------
+    # `killed` alone cannot say WHY. A mutant Wesker failed to build, and one a green suite
+    # genuinely failed to detect, are different facts about different things — the first is a
+    # fact about the harness — and both used to arrive here as `killed=True, killed_by="crash"`.
+    #
+    # Defaults are chosen so every EXISTING construction site keeps exactly today's meaning:
+    # reaching one of them means the mutant was built and the tests ran, which is
+    # `constructed=True, installed=True`. Only the construction-failure paths set them False.
+    constructed: bool = True
+    installed: bool = True
+    # None = NOT OBSERVED, which is not the same as False. Until entry is instrumented the
+    # engine has no evidence either way, and inventing `not_entered` here would withhold real
+    # kills — the one direction this repo's conservatism rule forbids (over-approximate only
+    # where that withholds a mutation dimension, never fabricate one). A False here is a
+    # positive observation that the test never called the mutant.
+    entered: bool | None = None
+
+
+# Dispositions that belong in the mutation-score denominator. A mutant only measures the SUITE
+# once it was built, installed, and entered; before that, an outcome measures the harness.
+SCORED_DISPOSITIONS = ("killed_after_entry", "survived_after_entry")
+
+
+def mutant_disposition(
+    constructed: bool,
+    installed: bool,
+    entered: bool | None,
+    contained: bool,
+    killed: bool,
+) -> str:
+    """What a mutant's outcome is EVIDENCE OF (issue #18).
+
+    `killed` answers "did something go wrong", not "did the suite detect the change", and the
+    two diverged silently. A mutant whose construction raised returned `killed=True,
+    killed_by="crash"` — a fact about Wesker's compile step scored as a fact about the user's
+    tests, straight into the adequacy numerator. `_preserve_descriptor_shape` records the same
+    class of error from the other side (issue #25: a double-bound classmethod raised TypeError
+    "which the runner reads as a spurious crash"), fixed there for one shape; this names the
+    category so the next shape cannot repeat it.
+
+    PRECEDENCE, earliest failed phase first — each answers a question the later ones presuppose:
+
+    * ``harness_error``  — never built. Says nothing about any test.
+    * ``not_installed``  — built, but no call site was rebound to it. A survivor here is a
+      patch blind spot, not a specification gap; `_patch_module_qualified` skips any object
+      without ``__code__``, so an `lru_cache`/`partial`-wrapped target lands here.
+    * ``not_entered``    — installed, but the test never called it. The classic decorator and
+      registry capture: the namespace holds the mutant while the caller holds the original.
+    * ``cut``            — ran, but the measurement is truncated or uncontained, so its outcome
+      is not evidence either way (the #14 boundary).
+    * ``killed_after_entry`` / ``survived_after_entry`` — the only two that measure the SUITE,
+      and the only two :data:`SCORED_DISPOSITIONS` admits to the denominator.
+
+    ``entered=None`` means NOT OBSERVED and falls through to the scored pair, preserving the
+    pre-#18 verdict exactly. It is deliberately not treated as ``not_entered``: that would
+    withhold real kills on evidence the engine does not have.
+    """
+    if not constructed:
+        return "harness_error"
+    if not installed:
+        return "not_installed"
+    if entered is False:
+        return "not_entered"
+    if not contained:
+        return "cut"
+    return "killed_after_entry" if killed else "survived_after_entry"
+
+
+def merge_unscored(counts: list[dict[str, int]]) -> tuple[int, dict[str, int]]:
+    """Fold per-category unscored breakdowns into one ``(total, by_reason)`` pair (#18).
+
+    The TOTAL IS DERIVED FROM THE BREAKDOWN, never summed alongside it. Reported separately
+    the two can disagree, and a payload whose own numbers do not reconcile is worse than one
+    that omits them — a reader who checks is told the report is wrong, and one who does not is
+    told a number nobody computed. This is the same partition discipline the audit accounting
+    already runs on: name the parts, derive the total, so the identity cannot be violated by
+    an update that touches one and forgets the other.
+
+    Shared by both :meth:`SamplingResult.to_dict` and :meth:`ProfilingResult.to_dict` because
+    the repo treats a second implementation of one fact as a defect class rather than a style
+    question — the two results are read by the same consumers and must not answer differently.
+
+    Zero-valued reasons are dropped: a reason that never fired is not evidence of anything, and
+    keeping it invites a reader to treat an empty bucket as a measured zero.
+    """
+    merged: dict[str, int] = {}
+    for one in counts:
+        for reason, n in one.items():
+            if n:
+                merged[reason] = merged.get(reason, 0) + n
+    return sum(merged.values()), merged
 
 
 @dataclass
@@ -169,6 +260,14 @@ class CategoryResult:
     killed_by_crash: int = 0
     timed_out: int = 0
     equivalent: int = 0
+    # Mutants whose outcome measured the HARNESS, not the suite (issue #18): never built,
+    # never installed at any call site, never entered by the test, or cut mid-measurement.
+    # Deliberately OUTSIDE `total`, which is the denominator: a mutant Wesker could not build
+    # is not a behaviour the tests failed to pin, and counting it either way is a claim about
+    # the suite that no measurement supports. Reported so the omission is visible — a silently
+    # smaller denominator is the same lie in the other direction.
+    unscored: int = 0
+    unscored_by: dict[str, int] = field(default_factory=dict)
 
     @property
     def survival_rate(self) -> float:
@@ -212,6 +311,12 @@ class SamplingResult:
     universe_size: int = 0
 
     def to_dict(self) -> dict:
+        # See `ProfilingResult.to_dict` for why this is emitted unconditionally. Sampling needs
+        # it at least as much: it already reports a PARTIAL universe, so a second, unexplained
+        # reason for the denominator to shrink is indistinguishable from the sampling itself.
+        unscored, unscored_by = merge_unscored(
+            [cr.unscored_by for cr in self.per_category]
+        )
         effective_total = self.total_mutants - self.total_equivalent
         effective_kill_pct = (
             round(100 * self.total_killed / effective_total)
@@ -225,6 +330,8 @@ class SamplingResult:
             "total_killed": self.total_killed,
             "total_survived": self.total_survived,
             "total_equivalent": self.total_equivalent,
+            "unscored": unscored,
+            "unscored_by": unscored_by,
             "universe_size": self.universe_size,
             "survival_rate": round(self.survival_rate, 3),
             "effective_kill_pct": effective_kill_pct,
@@ -238,6 +345,7 @@ class SamplingResult:
                     "killed": cr.killed,
                     "survived": cr.survived,
                     "equivalent": cr.equivalent,
+                    "unscored": cr.unscored,
                     "survival_rate": round(cr.survival_rate, 3),
                 }
                 for cr in self.per_category
@@ -352,6 +460,16 @@ class ProfilingResult:
         return list(self.survivor_records) + crash_survivors
 
     def to_dict(self) -> dict:
+        # Mutants whose outcome measured the HARNESS, not the suite (#18) — never built, never
+        # installed, never entered. `total_mutants` excludes them, so EMITTING THIS IS PART OF
+        # THE CONTRACT, including as 0: without it a consumer sees `universe_size` exceed
+        # `total_mutants`, and `effective_kill_pct` computed over a base that shrank for a
+        # reason the payload never states. A silently smaller denominator is the same
+        # dishonesty as counting a harness failure as a kill, pointed the other way; a reader
+        # has to be able to reconcile the two numbers from this payload alone.
+        unscored, unscored_by = merge_unscored(
+            [cr.unscored_by for cr in self.per_category]
+        )
         effective_total = self.total_mutants - self.total_equivalent
         effective_kill_pct = (
             round(100 * self.total_killed / effective_total)
@@ -365,6 +483,11 @@ class ProfilingResult:
             "total_killed": self.total_killed,
             "total_survived": self.total_survived,
             "total_equivalent": self.total_equivalent,
+            # `universe_size` counts every mutant the AST admits; `total_mutants` counts only
+            # those actually MEASURED against the suite. `unscored` is the difference this run
+            # is responsible for, and names why each one was not measurable.
+            "unscored": unscored,
+            "unscored_by": unscored_by,
             "universe_size": self.universe_size,
             "dof_total": self.dof_total,
             "dof_covered": self.dof_covered,
@@ -395,6 +518,7 @@ class ProfilingResult:
                     "killed": cr.killed,
                     "survived": cr.survived,
                     "equivalent": cr.equivalent,
+                    "unscored": cr.unscored,
                     "killed_by_assertion": cr.killed_by_assertion,
                     "killed_by_crash": cr.killed_by_crash,
                     "survival_rate": round(cr.survival_rate, 3),
@@ -2184,7 +2308,7 @@ class SessionBaseline:
     which would turn a timing accident into a false completeness verdict.
     """
 
-    __slots__ = ("traced", "failing", "inert", "n_tests", "truncated")
+    __slots__ = ("traced", "failing", "inert", "n_tests", "truncated", "inert_ids")
 
     def __init__(
         self,
@@ -2193,12 +2317,20 @@ class SessionBaseline:
         inert: set[int],
         n_tests: int,
         truncated: set[str] | None = None,
+        inert_ids: set[str] | None = None,
     ) -> None:
         self.traced = traced
         self.failing = failing
         self.inert = inert
         self.n_tests = n_tests
         self.truncated = truncated or set()
+        # `inert` addressed by TEST ID rather than `id()` (issue #17). The `id()` form is a
+        # fact about THIS heap and cannot key the traced map, which is why line completeness
+        # was judged from a union that still contained baseline-failing tests: the engine knew
+        # which CALLABLES were barred from kill attribution and had no way to say which TRACE
+        # ENTRIES they owned. Both are kept — `inert` stays the attribution filter (exact, and
+        # cheap on object identity), this is the evidence filter.
+        self.inert_ids = inert_ids or set()
 
     def replaced(
         self,
@@ -2238,6 +2370,10 @@ class SessionBaseline:
             {i for i in self.inert if i not in removed_ids} | partial.inert,
             n_tests,
             {n for n in self.truncated if n not in affected} | partial.truncated,
+            # Spliced by AFFECTED like the other id-keyed sets, not by `removed_ids`: this one
+            # is addressed by test id, so a re-measured test's old verdict must drop with its
+            # old trace entry or a rewritten test keeps the previous version's outcome.
+            {n for n in self.inert_ids if n not in affected} | partial.inert_ids,
         )
 
 
@@ -2485,7 +2621,17 @@ def build_session_baseline(
         trace_cache.save(
             project_root, targets_fp, budgets, cache, failing, list(cached_inert)
         )
-    return SessionBaseline(traced, failing, inert, len(test_functions), truncated)
+    # `cached_inert` holds the TEST IDS in both branches — read from disk when the outcomes
+    # were reused, freshly collected otherwise — so it is the one place both paths agree on
+    # which tests are barred, addressed by something the traced map is also keyed by (#17).
+    return SessionBaseline(
+        traced,
+        failing,
+        inert,
+        len(test_functions),
+        truncated,
+        set(cached_inert),
+    )
 
 
 def _baseline_failures(
@@ -3361,6 +3507,42 @@ def _unwrap_descriptor(obj: Any) -> Any:
     return obj
 
 
+def _entry_probe(fn: Any) -> Any:
+    """Wrap a compiled mutant so that ENTERING it is observable (issue #18).
+
+    Installing a mutant and the test CALLING it are different events, and the engine could
+    only see the first. `_patch_mutant_into_test` returns a bool meaning "an attribute was
+    rebound somewhere", which says nothing about the call path: a decorator, `lru_cache`,
+    `functools.partial`, a closure cell, a registry list or an object field can all hold the
+    ORIGINAL while the namespace holds the mutant. The test then passes for the honest reason
+    that nothing changed, and the mutant is reported as a surviving specification gap — a
+    statement about the user's tests derived from a fact about ours.
+
+    A wrapper rather than a tracer: `line_coverage` already owns per-line tracing and is
+    documented as the dominant wall-clock cost of a run, so paying it per mutant per test is
+    not affordable. This costs one call frame and one attribute store per invocation. It is
+    also not an AST-injected marker, which would shift `mutant.mutated_line` — the key
+    `_build_test_scope` scopes on.
+
+    A real function, not a callable object: the unpatched path injects the mutant positionally
+    (`test_fn(mutated_func)`) and `_preserve_descriptor_shape` may re-wrap it in
+    `classmethod`/`staticmethod`, both of which want ordinary function shape. `__code__` is
+    deliberately NOT copied across — it would make the probe run the mutant's code without
+    passing through the recorder, which is the entire point.
+    """
+
+    def probe(*args: Any, **kwargs: Any) -> Any:
+        probe.entered = True  # type: ignore[attr-defined]
+        return fn(*args, **kwargs)
+
+    probe.entered = False  # type: ignore[attr-defined]
+    probe.__name__ = getattr(fn, "__name__", "mutant")
+    probe.__qualname__ = getattr(fn, "__qualname__", probe.__name__)
+    probe.__doc__ = getattr(fn, "__doc__", None)
+    probe.__module__ = getattr(fn, "__module__", probe.__module__)
+    return probe
+
+
 def _preserve_descriptor_shape(original: Any, mutated_obj: Any) -> Any:
     """Wrap the mutant to match the original descriptor semantics.
 
@@ -3540,21 +3722,37 @@ def evaluate_mutant(
         exec(code, namespace)  # noqa: S102  # nosec B102 — intentional: compiling AST mutants
         func_name = getattr(mutant.mutated_node, "name", None)
         mutated_obj = namespace.get(func_name) if func_name else None
+        if mutated_obj is not None:
+            # Make ENTERING the mutant observable, not just installing it (#18). Wrapped here,
+            # at the single point the object is built, so every install path downstream —
+            # `_patch_mutant_into_test`'s four strategies and `_patch_module_qualified`'s
+            # module/owner loops — carries the same recorder without knowing about it.
+            mutated_obj = _entry_probe(mutated_obj)
         # `func_name is None` is already implied (the lookup above yields None without it), but
         # saying it here is what narrows the name for the patch/restore code below — where an
         # unrestored binding would leak this mutant into the NEXT one's evaluation.
         if mutated_obj is None or func_name is None:
+            # The mutant was never BUILT — the compiled module has no such name. That is a
+            # fact about this engine, not about the user's tests, and it used to return
+            # `killed=True, killed_by="crash"`: a harness failure counted straight into the
+            # adequacy numerator, indistinguishable from a suite that caught something (#18).
+            # `constructed=False` routes it to `harness_error`, outside the denominator.
+            # The enclosing loop already takes this direction when `evaluate_mutant` itself
+            # raises ("un-evaluable survivor — conservative, never inflates the kill score");
+            # these two returns were the one place that inflated it.
             return MutantResult(
                 mutant=mutant,
-                killed=True,
-                killed_by="crash",
+                killed=False,
+                constructed=False,
                 elapsed_ms=_elapsed(start),
             )
     except Exception:
+        # Compile/exec of the mutated AST failed. Same category as above: no mutant exists,
+        # so no test can have detected one.
         return MutantResult(
             mutant=mutant,
-            killed=True,
-            killed_by="crash",
+            killed=False,
+            constructed=False,
             elapsed_ms=_elapsed(start),
         )
 
@@ -3575,6 +3773,15 @@ def evaluate_mutant(
         )
         first_killer: str | None = None
         saw_uncontained = False  # a timed-out worker that could not be stopped (#14)
+        # How many tests actually got to run against this mutant. `entered` is only
+        # INTERPRETABLE when at least one did: with an empty scoped set — which is the normal
+        # state of Detective's synthesis path, where the tests do not exist yet — the probe is
+        # never called, and reading that `False` as "installed but bypassed" routes every
+        # mutant to `not_entered`, empties the denominator, and reports a function with no
+        # tests at all as fully specified. A false COMPLETE is the one outcome this engine
+        # must never produce, so with `ran == 0` entry stays UNOBSERVED (None) and the mutant
+        # is scored a plain survivor, exactly as before #18.
+        ran = 0
         for test_fn in test_functions:
             remaining_ms = timeout_ms - _elapsed(start)
             if remaining_ms <= 0:
@@ -3587,6 +3794,7 @@ def evaluate_mutant(
                     killed=True,
                     killed_by="timeout",
                     contained=not saw_uncontained,
+                    entered=(getattr(mutated_obj, "entered", None) if ran else None),
                     elapsed_ms=_elapsed(start),
                 )
             # Strategy: monkey-patch the mutated function into the test's namespace
@@ -3598,6 +3806,7 @@ def evaluate_mutant(
             patched, saved, patch_target = _patch_mutant_into_test(
                 test_fn, patch_name, mutated_obj
             )
+            ran += 1
             try:
                 result = _run_test_with_timeout(
                     test_fn,
@@ -3671,6 +3880,9 @@ def evaluate_mutant(
                             killed_by=result,
                             test_name=tname,
                             contained=not saw_uncontained,
+                            entered=(
+                                getattr(mutated_obj, "entered", None) if ran else None
+                            ),
                             elapsed_ms=_elapsed(start),
                         )
                     elif first_reason is None:
@@ -3694,6 +3906,7 @@ def evaluate_mutant(
                 test_name=killers[0],
                 killed_by_tests=killers,
                 contained=not saw_uncontained,
+                entered=(getattr(mutated_obj, "entered", None) if ran else None),
                 elapsed_ms=_elapsed(start),
             )
         if first_reason is not None:
@@ -3704,9 +3917,17 @@ def evaluate_mutant(
                 killed_by=first_reason,
                 test_name=first_killer,
                 contained=not saw_uncontained,
+                entered=(getattr(mutated_obj, "entered", None) if ran else None),
                 elapsed_ms=_elapsed(start),
             )
-        return MutantResult(mutant=mutant, killed=False, elapsed_ms=_elapsed(start))
+        # THE survivor return, and the one #18 exists for: "no test detected this" and "no test
+        # ever called this" are the same silence here, and only `entered` tells them apart.
+        return MutantResult(
+            mutant=mutant,
+            killed=False,
+            entered=(getattr(mutated_obj, "entered", None) if ran else None),
+            elapsed_ms=_elapsed(start),
+        )
     finally:
         for _mod, _orig in module_saved:
             try:
@@ -4017,8 +4238,18 @@ def run_function_sampling(
         cr = results_by_cat.setdefault(
             mutant.category, CategoryResult(category=mutant.category)
         )
-        cr.total += 1
-        if result.killed:
+        # Same denominator rule as the other two entry points (#18): a mutant that was never
+        # built measures this engine, not the sampled suite. Sampling already reports a
+        # PARTIAL universe, which is exactly why the partiality must stay honest — a harness
+        # failure silently scored as a kill inflates the one number a sample is read for.
+        disposition = mutant_disposition(
+            result.constructed, result.installed, result.entered, True, result.killed
+        )
+        if disposition not in SCORED_DISPOSITIONS:
+            cr.unscored += 1
+            cr.unscored_by[disposition] = cr.unscored_by.get(disposition, 0) + 1
+        elif result.killed:
+            cr.total += 1
             cr.killed += 1
             if result.killed_by == "assertion":
                 cr.killed_by_assertion += 1
@@ -4029,6 +4260,7 @@ def run_function_sampling(
             elif result.killed_by == "crash":
                 cr.killed_by_crash += 1
         else:
+            cr.total += 1
             cr.survived += 1
 
     per_cat = list(results_by_cat.values())
@@ -4225,8 +4457,22 @@ def run_function_profiling(
         cr = results_by_cat.setdefault(
             mutant.category, CategoryResult(category=mutant.category)
         )
-        cr.total += 1
-        if result.killed:
+        # What is this outcome EVIDENCE OF (#18)? Only a mutant that was built, installed and
+        # entered measures the SUITE; anything earlier measures this engine, and belongs
+        # outside the denominator rather than on either side of it.
+        #
+        # `contained=True` is passed deliberately: containment already has an owner in the #14
+        # break below (`all_contained` -> non-gateable, coverage_depth "cut"), and routing it
+        # through here too would silently move mutants out of a shipped contract's denominator.
+        # #18 owns the install/entry phases; W#19 revisits containment.
+        disposition = mutant_disposition(
+            result.constructed, result.installed, result.entered, True, result.killed
+        )
+        if disposition not in SCORED_DISPOSITIONS:
+            cr.unscored += 1
+            cr.unscored_by[disposition] = cr.unscored_by.get(disposition, 0) + 1
+        elif result.killed:
+            cr.total += 1
             cr.killed += 1
             if result.killed_by == "assertion":
                 cr.killed_by_assertion += 1
@@ -4258,6 +4504,7 @@ def run_function_profiling(
                 }
             )
         else:
+            cr.total += 1
             cr.survived += 1
             survivor_records.append(
                 {
@@ -4659,15 +4906,40 @@ def run_function_converged(
             # Integrated equivalence: check survivors immediately
             if not result.killed:
                 if check_equivalent(func_node, mutant):
+                    # Carry the execution phases across (#18). Rebuilding the result from
+                    # scratch here silently restored the dataclass DEFAULTS — `constructed=True,
+                    # installed=True, entered=None` — so a mutant that was never built or never
+                    # entered came out of this branch looking like a normally-evaluated
+                    # equivalent, and its disposition was erased before the denominator ever
+                    # saw it. A partial reconstruction of a record is a data-loss bug wearing
+                    # the shape of a constructor call.
                     result = MutantResult(
                         mutant=mutant,
                         killed=False,
                         equivalent=True,
+                        constructed=result.constructed,
+                        installed=result.installed,
+                        entered=result.entered,
                         elapsed_ms=result.elapsed_ms,
                     )
 
             seen[mutant.mutant_id] = result
-            if mutant.dimension and not _is_dead(mutant.dimension):
+            # The SECOND denominator (#18). `dims_covered` is a different accounting axis from
+            # `CategoryResult.total` and lives in a different loop, so gating the aggregation
+            # left this one inflated: a dimension whose only mutant was never built or never
+            # entered was still counted as COVERED, which is the same claim-without-measurement
+            # in a quantity Detective reads directly.
+            _scored = (
+                mutant_disposition(
+                    result.constructed,
+                    result.installed,
+                    result.entered,
+                    True,
+                    result.killed,
+                )
+                in SCORED_DISPOSITIONS
+            )
+            if _scored and mutant.dimension and not _is_dead(mutant.dimension):
                 dim_key = f"{mutant.category.value}\x00{mutant.dimension}"
                 dims_covered.add(dim_key)
                 # A dimension counts as PINNED only when a test DISTINGUISHED the mutant's
@@ -4745,8 +5017,18 @@ def run_function_converged(
             all_contained = False
         cat = result.mutant.category
         cr = results_by_cat.setdefault(cat, CategoryResult(category=cat))
-        cr.total += 1
-        if result.killed:
+        # Same denominator rule as `run_function_profiling` (#18) — the two loops report the
+        # same quantity to the same consumers, so a gate applied to one and not the other is
+        # a drift the shared `CategoryResult` cannot express. See that site for why
+        # containment is passed as True here rather than routed through the disposition.
+        disposition = mutant_disposition(
+            result.constructed, result.installed, result.entered, True, result.killed
+        )
+        if disposition not in SCORED_DISPOSITIONS:
+            cr.unscored += 1
+            cr.unscored_by[disposition] = cr.unscored_by.get(disposition, 0) + 1
+        elif result.killed:
+            cr.total += 1
             cr.killed += 1
             if result.killed_by == "assertion":
                 cr.killed_by_assertion += 1
@@ -4759,9 +5041,11 @@ def run_function_converged(
             elif result.killed_by == "timeout":
                 cr.timed_out += 1
         elif result.equivalent:
+            cr.total += 1
             cr.equivalent += 1
             cr.survived += 1
         else:
+            cr.total += 1
             cr.survived += 1
 
     per_cat = list(results_by_cat.values())

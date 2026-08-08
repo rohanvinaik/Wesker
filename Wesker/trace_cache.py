@@ -109,17 +109,40 @@ def test_fingerprint(fn: Callable[..., Any]) -> str:
 
 
 def targets_fingerprint(target_files: set[str]) -> str:
-    """The target files' CONTENT. Editing one moves its lines, so every entry naming it is void."""
+    """The target files' CANONICAL PATH and CONTENT. Editing one moves its lines, so every
+    entry naming it is void; and two different files must never share a key (issue #20).
+
+    Keyed on `os.path.realpath`, not `os.path.basename`. A basename plus content digest is not
+    an identity: two checkouts of the same repo, a vendored copy, or a `src/` and `build/` pair
+    hold same-named files with byte-identical content, and every one of them collapsed onto one
+    entry — so a trace measured against one file was served for another, silently, with line
+    numbers that happen to look plausible because the content matched at the time it was cached.
+
+    `realpath` is the right canonical form rather than merely the absolute path: symlink and
+    case spellings of ONE file must still agree, which is the same identity `coverage_from_trace`
+    resolves by `st_dev`/`st_ino` when reading a persisted trace back. Distinct files separate;
+    distinct spellings of one file do not.
+
+    The unreadable branch keeps the same canonical spelling. It previously fell back to the raw
+    path while the success branch used a basename, so the FAILURE path was the more specific of
+    the two — an inconsistency that would have masked this defect for any unreadable target.
+    """
     parts: list[str] = []
     for f in sorted(target_files):
         try:
+            canonical = os.path.realpath(f)
+        except (
+            OSError
+        ):  # pragma: no cover — realpath is total on every supported platform
+            canonical = f
+        try:
             with open(f, "rb") as fh:
                 parts.append(
-                    f"{os.path.basename(f)}:{hashlib.sha256(fh.read()).hexdigest()[:16]}"
+                    f"{canonical}:{hashlib.sha256(fh.read()).hexdigest()[:16]}"
                 )
         except OSError:
             parts.append(
-                f"{f}:<unreadable>"
+                f"{canonical}:<unreadable>"
             )  # cannot vouch for it -> a key nothing will match
     return _sha("|".join(parts))
 

@@ -379,6 +379,46 @@ def test_converged_union_grows_with_passes():
     assert three > one  # more passes -> strictly more unique mutants (up to universe)
 
 
+def test_converged_stops_immediately_on_an_uncontained_worker(monkeypatch):
+    """#14 (reopened): an uncontained worker (abandon could not stop it) is STILL ALIVE. The converged
+    path used to check containment only AFTER finishing all passes, so a first-mutant runaway kept
+    spawning workers alongside it. It must halt on the first uncontained result — keeping that result,
+    but evaluating no more — and report the run non-gateable / depth="cut"."""
+    from Wesker import engine as E
+
+    func = _fn(
+        """
+        def f(a, b, c, d, e, g):
+            return a < b, a < c, a < d, a < e, b > c, d == g
+        """
+    )
+    calls = {"n": 0}
+
+    def fake_evaluate(mutant, *a, **k):
+        calls["n"] += 1
+        return E.MutantResult(
+            mutant=mutant, killed=False, contained=False, elapsed_ms=1.0
+        )
+
+    monkeypatch.setattr(E, "evaluate_mutant", fake_evaluate)
+    monkeypatch.setattr(E, "check_equivalent", lambda *a, **k: False)
+
+    res = run_function_converged(
+        func,
+        "m::f",
+        {MutationCategory.BOUNDARY},
+        test_functions=[],
+        original_func=None,
+        max_per_category=4,
+        passes=3,
+    )
+    assert (
+        calls["n"] == 1
+    )  # halted after the first uncontained result — did not keep spawning
+    assert res.coverage_depth == "cut"  # the measurement is invalidated
+    assert res.is_gateable is False  # and honestly non-gateable
+
+
 # ── Key-extraction helpers ───────────────────────────────────────
 
 

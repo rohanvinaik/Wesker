@@ -4583,6 +4583,9 @@ def run_function_converged(
     kill_matrix: dict[str, list[str]] = {}
     survivor_records: list[dict] = []
     killed_records: list[dict] = []
+    uncontained_stop = (
+        False  # #14: set when a worker could not be stopped — halt all remaining passes
+    )
 
     for pass_idx in range(passes):
         if _elapsed(start) > budget_ms:
@@ -4686,6 +4689,19 @@ def run_function_converged(
                 survivor_records.append(record)
             else:
                 survivor_records.append(record)
+
+            # #14 (reopened): an uncontained worker (abandon could not stop it) is STILL ALIVE —
+            # burning a core and able to perturb every later mutant's timing. Keep THIS mutant's
+            # result (partial evidence), but stop NOW rather than measure more against a compromised
+            # process — and, because this path loops over passes, halt the OUTER loop too. The
+            # exhaustive path already breaks here; converged must not keep spawning workers alongside
+            # a runaway. `all_contained` (below) already forces the run non-gateable / depth="cut".
+            if not result.contained:
+                uncontained_stop = True
+                break
+
+        if uncontained_stop:
+            break
 
     # Aggregate by category
     results_by_cat: dict[MutationCategory, CategoryResult] = {}

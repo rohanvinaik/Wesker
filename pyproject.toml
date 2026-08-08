@@ -52,6 +52,21 @@ dev = ["pytest>=7", "pytest-cov>=4", "ruff==0.14.10"]
 [tool.hatch.version]
 path = "Wesker/__init__.py"
 
+# The packaging boundary, made explicit. Hatchling excludes VCS-ignored files by default, so the
+# .gitignore entries are the root guard — but a PUBLISHED sdist must never carry local tool state, and
+# `.lintgate/` was riding along (737 files, some with absolute /Users/... paths) because it was the one
+# dot-tool dir not yet ignored. This second guard states the intent at the boundary itself: an artifact
+# that slips back into an un-ignored state still cannot ship. Regeneratable session state, never source.
+[tool.hatch.build]
+exclude = [
+    ".lintgate",
+    ".detective",
+    ".wesker",
+    ".serena",
+    ".prism",
+    ".claude",
+]
+
 [tool.wesker]
 source_dir = "Wesker"
 exclude = [

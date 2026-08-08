@@ -16,6 +16,9 @@ coverage.xml
 .serena/
 .claude/
 .prism/
+# LintGate's local session state — regeneratable, and some files carry absolute local paths.
+# A published sdist shipped 737 of these once; it is packaging state, never source.
+.lintgate/
 .DS_Store
 
 # Secrets. No .env exists here today — this is the GUARD, not a cleanup: an ignore rule

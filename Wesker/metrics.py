@@ -78,9 +78,9 @@ def _load_config() -> dict:
             import tomllib
         else:
             try:
-                import tomllib
+                import tomllib  # ty: ignore[unresolved-import] — 3.11+, tomli fallback below
             except ImportError:
-                import tomli as tomllib  # type: ignore[no-redef]
+                import tomli as tomllib  # type: ignore[no-redef]  # ty: ignore[unresolved-import]
 
         data = tomllib.loads(pyproject.read_text())
     except Exception:

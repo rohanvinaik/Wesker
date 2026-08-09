@@ -3642,10 +3642,10 @@ def _entry_probe(fn: Any) -> Any:
     """
 
     def probe(*args: Any, **kwargs: Any) -> Any:
-        probe.entered = True  # type: ignore[attr-defined]
+        probe.entered = True  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         return fn(*args, **kwargs)
 
-    probe.entered = False  # type: ignore[attr-defined]
+    probe.entered = False  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     probe.__name__ = getattr(fn, "__name__", "mutant")
     probe.__qualname__ = getattr(fn, "__qualname__", probe.__name__)
     probe.__doc__ = getattr(fn, "__doc__", None)

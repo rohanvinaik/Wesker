@@ -210,7 +210,9 @@ def profiler_for_targets(
     package_dir = str(Path(__file__).resolve().parent)
     if targets_own_package(targets, package_dir, project_root):
         load_private_wesker()
-        from _wesker_self.ci import (  # type: ignore[import-not-found]
+        # The dogfood harness's RENAMED package copy — unresolvable by construction, and that
+        # is the point (see project_dogfood_harness.md).
+        from _wesker_self.ci import (  # type: ignore[import-not-found]  # ty: ignore[unresolved-import]
             profile_codebase_live,
         )
 

@@ -211,7 +211,9 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
         # FunctionType's argdefs carries __defaults__ only; keyword-only defaults live
         # in __kwdefaults__ and must be copied across or every binding above is lost.
         rebound.__kwdefaults__ = dict(run.__kwdefaults__ or {})
-        run = rebound
+        # A rebound wrapper replaces the declared closure; the two are structurally the same
+        # callable, which the declared signature cannot express.
+        run = rebound  # ty: ignore[invalid-assignment]
     run.__name__ = name
     run.__qualname__ = str(getattr(item, "nodeid", name))
     if mod is not None:
@@ -227,13 +229,13 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
         # so a constant source collapses the fingerprint: editing a test would no longer
         # invalidate its cache and stale verdicts would be served as fresh ones — the
         # false-survivor bug that cache exists to prevent.
-        run.__wrapped__ = fn  # type: ignore[attr-defined]  # functools.wraps sets it; not in the stub
+        run.__wrapped__ = fn  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute] — functools.wraps sets it; not in the stub
     origin = getattr(item, "path", None) or getattr(item, "fspath", None)
     if origin is not None:
         with contextlib.suppress(Exception):
             # The origin tag makes `ci.callable_origin` total for this wrapper even
             # when the item has no `function` (no __wrapped__ to follow).
-            run.__wesker_origin__ = str(origin)  # type: ignore[attr-defined]
+            run.__wesker_origin__ = str(origin)  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     return run
 
 

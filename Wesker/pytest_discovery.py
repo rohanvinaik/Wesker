@@ -89,7 +89,7 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
             with contextlib.suppress(Exception):
                 # Dynamic metadata on a function object: valid Python, absent from
                 # FunctionType's stub, so the checker needs telling.
-                runnable.__wesker_origin__ = str(origin)  # type: ignore[attr-defined]
+                runnable.__wesker_origin__ = str(origin)  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         return runnable
 
     callables: list[Callable[..., Any]] = []
@@ -130,7 +130,9 @@ def _bind_item(item: Any, fn: Callable[..., Any]) -> Callable[..., Any] | None:
     if not sig_params:
         if not getattr(fn, "__name__", None):
             with contextlib.suppress(Exception):
-                fn.__name__ = str(getattr(item, "name", "test"))
+                # Rebinding __name__ on a live callable is how a parametrized case keeps its
+                # nodeid identity (#16); the stub types it read-only.
+                fn.__name__ = str(getattr(item, "name", "test"))  # ty: ignore[unresolved-attribute]
         return fn
 
     callspec = getattr(item, "callspec", None)
@@ -152,7 +154,7 @@ def _bind_item(item: Any, fn: Callable[..., Any]) -> Callable[..., Any] | None:
     # nodeid discriminates the cases; `__wrapped__` makes getsource() read the USER's test, so a source
     # edit still invalidates the entry (and distinct tests still differ).
     run.__qualname__ = str(getattr(item, "nodeid", run.__name__))
-    run.__wrapped__ = fn  # type: ignore[attr-defined]  # set by functools.wraps too; not in the stub
+    run.__wrapped__ = fn  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute] — functools.wraps sets it; not in the stub
     return run
 
 

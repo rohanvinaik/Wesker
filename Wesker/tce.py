@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import ast
 import dis
+import struct
 import types
 from typing import Any
 
@@ -72,10 +73,49 @@ def _op_key(ins: Any) -> tuple:
     while the loaded objects are distinguishable, and a bare equality test would call those
     mutations equivalent when they are not — the one way this could produce an unsound True.
     """
-    v = ins.argval
+    return (ins.opname, _const_key(ins.argval))
+
+
+def _const_key(v: Any) -> tuple:
+    """A constant reduced to a stable, typed, STRUCTURAL identity — never ``repr()`` (#24).
+
+    ``repr()`` was two hazards in a proof tool. It is UNSTABLE: a code object (or a container of
+    one) reprs with a memory address, so the same program keys differently run to run. And it can
+    COLLIDE: for exotic or lossy values two distinguishable constants can share a repr, which is the
+    one way this could produce an UNSOUND ``True``. Instead recurse structurally with the type in the
+    key at every level:
+
+    * a code object recurses through :func:`_code_key`;
+    * a tuple recurses element-wise; a frozenset is order-canonicalised first (it is unordered);
+    * a float / complex uses its exact IEEE-754 bit pattern, so ``0.0`` vs ``-0.0`` and distinct
+      NaNs are distinguished (``==`` calls them equal, the bytes do not);
+    * ``bool`` is keyed before ``int`` (it is a subclass) so ``0`` and ``False`` never merge, and
+      ``int`` / ``str`` / ``bytes`` / ``None`` carry their own value beside their type name, so
+      ``1`` and ``1.0`` stay distinct.
+
+    An argval that is none of these (an exotic operand of some opcode) falls back to ``(type, repr)``
+    — a last resort that cannot be less precise than the old universal repr, only more."""
     if isinstance(v, types.CodeType):
-        return (ins.opname, "<code>", _code_key(v))
-    return (ins.opname, type(v).__name__, repr(v))
+        return ("code", _code_key(v))
+    if isinstance(
+        v, bool
+    ):  # before int: bool is an int subclass, and 0/False must not merge
+        return ("bool", v)
+    if isinstance(v, int):
+        return ("int", v)
+    if isinstance(v, float):
+        return ("float", struct.pack(">d", v))
+    if isinstance(v, complex):
+        return ("complex", struct.pack(">d", v.real), struct.pack(">d", v.imag))
+    if isinstance(v, (str, bytes)):
+        return (type(v).__name__, v)
+    if v is None:
+        return ("none",)
+    if isinstance(v, tuple):
+        return ("tuple", tuple(_const_key(e) for e in v))
+    if isinstance(v, frozenset):
+        return ("frozenset", tuple(sorted((_const_key(e) for e in v), key=repr)))
+    return (type(v).__name__, repr(v))
 
 
 def _code_key(code: types.CodeType) -> tuple:
@@ -90,6 +130,13 @@ def _code_key(code: types.CodeType) -> tuple:
         code.co_kwonlyargcount,
         code.co_posonlyargcount,
         code.co_flags,
+        # Stack shape and the EXCEPTION TABLE (#24). `dis.get_instructions` surfaces the instruction
+        # stream but NOT the zero-cost exception table (3.11+), so two functions with an identical
+        # stream but different try/finally/except* regions — behaviourally different when something
+        # raises — would key identically without this. Adding it can only make the key STRICTER
+        # (fewer equivalences claimed), never less sound. `getattr` tolerates pre-3.11 interpreters.
+        code.co_stacksize,
+        getattr(code, "co_exceptiontable", b""),
         code.co_varnames,
         code.co_freevars,
         code.co_cellvars,

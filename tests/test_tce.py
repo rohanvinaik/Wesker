@@ -92,3 +92,26 @@ def test_uncompilable_input_claims_nothing():
     that crashes a run — and False claims nothing, which is the honest answer."""
     assert bytecode_equivalent("def f(): pass", "def f(: pass") is False
     assert bytecode_equivalent("def f(: pass", "def f(): pass") is False
+
+
+def test_constant_identity_is_typed_and_structural_not_repr():
+    """#24 hardening: constants key by a recursive TYPED structure, never repr(). A True must be a
+    proof, so no two distinguishable constants may collide, and the key must be stable."""
+    # 0.0 == -0.0 in Python, but the loaded constants differ — the bit pattern must separate them.
+    assert bytecode_equivalent("x = 0.0", "x = -0.0") is False
+    # a genuinely identical constant (including nested container types) stays a catch, stably.
+    assert (
+        bytecode_equivalent("x = (1.0, 'a', b'z', None)", "x = (1.0, 'a', b'z', None)")
+        is True
+    )
+    # the canonical constant-fold catch survives the finer key.
+    assert bytecode_equivalent("x = 1 + 1", "x = 2") is True
+
+
+def test_exception_regions_are_part_of_the_key():
+    """#24: `dis.get_instructions` does not surface the zero-cost exception table (3.11+), so two
+    functions with an identical stream but different try/finally/except regions — behaviourally
+    different when the body raises — must not key identically. `co_exceptiontable` closes that."""
+    fin = "def g(f):\n    try:\n        x = f()\n    finally:\n        y = 2\n    return x\n"
+    lin = "def g(f):\n    x = f()\n    y = 2\n    return x\n"
+    assert bytecode_equivalent(fin, lin) is False

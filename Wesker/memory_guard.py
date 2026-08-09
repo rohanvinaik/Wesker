@@ -28,7 +28,18 @@ import sys
 try:
     import resource  # Unix only — absent on Windows.
 except ImportError:  # pragma: no cover — exercised only on Windows
-    resource = None  # type: ignore[assignment]
+    # SUPPRESSED DELIBERATELY, and this is the one place in either repo where the suppression is
+    # the fix rather than an evasion. The design fact is real: `resource` is genuinely optional
+    # at runtime, `None` is genuinely the fallback, and every consumer here guards on
+    # `if resource is None: return` before touching it (lines 94, 163).
+    #
+    # The alternatives were measured and are worse. Annotating `ModuleType | None` makes the six
+    # `resource.getrlimit` / `RLIMIT_AS` / `RUSAGE_SELF` reads unresolvable on `ModuleType`,
+    # trading one honest diagnostic for six false ones. Branching on `sys.platform` instead of
+    # `ImportError` typechecks cleanly but changes WHAT IS BEING ASKED — "is this Windows"
+    # rather than "is this module importable" — and this is a memory SAFETY guard, so degrading
+    # on a stripped or embedded build must stay driven by the import that actually failed.
+    resource = None  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
 
 _MB = 1024 * 1024
 _GB = 1024 * _MB

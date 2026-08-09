@@ -30,6 +30,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 # Ensure scripts/ is on the path for wesker_engine/wesker_filter imports
@@ -267,6 +268,26 @@ def _mutate_line(source: str, lineno: int, op_text: str, swap_text: str) -> str 
     return result if result != source else None
 
 
+@dataclass(frozen=True)
+class _ConditionSite:
+    """One comparison-operator swap site: where it is, and what it becomes.
+
+    Was a dict literal, which inferred as ``dict[str, int | str]`` — so every field read
+    returned ``int | str`` and none of the four could be passed to a typed parameter. `ty`
+    found it where the bag met ``_mutate_line(source, lineno: int, op_text: str, ...)``: three
+    arguments in one call, each unprovable at the boundary, and the call itself correct only
+    because the two dict literals happen to agree with the signature.
+
+    Frozen because a site is a FACT ABOUT THE SOURCE — it is read to build a mutant, never
+    edited. The mutant is the new thing; the site stays what the AST said.
+    """
+
+    line: int
+    op_text: str
+    swap_text: str
+    description: str
+
+
 def _check_equivalent(mutated: str, filepath: str) -> bool:
     """Check if a surviving boundary mutant is equivalent.
 
@@ -297,7 +318,7 @@ def _verify_mcdc_single(filepath: str, func_name: str) -> dict:
     if func_node is None:
         return {"function": func_name, "status": "not_found", "covered": 0, "total": 0}
 
-    condition_sites = []
+    condition_sites: list[_ConditionSite] = []
     for child in ast.walk(func_node):
         if isinstance(child, ast.Compare):
             for op in child.ops:
@@ -307,12 +328,12 @@ def _verify_mcdc_single(filepath: str, func_name: str) -> dict:
                     swaps = _TEXT_OP_SWAPS.get(op_text, [])
                     for swap_text in swaps:
                         condition_sites.append(
-                            {
-                                "line": child.lineno,
-                                "op_text": op_text,
-                                "swap_text": swap_text,
-                                "description": f"{op_text.strip()} -> {swap_text.strip()}",
-                            }
+                            _ConditionSite(
+                                line=child.lineno,
+                                op_text=op_text,
+                                swap_text=swap_text,
+                                description=f"{op_text.strip()} -> {swap_text.strip()}",
+                            )
                         )
 
     if not condition_sites:
@@ -329,7 +350,7 @@ def _verify_mcdc_single(filepath: str, func_name: str) -> dict:
     path = Path(filepath)
 
     for site in condition_sites:
-        mutated = _mutate_line(source, site["line"], site["op_text"], site["swap_text"])
+        mutated = _mutate_line(source, site.line, site.op_text, site.swap_text)
         if mutated is None or mutated == source:
             continue
 
@@ -347,8 +368,8 @@ def _verify_mcdc_single(filepath: str, func_name: str) -> dict:
                 covered += 1
                 details.append(
                     {
-                        "line": site["line"],
-                        "swap": site["description"],
+                        "line": site.line,
+                        "swap": site.description,
                         "killed": True,
                         "equivalent": False,
                     }
@@ -359,8 +380,8 @@ def _verify_mcdc_single(filepath: str, func_name: str) -> dict:
                     covered += 1
                 details.append(
                     {
-                        "line": site["line"],
-                        "swap": site["description"],
+                        "line": site.line,
+                        "swap": site.description,
                         "killed": False,
                         "equivalent": is_equivalent,
                     }
@@ -369,8 +390,8 @@ def _verify_mcdc_single(filepath: str, func_name: str) -> dict:
             covered += 1
             details.append(
                 {
-                    "line": site["line"],
-                    "swap": site["description"],
+                    "line": site.line,
+                    "swap": site.description,
                     "killed": True,
                     "equivalent": False,
                 }

@@ -1527,7 +1527,22 @@ def _stmt_label(node: ast.stmt) -> str:
         return type(node.value).__name__
     if isinstance(node, ast.AugAssign):
         return f"aug:{_assign_target_label(node.target)}"
-    targets = node.targets if isinstance(node, ast.Assign) else [node.target]  # type: ignore[attr-defined]
+    if isinstance(node, ast.Assign):
+        targets: list[ast.AST] = list(node.targets)
+    elif isinstance(node, ast.AnnAssign):
+        targets = [node.target]
+    else:
+        # `_deletable_stmt_ids` admits EXACTLY four statement kinds, and the two branches above
+        # plus the two below `Expr`/`AugAssign` exhaust them — so this is unreachable while the
+        # analysis and this labeller agree. It was written as `else: [node.target]` under a
+        # `type: ignore[attr-defined]`, i.e. an acknowledgement that the type system could not
+        # see the invariant, resolved by silencing the question rather than answering it. Every
+        # other `ast.stmt` (`Return`, `If`, `Import`, …) has no `.target`, so the drift the class
+        # docstring says cannot happen would surface as an AttributeError naming only `.target`,
+        # 127 lines from the analysis that actually broke. Name the node instead.
+        raise TypeError(
+            f"_stmt_label: {type(node).__name__} is not a deletable statement kind"
+        )
     return "=" + ",".join(_assign_target_label(t) for t in targets)
 
 
@@ -1975,6 +1990,23 @@ def _content_mutant_id(category: MutationCategory, mutated_node: ast.AST) -> str
         :8
     ]
     return f"{category.value}_{digest}"
+
+
+def _mutant_module(mutated_node: ast.AST) -> ast.Module:
+    """Wrap a mutant's function definition in a compilable module.
+
+    ``Mutant.mutated_node`` is declared ``ast.AST`` because it is whatever the transformer
+    returned; every producer hands back the visited ``FunctionDef``, so it is a statement in
+    practice, and ``ast.Module(body=...)`` requires exactly that. Both construction sites carried
+    ``# type: ignore[list-item]`` — the SAME silenced question written twice, which is how two
+    call sites drift into two behaviours. One owner asks it once, and a violation names the node
+    it was handed instead of failing inside ``compile``.
+    """
+    if not isinstance(mutated_node, ast.stmt):
+        raise TypeError(
+            f"a mutant body must be a statement, got {type(mutated_node).__name__}"
+        )
+    return ast.Module(body=[mutated_node], type_ignores=[])
 
 
 def _generate_state_mutants(
@@ -2464,11 +2496,23 @@ class LazySessionBaseline:
         self._budgets = budgets
 
     def get(self) -> SessionBaseline:
-        """The baseline, building it on first call. Memoised — the pass runs at most once."""
+        """The baseline, building it on first call. Memoised — the pass runs at most once.
+
+        `_built` and `_value` encode ONE state in two fields, and only their agreement made the
+        return type honest — `_built is True` implies `_value is not None`, which nothing checks
+        and which a future `reset()` or a partial-refresh splice could break without touching
+        this method. The invariant is now asserted where it is relied on, so a violation names
+        the broken memo instead of returning `None` to a caller annotated `SessionBaseline`.
+        """
         if not self._built:
             self._value = self._build()
             self._built = True
-        return self._value  # type: ignore[return-value]
+        if self._value is None:
+            raise RuntimeError(
+                "LazySessionBaseline memo is inconsistent: built but empty. "
+                "The build closure must return a SessionBaseline, never None."
+            )
+        return self._value
 
     @property
     def built(self) -> bool:
@@ -3858,7 +3902,7 @@ def evaluate_mutant(
 
     # Compile mutated function
     try:
-        module_ast = ast.Module(body=[mutant.mutated_node], type_ignores=[])  # type: ignore[list-item]
+        module_ast = _mutant_module(mutant.mutated_node)
         ast.fix_missing_locations(module_ast)
         code = compile(module_ast, "<mutant>", "exec")
         # Seed the mutant's namespace with the source module's globals so it can
@@ -4891,7 +4935,7 @@ def check_equivalent(
         orig_ns: dict[str, Any] = {}
         exec(orig_code, orig_ns)  # noqa: S102
 
-        mut_mod = ast.Module(body=[mutant.mutated_node], type_ignores=[])  # type: ignore[list-item]
+        mut_mod = _mutant_module(mutant.mutated_node)
         ast.fix_missing_locations(mut_mod)
         mut_code = compile(mut_mod, "<mutant>", "exec")
         mut_ns: dict[str, Any] = {}

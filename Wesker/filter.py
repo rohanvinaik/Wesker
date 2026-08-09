@@ -64,6 +64,31 @@ def operator_disposition(generated: int, withheld: int) -> str:
     return "not_applicable"
 
 
+def _census_row(
+    generated: int, withheld: int, sub_modes: dict[str, dict] | None = None
+) -> dict[str, object]:
+    """One census entry, built in one place so both branches produce the same shape.
+
+    A row is heterogeneous BY DESIGN — int counts, a str disposition, an optional nested
+    sub-mode map — and it was built by two separate dict literals that a checker then inferred
+    separately: `dict[str, int]` in the non-STATE arm, so assigning the `str` disposition
+    afterwards fit neither. Annotating the variable does not fix that, because the annotation is
+    narrowed by whichever literal was assigned last.
+
+    The disposition is computed from the ARGUMENTS, not read back out of the row. Re-reading a
+    bag to derive a value the caller just computed is the measurement/decision gap in miniature:
+    the bag answers with whatever it happens to hold, including something a later edit put there.
+
+    Key order is preserved (``generated``, ``withheld``, ``sub_modes``, ``disposition``) because
+    this census is serialised.
+    """
+    row: dict[str, object] = {"generated": generated, "withheld": withheld}
+    if sub_modes is not None:
+        row["sub_modes"] = sub_modes
+    row["disposition"] = operator_disposition(generated, withheld)
+    return row
+
+
 def filter_categories(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     is_pure: bool = False,
@@ -141,17 +166,10 @@ def category_census(
                     # sub-mode with no sites would read as a suppression that never happened.
                     "withheld_by": "purity_overlay" if (suppressed and targets) else "",
                 }
-            row: dict = {
-                "generated": generated,
-                "withheld": withheld,
-                "sub_modes": sub_modes,
-            }
+            row = _census_row(generated, withheld, sub_modes)
         else:
-            row = {
-                "generated": estimate_universe_size(func_node, {cat}),
-                "withheld": 0,
-            }
-        row["disposition"] = operator_disposition(row["generated"], row["withheld"])
+            generated, withheld = estimate_universe_size(func_node, {cat}), 0
+            row = _census_row(generated, withheld)
         census[cat] = row
     return census
 

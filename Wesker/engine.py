@@ -11,8 +11,10 @@ from __future__ import annotations
 import ast
 import copy
 import difflib
+import functools
 import hashlib
 import math
+import threading
 import time
 import types
 from dataclasses import dataclass, field
@@ -3855,6 +3857,44 @@ def _measure_scoped_baseline(
     return _elapsed(t0), False
 
 
+# PROCESS-WIDE EXECUTION LOCK (#19). Mutant evaluation monkey-patches a module global, runs a
+# test against it, and restores it. That sequence is only correct if nothing else patches the
+# same namespace in between, and until now nothing enforced it: two concurrent profiles (MCP and
+# CLI, or two MCP requests) patched and restored across one another.
+#
+# MEASURED, two threads evaluating different mutants of one function, 5/5 runs. Thread B's mutant
+# was "replace return with None", so under its own mutant the target returns None. It observed
+# None in ZERO runs -- it saw thread A's arithmetic mutant (0.5) every time, and in 2 of 5 runs
+# the value CHANGED mid-test (0.5 then 2, A's mutant then the restored original). Every result
+# thread B recorded was a verdict about a body that was never installed for it: a survivor of a
+# mutant that never ran, or a kill earned by someone else's code.
+#
+# RLock, not Lock, and the deviation from #19's "non-reentrant" wording is deliberate. The race
+# being closed is BETWEEN THREADS, and an RLock blocks other threads exactly as a Lock does. A
+# plain Lock additionally deadlocks a thread that re-enters -- which is reachable here, because
+# Wesker profiles code, and the code under analysis can be Wesker (the dogfood path). Trading a
+# silent cross-thread corruption for a silent self-deadlock is not an improvement. Nested
+# patch/restore on ONE thread is sequential rather than torn, and is a separate concern.
+_EXECUTION_LOCK = threading.RLock()
+
+
+def _serialized(fn):
+    """Serialize a function that mutates process-global interpreter state.
+
+    Applied rather than inlined because the region to protect is the WHOLE evaluation -- compile,
+    install, run, restore -- and re-indenting 280 lines to wrap them in a `with` is a large
+    diff whose risk is entirely unrelated to the defect.
+    """
+
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        with _EXECUTION_LOCK:
+            return fn(*args, **kwargs)
+
+    return _wrapped
+
+
+@_serialized
 def evaluate_mutant(
     mutant: Mutant,
     test_functions: list[Callable[..., None]],

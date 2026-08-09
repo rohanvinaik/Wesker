@@ -203,7 +203,7 @@ def _trace_one(
     target_file: str,
     exec_lines: set[int],
     budget_s: float | None = None,
-) -> tuple[set[int], bool]:
+) -> tuple[set[int], bool, bool]:
     """Lines within ``exec_lines`` that ``test_fn()`` executes in ``target_file``, and whether the
     budget CUT this test (the trace's own report — never inferred from a clock by the caller).
 
@@ -293,7 +293,7 @@ def _trace_one_multi(
     test_fn: Callable[..., None],
     target_files: set[str],
     budget_s: float | None = None,
-) -> tuple[dict[str, set[int]], bool]:
+) -> tuple[dict[str, set[int]], bool, bool]:
     """Every line ``test_fn()`` executes in ANY of ``target_files``: ``({file: lines}, truncated)``.
 
     Identical machinery to :func:`_trace_one` — the dispatch already decides per FRAME

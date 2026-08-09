@@ -9,6 +9,7 @@ namespace. Respects per-function time budgets.
 from __future__ import annotations
 
 import ast
+import contextlib
 import copy
 import difflib
 import functools
@@ -35,7 +36,7 @@ from .memory_guard import reclaim as _reclaim
 from .memory_guard import resolve_budget as _resolve_budget
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 
 # The default per-test TRACE budget, in seconds. A backstop, NOT a target: it is generous enough
@@ -2814,25 +2815,31 @@ def _baseline_failures(
     inert: set[int] = set()
     uncontained = False
     for test_fn in test_functions:
-        patched, saved, patch_target = _patch_mutant_into_test(
-            test_fn, qualname, original_func
-        )
-        try:
-            disposition = baseline_probe_disposition(
-                _run_test_with_timeout(test_fn, probe, patched, timeout_ms)
+        # THE GUARD BELONGS HERE TOO, and this is the site the proof requirement found. This
+        # function patches the same namespaces through the same helpers as `evaluate_mutant`,
+        # but it is NOT `evaluate_mutant`, so serializing that one left this one racing — the
+        # sibling-path miss. Held across patch → run → restore, because a restore visible to
+        # another thread is exactly the mid-test body change that was measured.
+        with _execution_guard() as _proof:
+            patched, saved, patch_target = _patch_mutant_into_test(
+                _proof, test_fn, qualname, original_func
             )
-            # An uncontained probe is BOTH: inert, because a test that never finished cannot be
-            # credited with distinguishing anything; and a containment failure, because the
-            # worker is still live. Recording only the first is the bug — it is what let a
-            # live thread read as an ordinary unrunnable test.
-            if disposition == "uncontained":
-                uncontained = True
-            if disposition != "usable":
+            try:
+                disposition = baseline_probe_disposition(
+                    _run_test_with_timeout(test_fn, probe, patched, timeout_ms)
+                )
+                # An uncontained probe is BOTH: inert, because a test that never finished cannot
+                # be credited with distinguishing anything; and a containment failure, because
+                # the worker is still live. Recording only the first is the bug — it is what let
+                # a live thread read as an ordinary unrunnable test.
+                if disposition == "uncontained":
+                    uncontained = True
+                if disposition != "usable":
+                    inert.add(id(test_fn))
+            except Exception:  # noqa: BLE001 — an unrunnable baseline is itself inert
                 inert.add(id(test_fn))
-        except Exception:  # noqa: BLE001 — an unrunnable baseline is itself inert
-            inert.add(id(test_fn))
-        finally:
-            _unpatch_mutant(patched, saved, patch_target, func_name)
+            finally:
+                _unpatch_mutant(_proof, patched, saved, patch_target, func_name)
     return inert, uncontained
 
 
@@ -3373,12 +3380,16 @@ def _is_private_copy(module_name: str, private_prefix: str) -> bool:
 
 
 def _patch_module_qualified(
+    _proof: _PatchProof,
     func_name: str | None,
     mutated_obj: Any,
     source_path: str | None,
     qualname: str | None = None,
 ) -> list[tuple[Any, Any]]:
     """Patch every module-level binding of the ORIGINAL function to the mutant.
+
+    Requires `_PatchProof` (#19): this mutates process-global state, so calling it without the
+    execution lock is a type error rather than a race nobody notices. See `_PatchProof`.
 
     Real-world suites call functions through the imported module
     (``import pkg as p; p.func(...)``) rather than a bare name in the test's
@@ -3487,11 +3498,14 @@ def _co_filename_matches(co_filename: str | None, source_path: str | None) -> bo
 
 
 def _patch_mutant_into_test(
+    _proof: _PatchProof,
     test_fn: Callable[..., None],
     qualname: str | None,
     mutated_obj: Any,
 ) -> tuple[bool, Any, Any]:
     """Patch mutated function into the test's namespace.
+
+    Requires `_PatchProof` (#19) — see there.
 
     Tries __globals__ first (works for dynamically imported modules),
     then falls back to inspect.getmodule.
@@ -3735,12 +3749,18 @@ def _preserve_closure_binding_shape(original: Any, mutated_obj: Any) -> Any:
 
 
 def _unpatch_mutant(
+    _proof: _PatchProof,
     patched: bool,
     saved: Any,
     patch_target: Any,
     func_name: str | None,
 ) -> None:
-    """Restore the original function after mutation evaluation."""
+    """Restore the original function after mutation evaluation.
+
+    Requires `_PatchProof` (#19). RESTORING is as lock-sensitive as patching: an unguarded
+    restore is what let one thread hand another thread's test the ORIGINAL body mid-run
+    (measured: `('b', 0.5, 2)`).
+    """
     if not patched or saved is None or func_name is None:
         return
     if isinstance(patch_target, dict):
@@ -3878,6 +3898,58 @@ def _measure_scoped_baseline(
 _EXECUTION_LOCK = threading.RLock()
 
 
+class _PatchProof:
+    """Evidence that the execution lock is held. Required to mutate a global namespace.
+
+    THE LOCK ALONE IS A RUNTIME GUARANTEE WITH NO STATIC HALF. Serializing `evaluate_mutant`
+    closes the race that exists; it does nothing about the next patch site someone adds, which
+    is how this defect arrived in the first place. Requiring proof makes an unguarded patch a
+    TYPE ERROR — `ty` rejects the call before it can run.
+
+    Measured on a probe: passing `None`, a bare `object()`, or the guard itself where a proof is
+    required are all caught. Forging one (`_PatchProof()` written out by hand) is NOT caught, and
+    cannot be in Python. That is the honest limit — the pattern converts "did someone forget the
+    lock?" from invisible into visibly deliberate. An omission nobody can see becomes a line a
+    reviewer reads.
+
+    IT PAID FOR ITSELF IMMEDIATELY. Adding it surfaced `_baseline_failures`, which patches the
+    same namespaces through the same helpers and is NOT `evaluate_mutant`, so the serializing
+    decorator never covered it — the sibling-path miss, again.
+    """
+
+    __slots__ = ()
+
+
+@contextlib.contextmanager
+def _execution_guard() -> Iterator[_PatchProof]:
+    """Hold the process-wide execution lock and yield proof of it.
+
+    Re-entrant by construction (`_EXECUTION_LOCK` is an RLock), so a coarse holder such as
+    `evaluate_mutant` and the fine-grained patch sites inside it nest without deadlock.
+    """
+    with _EXECUTION_LOCK:
+        yield _PatchProof()
+
+
+def _held_patch_proof() -> _PatchProof:
+    """Proof for a caller that ALREADY holds the lock — e.g. anything under `@_serialized`.
+
+    VERIFIES the claim instead of trusting it. A token handed to a thread that does not hold the
+    lock would make the type signature a lie, which is worse than no signature: the reader would
+    be entitled to believe the call site was checked. `_is_owned()` is private, and it is also
+    the only way to ask the question; the alternative is a proof that means nothing.
+
+    This also narrows the forging hole the probe measured. `_PatchProof()` can still be written
+    out by hand, but every path this module offers requires actually holding the lock.
+    """
+    if not _EXECUTION_LOCK._is_owned():  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]  # noqa: SLF001
+        raise RuntimeError(
+            "patch proof requested without holding the execution lock (#19): "
+            "wrap the call in `with _execution_guard() as proof:`"
+        )
+    return _PatchProof()
+
+
 def _serialized(fn):
     """Serialize a function that mutates process-global interpreter state.
 
@@ -3996,8 +4068,12 @@ def evaluate_mutant(
     # the mutant — not only tests that call a bare imported name. Restored in the
     # finally regardless of how the loop exits. No-op when source_path is absent,
     # so existing callers/output are unchanged.
+    # `@_serialized` holds the execution lock for this whole call, so one proof covers the entire
+    # patch/run/restore phase below. The decorator owns EXCLUSION; the proof owns the type-level
+    # evidence that a patch site was reached with it held (#19).
+    _proof = _held_patch_proof()
     module_saved = _patch_module_qualified(
-        func_name, mutated_obj, source_path, qualname
+        _proof, func_name, mutated_obj, source_path, qualname
     )
     try:
         # Run tests against mutated function
@@ -4039,7 +4115,7 @@ def evaluate_mutant(
             # inspect.getmodule for inline test callables without __globals__.
             patch_name = qualname or func_name
             patched, saved, patch_target = _patch_mutant_into_test(
-                test_fn, patch_name, mutated_obj
+                _proof, test_fn, patch_name, mutated_obj
             )
             ran += 1
             try:
@@ -4125,7 +4201,7 @@ def evaluate_mutant(
                         # scanning: a later test may pin the value by assertion.
                         first_reason, first_killer = result, tname
             finally:
-                _unpatch_mutant(patched, saved, patch_target, func_name)
+                _unpatch_mutant(_proof, patched, saved, patch_target, func_name)
 
         if record_all_killers and killers:
             return MutantResult(

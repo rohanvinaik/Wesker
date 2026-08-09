@@ -111,6 +111,34 @@ def test_a_concurrent_profile_cannot_be_scored_against_another_mutants_body(targ
     )
 
 
+def test_a_patch_proof_cannot_be_obtained_without_holding_the_lock():
+    """The type signature must not be a lie.
+
+    `_PatchProof` makes an unguarded patch a TYPE error — measured on a probe: `None`, a bare
+    `object()`, and the guard itself are all rejected where a proof is required. What a type
+    cannot do is stop a token being handed to a thread that does not actually hold the lock, and
+    a proof that means nothing is worse than no proof, because a reader is then entitled to
+    believe the call site was checked. So the claim is VERIFIED, not trusted.
+    """
+    from Wesker.engine import _execution_guard, _held_patch_proof
+
+    with pytest.raises(RuntimeError, match="without holding the execution lock"):
+        _held_patch_proof()
+
+    with _execution_guard():
+        assert _held_patch_proof() is not None  # inside the guard it is genuinely held
+
+
+def test_the_guard_is_reentrant_so_nested_patch_sites_cannot_deadlock():
+    """`evaluate_mutant` holds the lock for its whole call and the patch sites inside it acquire
+    again. A non-reentrant lock — which is what #19's wording asks for — would deadlock there,
+    and a silent self-deadlock is not an improvement on a silent race."""
+    from Wesker.engine import _execution_guard
+
+    with _execution_guard() as outer, _execution_guard() as inner:
+        assert outer is not inner
+
+
 def test_the_original_is_restored_after_concurrent_evaluation(target):
     """Serialization must not leave the last mutant installed. The lock changes WHEN a patch
     happens, never WHETHER it is undone."""

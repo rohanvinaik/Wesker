@@ -453,15 +453,18 @@ def _make_owner() -> _OwnerFixture:
 
 
 def test_patch_module_qualified_patches_class_method_owner():
-    from Wesker.engine import _patch_module_qualified
+    from Wesker.engine import _execution_guard, _patch_module_qualified
 
     def mutant(self):  # the VALUE mutant: flip the return
         return False
 
     assert _make_owner().flag() is True
-    saved = _patch_module_qualified(
-        "flag", mutant, __file__, qualname="_OwnerFixture.flag"
-    )
+    # Patching global state requires proof of the execution lock (#19) — the test acquires it
+    # the same way production does, rather than being exempted from the contract it exercises.
+    with _execution_guard() as proof:
+        saved = _patch_module_qualified(
+            proof, "flag", mutant, __file__, qualname="_OwnerFixture.flag"
+        )
     try:
         assert saved, "owner class was not resolved/patched"
         assert (
@@ -475,14 +478,15 @@ def test_patch_module_qualified_patches_class_method_owner():
 
 def test_patch_module_qualified_skips_inherited_method():
     # a subclass that does NOT define the method is not patched (precision: only the defining owner)
-    from Wesker.engine import _patch_module_qualified
+    from Wesker.engine import _execution_guard, _patch_module_qualified
 
     def mutant(self):
         return False
 
-    saved = _patch_module_qualified(
-        "flag", mutant, __file__, qualname="_SubNoOverride.flag"
-    )
+    with _execution_guard() as proof:
+        saved = _patch_module_qualified(
+            proof, "flag", mutant, __file__, qualname="_SubNoOverride.flag"
+        )
     for owner, orig in saved:  # cleanup if anything was (wrongly) patched
         setattr(owner, "flag", orig)
     assert saved == []  # nothing defines _SubNoOverride.flag directly

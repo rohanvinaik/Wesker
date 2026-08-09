@@ -30,8 +30,10 @@ import contextlib
 import importlib
 import inspect
 import io
+import itertools
 import os
 import sys
+from collections.abc import Iterator
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -56,6 +58,41 @@ def last_session_manifest() -> PytestSessionManifest | None:
     say so, not quietly compute a lookalike.
     """
     return _LAST_MANIFEST.get()
+
+
+# The live measurement session currently in scope (#26). `_LAST_MANIFEST` alone is process-global
+# "the last manifest captured" — a collect-only run for project A leaks into a live run for
+# project B, and B's certificate gets authorized by A's collection (reproduced: A's rootpath,
+# standing `confirmed`, consumed inside B's session). A manifest is proof-facing only when it was
+# captured by the EXACT session now consuming it; a monotonic per-session id stamped at capture
+# and checked at consume is what makes "same session" decidable when paths, modules, and config
+# coincide. Ids start at 1 so 0 can mean "no scope / unstamped" without a second sentinel.
+_SCOPE_COUNTER = itertools.count(1)
+_MEASUREMENT_SCOPE: ContextVar[int | None] = ContextVar(
+    "wesker_measurement_scope", default=None
+)
+
+
+def current_measurement_scope() -> int | None:
+    """The id of the live measurement session in scope, or None outside one (#26)."""
+    return _MEASUREMENT_SCOPE.get()
+
+
+@contextlib.contextmanager
+def live_measurement_scope() -> Iterator[int]:
+    """Mint a fresh measurement-scope id for the duration of one live pytest session (#26).
+
+    A manifest captured inside this scope is stamped with the id; a consumer inside the same
+    scope admits only a manifest carrying it. Sequential and nested sessions get distinct ids
+    and cannot read each other's manifest even when their rootpath, module names, or config
+    shape are identical. Token-reset in ``finally`` restores the enclosing scope (None at the
+    top level), so an exception mid-session cannot leave a stale id bound.
+    """
+    token = _MEASUREMENT_SCOPE.set(next(_SCOPE_COUNTER))
+    try:
+        yield _MEASUREMENT_SCOPE.get() or 0
+    finally:
+        _MEASUREMENT_SCOPE.reset(token)
 
 
 def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:

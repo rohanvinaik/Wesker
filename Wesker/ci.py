@@ -1275,6 +1275,11 @@ def run_with_live_suite(
 
     def _body(callables: list[Any], _session: Any) -> Any:
         suite_token = _LIVE_SUITE.set(callables)
+        # Bind the project root to THIS session and token-reset it on exit (#26). `_PROJECT_ROOT`
+        # was set inside `build_session_baseline` but never reset at the end of the owning session,
+        # so a later run in the same process relativized legacy TestIds against a stale project.
+        # Bound here, at the session boundary, it is restored to the enclosing value in `finally`.
+        root_token = _PROJECT_ROOT.set(os.path.abspath(project_root))
 
         def _build(subset: list[Any] | None = None) -> Any:
             # The guard lives INSIDE the closure because the closure decides when it runs. The
@@ -1325,6 +1330,7 @@ def run_with_live_suite(
         finally:
             if base_token is not None:
                 _SESSION_BASELINE.reset(base_token)
+            _PROJECT_ROOT.reset(root_token)
             _LIVE_SUITE.reset(suite_token)
 
     result = run_in_session(project_root, _body, paths=paths, diagnostic=diagnostic)

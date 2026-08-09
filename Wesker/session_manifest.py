@@ -114,6 +114,37 @@ def collection_identity_standing(
     return "confirmed"
 
 
+def manifest_admissibility(manifest_scope: int, current_scope: int) -> str:
+    """Whether a captured manifest may serve as THIS run's proof basis (#26, pure — pinned).
+
+    Split from the consumer so the whole decision sits inside a literal grammar and can be
+    pinned: the consumer holds live ContextVar objects and a frozen dataclass, neither of which
+    input synthesis can construct, while this takes two ints and returns a named code.
+
+    Scopes are positive session ids; ``0`` means absent — no live session in scope, or a
+    manifest that predates #26 / came from a collect-only discovery. Admissible only when both
+    are present and identical, i.e. the manifest was minted by the exact session now consuming
+    it. Every other case is ``refuse``, and the three ways it can arise are kept distinct in the
+    reasoning even though they share a verdict:
+
+    * ``current_scope <= 0`` — nothing is measuring; a manifest lingering in the ContextVar is
+      not evidence for a run that is not happening.
+    * ``manifest_scope <= 0`` — the manifest was never stamped by a live session (collect-only,
+      or pre-#26); it describes a collection, not this measurement.
+    * ``manifest_scope != current_scope`` — a DIFFERENT session captured it. This is the leak:
+      two projects can share rootpath, module names, and config shape, so only the id separates
+      "our collection" from "the last collection", and matching fields after the fact is exactly
+      the substitution the manifest exists to end.
+    """
+    if current_scope <= 0:
+        return "refuse"
+    if manifest_scope <= 0:
+        return "refuse"
+    if manifest_scope != current_scope:
+        return "refuse"
+    return "admit"
+
+
 @dataclass(frozen=True)
 class PytestSessionManifest:
     """The collection regime and its selected items, as the runner reports them."""
@@ -130,6 +161,11 @@ class PytestSessionManifest:
     # Dotted name -> every distinct file seen under it. A well-formed session yields exactly
     # one file per name; more is the shadow/alias conflict a certificate must refuse over.
     module_origins: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # The live measurement session that captured this manifest (#26). 0 means "no session" — a
+    # collect-only discovery, or a pre-#26 manifest. A proof-facing consumer admits this manifest
+    # only when its scope matches the session now consuming it, so a prior project's collection
+    # left in the ContextVar cannot be read as this run's proof basis.
+    scope: int = 0
 
     @property
     def conflicting_modules(self) -> tuple[str, ...]:
@@ -244,6 +280,13 @@ def capture_manifest(
         for a in getattr(getattr(config, "invocation_params", None), "args", ()) or ()
     )
 
+    # Stamp the live session that captured this (#26). Read here, at capture, so the id belongs
+    # to whatever session is actually collecting — a live measurement stamps its own scope, a
+    # collect-only discovery stamps 0 (no scope), and neither can later be mistaken for the
+    # other. Local import: `pytest_discovery` runtime-imports this module, so a module-level
+    # back-edge would be a cycle.
+    from .pytest_discovery import current_measurement_scope
+
     return PytestSessionManifest(
         pytest_version=pytest_version,
         python_version=sys.version.split()[0],
@@ -255,4 +298,5 @@ def capture_manifest(
         collection_errors=errors,
         items=tuple(collected),
         module_origins={k: tuple(v) for k, v in origins.items()},
+        scope=current_measurement_scope() or 0,
     )

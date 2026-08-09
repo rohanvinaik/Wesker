@@ -319,6 +319,17 @@ def run_in_session(
             diagnostic["reason"] = "pytest_missing"
         return None
 
+    # The live session captures its OWN manifest, stamped with this session's scope (#26). The
+    # collect-only discovery sets a process-global "last manifest"; consuming that on the live
+    # path let a prior project's collection authorize this measurement. `_LAST_MANIFEST` is
+    # token-set inside the collection hook and reset in `finally`, so it is bound only for the
+    # window `body` runs in and restores the enclosing value on the way out.
+    from Wesker.pytest_discovery import (
+        _LAST_MANIFEST,
+        _MEASUREMENT_SCOPE,
+        _SCOPE_COUNTER,
+    )
+
     box: dict[str, Any] = {}
     capture = _ExcCapture()
     collect_errors = _CollectionErrorCapture()
@@ -327,6 +338,21 @@ def run_in_session(
     real_stdout, real_stderr = sys.stdout, sys.stderr
 
     class _Driver:
+        def pytest_collection_modifyitems(self, session, config, items) -> None:  # type: ignore[no-untyped-def]
+            # Capture THIS live session's regime from the live Config/Session, stamped with the
+            # active scope (#26). Same hook the collect-only backend uses, but bound to the
+            # session that will actually measure, so `_live_collection_identity` reads the
+            # runner's own answer instead of whatever was collected last. Never allowed to fail
+            # the collection: the measurement is the product, its description is not.
+            try:
+                from Wesker.session_manifest import capture_manifest
+
+                box["manifest_token"] = _LAST_MANIFEST.set(
+                    capture_manifest(session, config, items)
+                )
+            except Exception:  # noqa: BLE001 — a manifest that raises breaks a working run
+                pass
+
         def pytest_runtestloop(self, session):  # type: ignore[no-untyped-def]
             if (
                 session.testsfailed
@@ -406,6 +432,10 @@ def run_in_session(
     stdout_buf = io.StringIO()
     stderr_buf = io.StringIO()
     rc = 0
+    # Mint this session's scope BEFORE collection, so the manifest hook above stamps it and the
+    # consumer inside `body` admits only this session's manifest (#26). Reset in `finally` — with
+    # the manifest token — restores the enclosing scope even if collection or the body raises.
+    scope_token = _MEASUREMENT_SCOPE.set(next(_SCOPE_COUNTER))
     try:
         os.chdir(project_root)
         if project_root not in sys.path:
@@ -425,6 +455,14 @@ def run_in_session(
             diagnostic["reason"] = "pytest_crashed"
         return None
     finally:
+        # Restore the live-manifest and scope this session bound, innermost first, so a nested
+        # or sequential session sees the enclosing context exactly as it was (#26).
+        manifest_token = box.get("manifest_token")
+        if manifest_token is not None:
+            with contextlib.suppress(Exception):
+                _LAST_MANIFEST.reset(manifest_token)
+        with contextlib.suppress(Exception):
+            _MEASUREMENT_SCOPE.reset(scope_token)
         sys.path[:] = prev_path
         with contextlib.suppress(Exception):
             os.chdir(cwd)

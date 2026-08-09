@@ -3812,16 +3812,26 @@ def _live_collection_identity() -> tuple[str, tuple[str, ...]]:
     ``unobserved``, which changes no verdict.
     """
     try:
-        from .pytest_discovery import last_session_manifest
-        from .session_manifest import collection_identity_standing
+        from .pytest_discovery import current_measurement_scope, last_session_manifest
+        from .session_manifest import (
+            collection_identity_standing,
+            manifest_admissibility,
+        )
 
         manifest = last_session_manifest()
+        scope = current_measurement_scope() or 0
     except Exception:  # noqa: BLE001 — describing the run must not fail the run
         return "unobserved", ()
-    conflicts = (
-        tuple(getattr(manifest, "conflicting_modules", ()) or ()) if manifest else ()
-    )
-    return collection_identity_standing(manifest is not None, conflicts), conflicts
+    # Admit the manifest only if THIS live session captured it (#26). A prior project's collection
+    # left in the ContextVar, or a collect-only manifest never stamped by a live session, is
+    # inadmissible — and inadmissible reads as `unobserved`, exactly as a missing manifest does,
+    # so the pre-flight prediction stands alone and no measurement is authorized on another
+    # session's collection.
+    manifest_scope = getattr(manifest, "scope", 0) if manifest is not None else 0
+    if manifest is None or manifest_admissibility(manifest_scope, scope) != "admit":
+        return "unobserved", ()
+    conflicts = tuple(getattr(manifest, "conflicting_modules", ()) or ())
+    return collection_identity_standing(True, conflicts), conflicts
 
 
 def _measurement_gateable(

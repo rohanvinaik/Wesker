@@ -108,10 +108,154 @@ def process_rss_bytes() -> int:
     return peak if sys.platform == "darwin" else peak * 1024
 
 
-def over_budget(budget_bytes: int | None = None) -> bool:
-    """True when this process has crossed the memory budget and must stop growing."""
+def current_rss_bytes() -> int:
+    """This process's INSTANTANEOUS resident set size, or 0 when unobtainable.
+
+    `ru_maxrss` is a lifetime peak and never falls, so it cannot answer "how much is resident
+    NOW". `resource` offers no current figure, and this module is stdlib-only by contract (no
+    psutil), so the platform routes are `/proc/self/statm` on Linux and `mach_task_basic_info`
+    via ctypes on macOS.
+
+    MEASURED, and the measurement corrects W#21's premise. The issue predicts that after a
+    release the current figure drops while the peak stays high (`current ~20 MB, guard ~116 MB`).
+    On macOS/CPython 3.14 it does NOT:
+
+        start                    resident   13.3 MB    resident_max   13.3 MB
+        holding 200MB            resident  213.3 MB    resident_max  213.3 MB
+        released + gc.collect    resident  213.3 MB    resident_max  213.3 MB
+
+    The allocator keeps the pages, so current and peak are equally "poisoned" and swapping one
+    for the other would have fixed nothing. What made the number usable was measuring GROWTH
+    within a run (see `run_growth_bytes`): cycles 2 and 3 of the same probe reallocated 200MB and
+    resident stayed flat at 213.3, because the retained pages were reused — a later run that
+    demands nothing new from the OS correctly shows zero growth.
+    """
+    if sys.platform == "darwin":
+        return _darwin_resident_bytes()
+    try:
+        with open("/proc/self/statm") as fh:
+            return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def _darwin_resident_bytes() -> int:
+    """`mach_task_basic_info().resident_size` — the only stdlib route to current RSS on macOS."""
+    try:
+        import ctypes
+
+        class _Info(ctypes.Structure):
+            _fields_ = [
+                ("virtual_size", ctypes.c_uint64),
+                ("resident_size", ctypes.c_uint64),
+                ("resident_size_max", ctypes.c_uint64),
+                ("user_time_s", ctypes.c_int32),
+                ("user_time_us", ctypes.c_int32),
+                ("system_time_s", ctypes.c_int32),
+                ("system_time_us", ctypes.c_int32),
+                ("policy", ctypes.c_int32),
+                ("suspend_count", ctypes.c_int32),
+            ]
+
+        libc = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
+        libc.task_info.restype = ctypes.c_int
+        task = ctypes.c_uint.in_dll(libc, "mach_task_self_").value
+        info = _Info()
+        count = ctypes.c_uint(ctypes.sizeof(_Info) // ctypes.sizeof(ctypes.c_uint))
+        # 20 == MACH_TASK_BASIC_INFO
+        if libc.task_info(task, 20, ctypes.byref(info), ctypes.byref(count)) != 0:
+            return 0
+        return int(info.resident_size)
+    except Exception:  # noqa: BLE001 — an unavailable probe is not an error, it is degraded mode
+        return 0
+
+
+def rss_capability() -> str:
+    """What this platform can actually MEASURE — named, because a guarantee must not be claimed
+    on a platform that only observes (W#21).
+
+    ``current``     — instantaneous RSS is readable, so per-run growth is enforceable.
+    ``peak_only``   — only ``ru_maxrss``. Growth within a run is not separable from history.
+    ``unavailable`` — neither. The static worker-count admission carries the guarantee instead,
+                      and no memory figure may be presented as a bound.
+    """
+    if current_rss_bytes() > 0:
+        return "current"
+    if process_rss_bytes() > 0:
+        return "peak_only"
+    return "unavailable"
+
+
+def memory_budget_standing(
+    growth_bytes: int, budget_bytes: int, capability: str
+) -> str:
+    """Whether THIS RUN has exhausted its memory budget (W#21, pure — pinned).
+
+    Judged on GROWTH SINCE THE RUN BEGAN, never on an absolute process figure. The defect W#21
+    names is that one historical spike makes every later low-budget run in a long-lived MCP
+    process read as permanently over budget: `ru_maxrss` never falls, so the guard answers a
+    question about the process's whole history when it was asked about this run.
+
+    Growth is the honest quantity for a further reason the probe measured: after a release macOS
+    keeps the pages, so a later run that reallocates the same amount grows by ZERO. It demanded
+    nothing new from the OS, and a budget is about demand.
+
+    Three states, and the third is why this is not a bool:
+
+    ``within``        — growth is inside the budget.
+    ``exhausted``     — growth crossed it. A graceful cut, owned by us.
+    ``unmeasurable``  — the platform reports no RSS at all, so there is nothing to compare. It
+      must NOT read as ``within``: "we looked and it is fine" and "we cannot look" are different
+      facts, and collapsing them is how an absent guard comes to read as a passed one. The
+      caller keeps running (refusing every run on Windows would be absurd) but may not describe
+      the result as memory-bounded.
+    """
+    if capability == "unavailable":
+        return "unmeasurable"
+    if budget_bytes <= 0:
+        return "within"
+    return "exhausted" if growth_bytes > budget_bytes else "within"
+
+
+def run_baseline_bytes() -> int:
+    """The RSS a run starts from. Capture once, before the work, and pass it to `over_budget`.
+
+    Without it the guard compares an ABSOLUTE process figure against a per-run budget, which is
+    W#21's defect: in a long-lived MCP process, one earlier spike leaves `ru_maxrss` permanently
+    high and every later low-budget run reads as exhausted before it allocates anything.
+    """
+    return current_rss_bytes() or process_rss_bytes()
+
+
+def run_growth_bytes(baseline_bytes: int) -> int:
+    """RSS growth since a run's baseline, floored at zero.
+
+    Floored because a shrink is not negative demand — it is the allocator returning pages, which
+    a budget has no opinion about.
+    """
+    now = current_rss_bytes() or process_rss_bytes()
+    return max(0, now - baseline_bytes)
+
+
+def over_budget(
+    budget_bytes: int | None = None, baseline_bytes: int | None = None
+) -> bool:
+    """True when THIS RUN has crossed its memory budget and must stop growing.
+
+    `baseline_bytes` is what makes the answer about this run rather than about the process's
+    whole history — see `run_baseline_bytes`. Passing None keeps the historical absolute
+    comparison, which is retained ONLY so an external caller that never established a run is
+    not silently changed; every caller inside Wesker now supplies one.
+    """
     budget = budget_bytes if budget_bytes is not None else resolve_budget()
-    return process_rss_bytes() > budget
+    if baseline_bytes is None:
+        return process_rss_bytes() > budget
+    return (
+        memory_budget_standing(
+            run_growth_bytes(baseline_bytes), budget, rss_capability()
+        )
+        == "exhausted"
+    )
 
 
 def reclaim() -> None:

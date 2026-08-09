@@ -33,6 +33,7 @@ from .line_coverage import trace_suite as _trace_suite
 from .tce import WARRANT_BYTECODE, nodes_equivalent
 from .memory_guard import over_budget as _over_budget
 from .memory_guard import reclaim as _reclaim
+from .memory_guard import run_baseline_bytes as _mem_baseline
 from .memory_guard import resolve_budget as _resolve_budget
 
 if TYPE_CHECKING:
@@ -4720,6 +4721,11 @@ def run_function_profiling(
     budget_exhausted = False
     all_contained = True  # #14: cleared if any timed-out worker could not be stopped
     mem_budget = _resolve_budget(mem_budget_mb)
+    # THE BASELINE IS WHAT MAKES THE BUDGET ABOUT THIS RUN (W#21). Captured before the loop:
+    # `ru_maxrss` is a process LIFETIME peak and never falls, so an absolute comparison meant one
+    # earlier spike left every later low-budget run in a long-lived MCP process reading as
+    # exhausted before it allocated anything.
+    mem_baseline = _mem_baseline()
     total_m = len(mutants)
     for count, mutant in enumerate(mutants):
         if progress is not None:
@@ -4730,7 +4736,7 @@ def run_function_profiling(
         # Memory guard: if this run has crossed the (capacity-derived, user-
         # selectable) RAM budget, stop accumulating and reclaim rather than climb
         # past the ceiling — the guarantee that a profile cannot take over the box.
-        if count % 16 == 0 and _over_budget(mem_budget):
+        if count % 16 == 0 and _over_budget(mem_budget, mem_baseline):
             budget_exhausted = True
             _reclaim()
             break

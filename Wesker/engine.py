@@ -374,6 +374,10 @@ class ProfilingResult:
     survival_rate: float = 0.0
     coverage_depth: str = "profiled"
     is_gateable: bool = True
+    # Module names the LIVE collection resolved to more than one file (#58). Non-empty means
+    # the measurement may be perfectly counted and still be about the wrong copy of the code,
+    # so `is_gateable` is False and the reason is nameable rather than a bare refusal.
+    collection_conflicts: tuple[str, ...] = ()
     per_category: list[CategoryResult] = field(default_factory=list)
     kill_matrix: dict[str, list[str]] = field(default_factory=dict)
     # The PROOF view of `line_coverage` (issue #17): the same map with the entries whose owner
@@ -3733,17 +3737,46 @@ def _adaptive_allowance(
     return min(base, cap_ms, remaining_ms)
 
 
+def _live_collection_identity() -> tuple[str, tuple[str, ...]]:
+    """The live session's module-identity standing and the conflicting names (#58).
+
+    Defensive throughout: this describes a measurement and must never break one. No manifest —
+    an older Wesker, a direct-call path that never collected, an import that failed — yields
+    ``unobserved``, which changes no verdict.
+    """
+    try:
+        from .pytest_discovery import last_session_manifest
+        from .session_manifest import collection_identity_standing
+
+        manifest = last_session_manifest()
+    except Exception:  # noqa: BLE001 — describing the run must not fail the run
+        return "unobserved", ()
+    conflicts = (
+        tuple(getattr(manifest, "conflicting_modules", ()) or ()) if manifest else ()
+    )
+    return collection_identity_standing(manifest is not None, conflicts), conflicts
+
+
 def _measurement_gateable(
-    base_gateable: bool, all_contained: bool, budget_ok: bool
+    base_gateable: bool,
+    all_contained: bool,
+    budget_ok: bool,
+    identity_unambiguous: bool = True,
 ) -> bool:
     """Whether a profiling result may gate a downstream verdict (COMPLETE, auto-apply, CI).
 
     A gateable result must be COMPLETE and VALID. ``base_gateable`` is the coverage-depth basis —
     an exhaustive/profiled run, not a sampled one. ``all_contained`` is False when any timed-out
     worker could not be stopped (#14). ``budget_ok`` is False when the aggregate or memory budget
-    was cut (#13). Any one False makes the counts a floor, not a verdict.
+    was cut (#13). ``identity_unambiguous`` is False when the live collection resolved a dotted
+    module name to more than one file (#58) — the counts may be perfectly measured and still be
+    about the wrong copy of the code, which no other conjunct here can see. Any one False makes
+    the counts a floor, not a verdict.
+
+    Defaults True so a caller that has not OBSERVED identity keeps its previous meaning; an
+    unasked question must not become a refusal.
     """
-    return base_gateable and all_contained and budget_ok
+    return base_gateable and all_contained and budget_ok and identity_unambiguous
 
 
 def _measure_scoped_baseline(
@@ -4695,6 +4728,9 @@ def run_function_profiling(
     # line used to read directly, the per-function inert probe, and #13's sizing pass — because
     # reading ONE of them is how the other two stayed invisible.
     _contained = all_contained and not _baseline_uncontained
+    # Read ONCE per result, next to the gate that consumes it (#58): the live collection's
+    # own answer about module identity, not a reconstruction of it.
+    _identity_standing, _identity_conflicts = _live_collection_identity()
 
     return ProfilingResult(
         function_key=func_key,
@@ -4708,7 +4744,10 @@ def run_function_profiling(
         survivor_records=survivor_records,
         killed_records=killed_records,
         budget_exhausted=budget_exhausted,
-        is_gateable=_measurement_gateable(True, _contained, not budget_exhausted),
+        is_gateable=_measurement_gateable(
+            True, _contained, not budget_exhausted, _identity_standing != "ambiguous"
+        ),
+        collection_conflicts=_identity_conflicts,
         # A cut is any invalid measurement — budget overrun OR an uncontained worker (#13/#14),
         # from the mutation loop OR the baseline trace (#19): the depth must not read "profiled"
         # when the run stopped short or ran against a live abandoned worker. is_gateable already
@@ -5257,6 +5296,10 @@ def run_function_converged(
     else:
         depth = "sampled"
 
+    # Read ONCE per result, next to the gate that consumes it (#58): the live collection's
+    # own answer about module identity, not a reconstruction of it.
+    _identity_standing, _identity_conflicts = _live_collection_identity()
+
     return ProfilingResult(
         function_key=func_key,
         categories_tested=len(per_cat),
@@ -5271,8 +5314,12 @@ def run_function_converged(
         dof_pinned=len(dims_pinned),
         coverage_depth=depth,
         is_gateable=_measurement_gateable(
-            depth == "profiled", all_contained, not budget_exhausted
+            depth == "profiled",
+            all_contained,
+            not budget_exhausted,
+            _identity_standing != "ambiguous",
         ),
+        collection_conflicts=_identity_conflicts,
         per_category=per_cat,
         kill_matrix=kill_matrix,
         survivor_records=survivor_records,

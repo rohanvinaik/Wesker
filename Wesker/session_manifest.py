@@ -81,6 +81,39 @@ def conflicting_module_names(
     )
 
 
+def collection_identity_standing(
+    observed: bool, conflicting_modules: tuple[str, ...]
+) -> str:
+    """What the LIVE collection established about module identity (#58, pure — pinned).
+
+    The manifest exists so a certificate can name the regime it was measured under instead of
+    PREDICTING it. Until now nothing read it: `last_session_manifest()` had zero consumers in
+    either repo — not even a test — so the capture ran every session and informed no decision.
+    This is the seam that makes it load-bearing.
+
+    Three states, because "we did not look" and "we looked and it was clean" are different facts,
+    and collapsing them is how an absent check comes to read as a passed one:
+
+    ``unobserved`` — no manifest for this run. The pre-flight prediction (``shadowed_target``)
+    stands alone, exactly as before; a missing observation must never manufacture a refusal.
+    ``ambiguous`` — a dotted name resolved to MORE THAN ONE FILE in the very run that measured.
+    A measurement attributed to the wrong copy of a function is a measurement of something else,
+    so nothing computed over this collection can be gated on.
+    ``confirmed`` — the runner itself reports every name identifying exactly one file. Positive
+    evidence, and strictly stronger than the prediction, because it is what pytest DID rather
+    than what we reconstructed it would do.
+
+    Broader than ``shadowed_target``, which resolves ONE target's own module name in a subprocess.
+    This sees every module the session imported, so it also catches a shadowed DEPENDENCY — the
+    case where the target itself resolves fine and the code beneath it does not.
+    """
+    if not observed:
+        return "unobserved"
+    if conflicting_modules:
+        return "ambiguous"
+    return "confirmed"
+
+
 @dataclass(frozen=True)
 class PytestSessionManifest:
     """The collection regime and its selected items, as the runner reports them."""

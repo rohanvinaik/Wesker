@@ -20,6 +20,7 @@ from Wesker.session_manifest import (
     PytestSessionManifest,
     _digest,
     capture_manifest,
+    collection_identity_standing,
     conflicting_module_names,
 )
 
@@ -164,3 +165,46 @@ def test_an_item_without_a_path_is_recorded_without_inventing_one():
     assert manifest.items == (
         CollectedItem(node_id="tests/t.py::x", origin="", origin_digest="", module=""),
     )
+
+
+# --------------------------------------------------------------------------------------
+# The manifest finally decides something (Detective #58)
+# --------------------------------------------------------------------------------------
+
+
+def test_not_looking_and_looking_clean_are_different_answers():
+    """THE reason this is three states and not a bool.
+
+    `last_session_manifest()` had ZERO consumers in either repo — the capture ran every session
+    and informed no decision. Wiring it to a gate makes the distinction load-bearing: a run with
+    no manifest must keep its previous meaning, while a run whose collection CONFIRMED one file
+    per name carries positive evidence the pre-flight prediction cannot give.
+    """
+    assert collection_identity_standing(False, ()) == "unobserved"
+    assert collection_identity_standing(True, ()) == "confirmed"
+    assert collection_identity_standing(False, ()) != collection_identity_standing(
+        True, ()
+    )
+
+
+def test_a_name_resolving_to_two_files_is_ambiguous():
+    assert collection_identity_standing(True, ("pkg.mod",)) == "ambiguous"
+
+
+def test_conflicts_without_an_observation_cannot_refuse():
+    """Defensive: conflicts can only come FROM a manifest, so this pairing should not arise —
+    and if it ever does, "we did not look" is the honest answer rather than a refusal built on
+    a value with no provenance."""
+    assert collection_identity_standing(False, ("pkg.mod",)) == "unobserved"
+
+
+def test_the_gate_consumes_it():
+    """The wiring, not just the decision. `_measurement_gateable` is the single owner both
+    ProfilingResult sites route through, so one conjunct covers the exhaustive and converged
+    paths alike."""
+    from Wesker.engine import _measurement_gateable
+
+    assert _measurement_gateable(True, True, True, True) is True
+    assert _measurement_gateable(True, True, True, False) is False
+    # An unasked question must not become a refusal.
+    assert _measurement_gateable(True, True, True) is True

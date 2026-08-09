@@ -233,17 +233,24 @@ def capture_manifest(
     errors: tuple[str, ...] = ()
     _ = session  # accepted for the hook's signature; nothing here is derivable from it yet
 
+    # Bind ONCE, then read. This used to dereference one `getattr(config, "invocation_params")`
+    # call while guarding a SECOND, separate call — so the value checked was never the value
+    # used. On a plain attribute the two agree; on a property, a mock, or a plugin-wrapped
+    # config they need not, and this module's whole contract is that describing a collection
+    # must never break one. `.args` is read defensively for the same reason: an object that
+    # exists WITHOUT that attribute would raise from inside a hook that promises not to.
+    _invocation_args = tuple(
+        str(a)
+        for a in getattr(getattr(config, "invocation_params", None), "args", ()) or ()
+    )
+
     return PytestSessionManifest(
         pytest_version=pytest_version,
         python_version=sys.version.split()[0],
         rootpath=str(getattr(config, "rootpath", "") or ""),
         inipath=str(getattr(config, "inipath", "") or ""),
         import_mode=_opt("importmode"),
-        invocation_args=tuple(
-            str(a) for a in getattr(config, "invocation_params", None).args
-        )
-        if getattr(config, "invocation_params", None) is not None
-        else (),
+        invocation_args=_invocation_args,
         plugins=plugins,
         collection_errors=errors,
         items=tuple(collected),

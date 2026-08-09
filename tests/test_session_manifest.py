@@ -208,3 +208,34 @@ def test_the_gate_consumes_it():
     assert _measurement_gateable(True, True, True, False) is False
     # An unasked question must not become a refusal.
     assert _measurement_gateable(True, True, True) is True
+
+
+def test_a_config_whose_invocation_params_lack_args_does_not_break_collection():
+    """The module's contract: describing a measurement must never fail one.
+
+    The read used to dereference one `getattr(config, "invocation_params")` call while
+    guarding a SECOND, separate call — so the value checked was never the value used, and an
+    object present but without `.args` raised from inside a collection hook.
+    """
+
+    class _Odd:
+        invocation_params = object()  # exists, has no `.args`
+        rootpath = "/proj"
+        inipath = ""
+        pluginmanager = _PluginManager([])
+
+        def getoption(self, _name):
+            return "prepend"
+
+    assert capture_manifest(None, _Odd(), []).invocation_args == ()
+
+
+def test_invocation_args_are_recorded_when_present():
+    class _Params:
+        args = ("-q", "tests")
+
+    class _Cfg(_Config):
+        invocation_params = _Params()
+
+    manifest = capture_manifest(None, _Cfg(_PluginManager([])), [])
+    assert manifest.invocation_args == ("-q", "tests")

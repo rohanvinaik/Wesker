@@ -398,18 +398,28 @@ def run_in_session(
     args += paths or ["."]
     cwd = os.getcwd()
     prev_path = list(sys.path)
+    # Retain pytest's exit code and captured output (#66). A conftest / config that fails to LOAD —
+    # e.g. `import keras` in conftest.py with keras uninstalled — dies before the collection hook that
+    # populates `collect_errors` can fire, so `collect_errors.errors` is empty; but pytest exits with
+    # a collection/config code (2/3/4) and prints the ImportError to stderr. Discarding both left the
+    # run indistinguishable from a genuinely empty suite.
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    rc = 0
     try:
         os.chdir(project_root)
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
         if quiet:
             with (
-                contextlib.redirect_stdout(io.StringIO()),
-                contextlib.redirect_stderr(io.StringIO()),
+                contextlib.redirect_stdout(stdout_buf),
+                contextlib.redirect_stderr(stderr_buf),
             ):
-                pytest.main(args, plugins=[_Driver(), capture, collect_errors])
+                rc = int(
+                    pytest.main(args, plugins=[_Driver(), capture, collect_errors])
+                )
         else:
-            pytest.main(args, plugins=[_Driver(), capture, collect_errors])
+            rc = int(pytest.main(args, plugins=[_Driver(), capture, collect_errors]))
     except Exception:
         if diagnostic is not None:
             diagnostic["reason"] = "pytest_crashed"
@@ -438,9 +448,29 @@ def run_in_session(
         diagnostic["errors"] = collect_errors.errors
     if not box.get("ran"):
         if diagnostic is not None:
-            diagnostic["reason"] = (
-                "collection_errors" if collect_errors.errors else "empty_collection"
-            )
+            if collect_errors.errors:
+                diagnostic["reason"] = "collection_errors"
+            elif rc in (2, 3, 4):
+                # No session, no per-test collection error recorded, yet pytest exited with a
+                # collection / internal / usage code (#66): the signature of a conftest or config
+                # that failed to LOAD before the collection hook fired. That is a collection ERROR,
+                # not an empty suite — classify it so, and carry the captured error so the caller
+                # names the real cause (the missing import) instead of "check your testpaths".
+                raw = (stderr_buf.getvalue() or stdout_buf.getvalue()).strip()
+                err_lines = [ln.strip() for ln in raw.splitlines() if "Error" in ln]
+                detail = (
+                    (err_lines[-1] + "\n" + raw)
+                    if err_lines
+                    else (
+                        raw
+                        or f"pytest exited {rc} before any test ran — a conftest or config failed to load"
+                    )
+                )
+                diagnostic["reason"] = "collection_errors"
+                if not diagnostic.get("errors"):
+                    diagnostic["errors"] = (("conftest/config load", detail),)
+            else:
+                diagnostic["reason"] = "empty_collection"
         return None
     return box.get("result")
 

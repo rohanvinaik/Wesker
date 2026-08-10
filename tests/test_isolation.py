@@ -331,3 +331,107 @@ def test_per_mutant_node_ids_override_the_session_default(tmp_path):
         assert r.killed_by == "assertion"
     finally:
         worker.close()
+
+
+# ── the engine routes profiling through the isolated worker (increment 4b) ───────
+
+
+def _real_project(tmp_path):
+    """An on-disk project whose test callables carry REAL pytest nodeids, and the function node +
+    its imported test callables (nodeid stamped on __qualname__ exactly as Wesker's collection does,
+    so the isolated path can address them). Returns (func_node, func_obj, test_callables)."""
+    import ast
+    import importlib
+    import sys
+
+    (tmp_path / "m.py").write_text(
+        "def in_range(x, lo, hi):\n    return lo <= x <= hi\n"
+    )
+    (tmp_path / "test_m.py").write_text(
+        "from m import in_range\n\n\n"
+        "def test_inside():\n    assert in_range(5, 0, 10) is True\n\n\n"
+        "def test_below():\n    assert in_range(-1, 0, 10) is False\n"
+    )
+    node = ast.parse((tmp_path / "m.py").read_text()).body[0]
+    sys.path.insert(0, str(tmp_path))
+    m = importlib.import_module("m")
+    tm = importlib.import_module("test_m")
+    tm.test_inside.__qualname__ = "test_m.py::test_inside"
+    tm.test_below.__qualname__ = "test_m.py::test_below"
+    return node, m.in_range, [tm.test_inside, tm.test_below]
+
+
+def _drop_project(tmp_path):
+    import sys
+
+    sys.path[:] = [p for p in sys.path if p != str(tmp_path)]
+    sys.modules.pop("m", None)
+    sys.modules.pop("test_m", None)
+
+
+def test_isolated_profiling_agrees_with_in_process_and_marks_the_mode(tmp_path):
+    """THE soundness proof for the wiring: routing `run_function_profiling` through the killable
+    worker process yields the SAME bottom line as the in-process path — same kills, same survivors,
+    same value-spec split — and stamps the mode so a consumer can tell which containment guarantee
+    measured it. A verdict that disagreed would mean the isolated crossing lost or invented a kill."""
+    from Wesker.ci import _PROJECT_ROOT
+    from Wesker.engine import run_function_profiling
+    from Wesker.filter import filter_categories
+
+    node, func_obj, tests = _real_project(tmp_path)
+    try:
+        cats = filter_categories(node)
+        token = _PROJECT_ROOT.set(str(tmp_path))
+        try:
+            inproc = run_function_profiling(
+                node, "m.py::in_range", cats, tests, func_obj
+            )
+            iso = run_function_profiling(
+                node, "m.py::in_range", cats, tests, func_obj, isolated=True
+            )
+        finally:
+            _PROJECT_ROOT.reset(token)
+    finally:
+        _drop_project(tmp_path)
+
+    assert inproc.execution_mode == "in_process"
+    assert iso.execution_mode == "isolated"
+    assert iso.to_dict()["execution_mode"] == "isolated"
+    # A real suite kills something here, or the comparison is vacuous.
+    assert inproc.total_killed > 0
+    # The bottom line agrees — the crossing neither lost nor invented a verdict.
+    assert (iso.total_mutants, iso.total_killed, iso.total_survived) == (
+        inproc.total_mutants,
+        inproc.total_killed,
+        inproc.total_survived,
+    )
+    # And the value-specification split (assertion pins vs run-only kills) survives isolation.
+    assert iso.value_killed == inproc.value_killed
+
+
+def test_isolated_profiling_is_gateable_on_a_clean_run(tmp_path):
+    """The whole reason the isolated mode exists: a contained, budgeted, exhaustive run through it is
+    gateable — the containment is a real SIGKILL guarantee, not a best-effort thread abandon."""
+    from Wesker.ci import _PROJECT_ROOT
+    from Wesker.engine import run_function_profiling
+    from Wesker.filter import filter_categories
+
+    node, func_obj, tests = _real_project(tmp_path)
+    try:
+        token = _PROJECT_ROOT.set(str(tmp_path))
+        try:
+            iso = run_function_profiling(
+                node,
+                "m.py::in_range",
+                filter_categories(node),
+                tests,
+                func_obj,
+                isolated=True,
+            )
+        finally:
+            _PROJECT_ROOT.reset(token)
+    finally:
+        _drop_project(tmp_path)
+
+    assert iso.coverage_depth == "profiled"
+    assert iso.is_gateable is True

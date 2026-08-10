@@ -31,6 +31,12 @@ from .line_coverage import executable_lines as _executable_lines
 from .line_coverage import failing_on_baseline as _failing_on_baseline
 from .line_coverage import trace_line_coverage as _trace_line_coverage
 from .line_coverage import trace_suite as _trace_suite
+from .isolation import (
+    IsolatedMutantWorker,
+    IsolatedRun,
+    mutant_verdict,
+    should_recycle,
+)
 from .tce import WARRANT_BYTECODE, nodes_equivalent
 from .trace_evidence import TraceEvidence, build_trace_ledger
 from .memory_guard import over_budget as _over_budget
@@ -379,6 +385,11 @@ class ProfilingResult:
     total_survived: int = 0
     survival_rate: float = 0.0
     coverage_depth: str = "profiled"
+    #: Which execution mode measured this result (#19): "in_process" (default) or "isolated". The
+    #: isolated worker's containment is a real SIGKILL guarantee; the in-process path can only ASK a
+    #: runaway thread to stop. `execution_mode_standing` maps this + containment to a gateability tier
+    #: (Detective #60 consumes it). Defaults "in_process" so every existing construction keeps meaning.
+    execution_mode: str = "in_process"
     is_gateable: bool = True
     # Module names the LIVE collection resolved to more than one file (#58). Non-empty means
     # the measurement may be perfectly counted and still be about the wrong copy of the code,
@@ -576,6 +587,7 @@ class ProfilingResult:
             "survival_rate": round(self.survival_rate, 3),
             "effective_kill_pct": effective_kill_pct,
             "coverage_depth": self.coverage_depth,
+            "execution_mode": self.execution_mode,
             "is_gateable": self.is_gateable,
             "budget_exhausted": self.budget_exhausted,
             "elapsed_ms": round(self.elapsed_ms, 1),
@@ -4700,6 +4712,116 @@ def run_function_sampling(
     )
 
 
+# How many mutants one isolated worker evaluates before it is recycled to a fresh process (#19).
+# A reused interpreter can accumulate application state a per-test lifecycle does not reset (a
+# singleton, a registry, a module cache); a bounded count discards that drift before it can perturb
+# a verdict. Tunable; `should_recycle` treats 0 as "never recycle on count".
+_ISOLATED_WORKER_RECYCLE = 100
+
+# Floor for the isolated per-mutant timeout (#19). The isolated worker runs a full pytest invocation
+# per mutant — the first on a fresh worker paying interpreter+collection startup — so a cap tuned for
+# in-process microsecond calls would time out honest mutants and read them as false kills. `select`
+# returns as soon as the worker answers, so this floor never slows a normal mutant; it only sets how
+# long a genuine hang runs before the process group is killed.
+_ISOLATED_MIN_TIMEOUT_S = 10.0
+
+
+def _isolated_result(
+    mutant: Mutant, run: IsolatedRun, elapsed_ms: float
+) -> MutantResult:
+    """One isolated worker verdict -> a MutantResult with the SAME inputs the in-process path feeds
+    `mutant_disposition` (#19).
+
+    `entered` stays None: the worker does not instrument entry, so a killed mutant is
+    `killed_after_entry` and a survivor `survived_after_entry` — the pre-#18 unobserved-entry
+    default, which is the conservative direction (it never withholds a real kill). A timed-out run is
+    a run-only `timeout` kill carrying its own containment. A verdict that measured the HARNESS and
+    not the suite — the mutant would not compile, or its covering tests could not be collected (a
+    pytest collection/usage exit) — is marked `constructed=False`, so `mutant_disposition` scores it
+    `harness_error`, outside the denominator, never a false survivor that deflates the score.
+    """
+    if run.timed_out:
+        return MutantResult(
+            mutant=mutant,
+            killed=True,
+            killed_by="timeout",
+            contained=run.contained,
+            test_name=run.test_name,
+            elapsed_ms=elapsed_ms,
+        )
+    verdict = mutant_verdict(run.outcome)
+    if not run.constructed or verdict == "harness":
+        return MutantResult(
+            mutant=mutant,
+            killed=False,
+            constructed=False,
+            contained=run.contained,
+            elapsed_ms=elapsed_ms,
+        )
+    if verdict == "killed":
+        return MutantResult(
+            mutant=mutant,
+            killed=True,
+            killed_by=run.killed_by or "crash",
+            test_name=run.test_name,
+            contained=run.contained,
+            elapsed_ms=elapsed_ms,
+        )
+    return MutantResult(
+        mutant=mutant,
+        killed=False,
+        contained=run.contained,
+        elapsed_ms=elapsed_ms,
+    )
+
+
+def _evaluate_isolated(
+    worker: IsolatedMutantWorker | None,
+    mutant: Mutant,
+    scoped_tests: list[Callable[..., None]],
+    iso_ctx: tuple[str, str, str, int],
+    per_mutant_timeout_ms: float,
+) -> tuple[MutantResult, IsolatedMutantWorker | None]:
+    """Evaluate one mutant in a killable isolated worker, recycling the worker when spent (#19).
+
+    Returns the verdict AND the (possibly fresh) worker, which the caller threads forward — a hang
+    or a reached recycle cap retires the current worker and a new one takes the next mutant. A mutant
+    whose covering tests carry no real pytest nodeid (the whole scoped set is empty) is a plain
+    survivor — `entered=None -> survived_after_entry`, matching the in-process empty-scope path — and
+    is NEVER handed to pytest with an empty argv, which would collect the ENTIRE suite instead.
+
+    THE TIMEOUT IS THE CONFIGURED CAP, NOT THE IN-PROCESS ADAPTIVE ALLOWANCE. The allowance the loop
+    tightens per mutant is calibrated for a bare in-process function CALL (microseconds); the isolated
+    worker runs a whole pytest invocation per mutant (tens to hundreds of ms), so the allowance
+    expires mid-collection and every slower mutant reads as a spurious `timeout` KILL — inflating
+    adequacy, the one direction that must never happen. The cap, floored to cover pytest startup, is
+    the hang bound instead; `select` returns the instant the worker answers, so the generous floor
+    costs a normal mutant nothing and only bounds a true runaway.
+    """
+    from Wesker.ci import callable_test_id
+
+    root, target, qualname, recycle_cap = iso_ctx
+    node_ids = [tid for c in scoped_tests if "::" in (tid := callable_test_id(c))]
+    if not node_ids:
+        return MutantResult(mutant=mutant, killed=False, elapsed_ms=0.0), worker
+    if (
+        worker is None
+        or not worker.alive
+        or should_recycle(worker.evaluated, recycle_cap)
+    ):
+        if worker is not None:
+            worker.close()
+        worker = IsolatedMutantWorker(root, [], target, qualname)
+    try:
+        source = ast.unparse(mutant.mutated_node)
+    except Exception:  # noqa: BLE001 — an un-unparseable mutant is un-evaluable: conservative survivor
+        return MutantResult(mutant=mutant, killed=False, elapsed_ms=0.0), worker
+    timeout_s = max(per_mutant_timeout_ms / 1000.0, _ISOLATED_MIN_TIMEOUT_S)
+    t0 = time.monotonic()
+    run = worker.evaluate(source, timeout_s, node_ids=node_ids)
+    return _isolated_result(mutant, run, _elapsed(t0)), worker
+
+
 def run_function_profiling(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     func_key: str,
@@ -4722,6 +4844,7 @@ def run_function_profiling(
     trace_budget_s: float | None = DEFAULT_TRACE_BUDGET_S,
     trace_progress: Callable[[int, int, float], None] | None = None,
     trace_session_budget_s: float | None = DEFAULT_TRACE_SESSION_BUDGET_S,
+    isolated: bool = False,
 ) -> ProfilingResult:
     """Profiling mode — generate mutants (exhaustive by default), evaluate with budget.
 
@@ -4822,6 +4945,25 @@ def run_function_profiling(
     # exhausted before it allocated anything.
     mem_baseline = _mem_baseline()
     total_m = len(mutants)
+    # Isolated mode routes each mutant through a killable worker PROCESS (the gateable execution
+    # mode, #19) instead of the in-process `evaluate_mutant`; `in_process` (the default) stays the
+    # fast path. The worker is threaded through the loop so it can be recycled on a hang or a reached
+    # cap; its context — session root, relative target file, qualname, recycle cap — is fixed for the
+    # whole function. Root comes from the session ContextVar the baseline tracer already used, so the
+    # worker's cwd matches the measured collection rather than a re-derived guess.
+    _iso_worker: IsolatedMutantWorker | None = None
+    _iso_ctx: tuple[str, str, str, int] | None = None
+    if isolated:
+        import os
+
+        from Wesker.ci import _PROJECT_ROOT
+
+        _iso_ctx = (
+            _PROJECT_ROOT.get() or os.getcwd(),
+            source_path or "",
+            qualname or "",
+            _ISOLATED_WORKER_RECYCLE,
+        )
     for count, mutant in enumerate(mutants):
         if progress is not None:
             progress(count, total_m, _elapsed(start))
@@ -4847,15 +4989,21 @@ def run_function_profiling(
         allowance_ms = _adaptive_allowance(
             baseline_ms, per_mutant_timeout_ms, remaining_ms
         )
-        try:
-            result = evaluate_mutant(
-                mutant,
-                _tests_for(mutant),
-                original_func,
-                timeout_ms=allowance_ms,
-                qualname=qualname,
-                source_path=source_path,
+        if isolated:
+            assert _iso_ctx is not None
+            result, _iso_worker = _evaluate_isolated(
+                _iso_worker, mutant, _tests_for(mutant), _iso_ctx, per_mutant_timeout_ms
             )
+        try:
+            if not isolated:
+                result = evaluate_mutant(
+                    mutant,
+                    _tests_for(mutant),
+                    original_func,
+                    timeout_ms=allowance_ms,
+                    qualname=qualname,
+                    source_path=source_path,
+                )
         except Exception as exc:  # noqa: BLE001
             # A pathological mutant can crash the evaluation harness itself —
             # e.g. self-profiling the engine's own internals, where the mutant
@@ -4963,6 +5111,8 @@ def run_function_profiling(
             budget_exhausted = True
             break
 
+    if _iso_worker is not None:
+        _iso_worker.close()
     if progress is not None:
         progress(total_m, total_m, _elapsed(start))
     per_cat = list(results_by_cat.values())
@@ -5024,6 +5174,11 @@ def run_function_profiling(
         # when the run stopped short or ran against a live abandoned worker. is_gateable already
         # reflects both; coverage_depth now agrees.
         coverage_depth="cut" if (budget_exhausted or not _contained) else "profiled",
+        # Which execution mode measured this (#19): `isolated` ran each mutant in a killable worker
+        # PROCESS — containment is a real guarantee — while `in_process` shares the interpreter and
+        # can only ASK a runaway thread to stop. `execution_mode_standing` (4c) turns this into a
+        # gateability tier; Detective #60 consumes it.
+        execution_mode="isolated" if isolated else "in_process",
         elapsed_ms=_elapsed(start),
         line_coverage=line_cov,
         admissible_line_coverage=_admissible_coverage(line_cov, _barred),

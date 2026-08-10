@@ -677,3 +677,165 @@ def test_in_process_gateability_now_requires_hermetic_shapes(tmp_path):
             _PROJECT_ROOT.reset(token)
     finally:
         _drop_project(tmp_path)
+
+
+# ── repeated-fresh-baseline nondeterminism (increment 5c) ────────────────────────
+#
+# Run the unmutated baseline twice from matched FRESH state (two killable workers, each tracing the
+# target's covered lines) and compare via the pinned `baseline_determinism`. A differing outcome or
+# covered-line set means the baseline is not repeatable, so no verdict against it may gate.
+
+
+def test_a_deterministic_baseline_traces_identically_from_fresh_state(tmp_path):
+    from Wesker.isolation import baseline_determinism, run_baseline_traced_isolated
+
+    (tmp_path / "d.py").write_text(
+        "def f(x):\n    if x > 0:\n        return x\n    return -x\n"
+    )
+    (tmp_path / "test_d.py").write_text(
+        "from d import f\n\n\ndef test_f():\n    assert f(3) == 3\n"
+    )
+    lines_a, out_a, cont_a = run_baseline_traced_isolated(
+        str(tmp_path), ["test_d.py::test_f"], "d.py", 30.0
+    )
+    lines_b, out_b, cont_b = run_baseline_traced_isolated(
+        str(tmp_path), ["test_d.py::test_f"], "d.py", 30.0
+    )
+    assert out_a == "passed" and out_b == "passed"
+    assert cont_a and cont_b
+    assert lines_a, "the tracer captured no target lines"
+    assert baseline_determinism(lines_a, out_a, lines_b, out_b) == "deterministic"
+
+
+def test_a_baseline_whose_coverage_shifts_is_nondeterministic(tmp_path):
+    """A target that branches on external state (a counter file) covers a DIFFERENT line each fresh
+    run, though the test still passes — exactly the coverage-only nondeterminism a proof basis must
+    not gate on. Two fresh workers surface it; the pinned decision names it."""
+    from Wesker.isolation import baseline_determinism, run_baseline_traced_isolated
+
+    (tmp_path / "c.py").write_text(
+        "import os\n"
+        "_P = os.path.join(os.path.dirname(__file__), 'ctr')\n"
+        "def f():\n"
+        "    n = int(open(_P).read()) if os.path.exists(_P) else 0\n"
+        "    open(_P, 'w').write(str(n + 1))\n"
+        "    if n % 2 == 0:\n"
+        "        return 'even'\n"
+        "    return 'odd'\n"
+    )
+    (tmp_path / "test_c.py").write_text("from c import f\n\n\ndef test_f():\n    f()\n")
+    lines_a, out_a, _ = run_baseline_traced_isolated(
+        str(tmp_path), ["test_c.py::test_f"], "c.py", 30.0
+    )
+    lines_b, out_b, _ = run_baseline_traced_isolated(
+        str(tmp_path), ["test_c.py::test_f"], "c.py", 30.0
+    )
+    # Both pass (no assertion), but the covered branch differs run-to-run.
+    assert out_a == "passed" and out_b == "passed"
+    assert lines_a != lines_b
+    assert baseline_determinism(lines_a, out_a, lines_b, out_b) == "nondeterministic"
+
+
+def _counter_project(tmp_path):
+    """A profileable function whose covered branch flips each fresh run. The counter is incremented
+    at MODULE IMPORT — not inside g — so the mutant loop (which only replaces g's body) cannot corrupt
+    it; each fresh worker's import advances the parity g branches on. The test callable's nodeid is
+    stamped so the isolated path can address it."""
+    import ast
+    import importlib
+    import sys
+
+    (tmp_path / "cc.py").write_text(
+        "import os\n"
+        "_P = os.path.join(os.path.dirname(__file__), 'ctr2')\n"
+        "_n = int(open(_P).read() or '0') if os.path.exists(_P) else 0\n"
+        "open(_P, 'w').write(str(_n + 1))\n"
+        "def g():\n"
+        "    if _n % 2 == 0:\n"
+        "        return 'even'\n"
+        "    return 'odd'\n"
+    )
+    (tmp_path / "test_cc.py").write_text(
+        "from cc import g\n\n\ndef test_g():\n    g()\n"
+    )
+    node = ast.parse((tmp_path / "cc.py").read_text()).body[
+        4
+    ]  # import, _P, _n, write, then def g
+    sys.path.insert(0, str(tmp_path))
+    m = importlib.import_module("cc")
+    tm = importlib.import_module("test_cc")
+    tm.test_g.__qualname__ = "test_cc.py::test_g"
+    return node, m.g, [tm.test_g]
+
+
+def _drop_counter(tmp_path):
+    import sys
+
+    sys.path[:] = [p for p in sys.path if p != str(tmp_path)]
+    sys.modules.pop("cc", None)
+    sys.modules.pop("test_cc", None)
+
+
+def test_the_determinism_check_is_opt_in_and_confirms_a_deterministic_run(tmp_path):
+    """Default off (a second baseline doubles cost): determinism is 'unchecked' and gateability
+    stands. Opt in on a deterministic function and it is checked, confirmed, and still gateable."""
+    from Wesker.ci import _PROJECT_ROOT
+    from Wesker.engine import run_function_profiling
+    from Wesker.filter import filter_categories
+
+    node, func_obj, tests = _real_project(tmp_path)
+    try:
+        cats = filter_categories(node)
+        token = _PROJECT_ROOT.set(str(tmp_path))
+        try:
+            plain = run_function_profiling(
+                node, "m.py::in_range", cats, tests, func_obj, isolated=True
+            )
+            assert plain.determinism == "unchecked"
+            assert plain.is_gateable is True
+
+            checked = run_function_profiling(
+                node,
+                "m.py::in_range",
+                cats,
+                tests,
+                func_obj,
+                isolated=True,
+                check_determinism=True,
+            )
+            assert checked.determinism == "deterministic"
+            assert checked.is_gateable is True
+            assert checked.to_dict()["determinism"] == "deterministic"
+        finally:
+            _PROJECT_ROOT.reset(token)
+    finally:
+        _drop_project(tmp_path)
+
+
+def test_a_nondeterministic_baseline_cuts_gateability_end_to_end(tmp_path):
+    """THE 5c payoff, verified end-to-end: profiling a function whose baseline coverage is not
+    repeatable, with the check on, yields determinism='nondeterministic' and a NON-gateable result —
+    the unrepeatable baseline cannot ground a verdict."""
+    from Wesker.ci import _PROJECT_ROOT
+    from Wesker.engine import run_function_profiling
+    from Wesker.filter import filter_categories
+
+    node, func_obj, tests = _counter_project(tmp_path)
+    try:
+        token = _PROJECT_ROOT.set(str(tmp_path))
+        try:
+            r = run_function_profiling(
+                node,
+                "cc.py::g",
+                filter_categories(node),
+                tests,
+                func_obj,
+                isolated=True,
+                check_determinism=True,
+            )
+            assert r.determinism == "nondeterministic"
+            assert r.is_gateable is False
+        finally:
+            _PROJECT_ROOT.reset(token)
+    finally:
+        _drop_counter(tmp_path)

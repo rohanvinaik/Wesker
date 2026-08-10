@@ -159,6 +159,66 @@ def _evaluate_full(
     }
 
 
+def _trace_baseline_run(target_abspath: str, node_ids: list[str]) -> dict[str, Any]:
+    """Run node IDs against the UNMUTATED target under a line tracer, in THIS fresh process (#19).
+
+    The determinism check runs this twice in two fresh workers and compares. Here, from one fresh
+    process, it captures the set of TARGET lines the covering tests execute and the run's outcome.
+    The tracer mirrors ``line_coverage._trace_one_multi``'s dispatch: a global ``settrace`` whose
+    dispatch installs the per-line recorder only on frames whose code lives in the target file —
+    ``settrace``'s global hook still fires for every nested frame, so a test in another file that
+    CALLS the target is recorded too. ``settrace`` binds the calling (main) thread, which is where
+    pytest runs the node bodies.
+    """
+    from Wesker.isolation import isolated_test_outcome
+
+    # `realpath`, not `abspath`: `python -m` prepends "" (cwd) to sys.path so an import can resolve to
+    # a RELATIVE co_filename, AND on macOS the target dir is reached through the /var -> /private/var
+    # SYMLINK — abspath leaves the symlink in, so the two spellings never == . realpath canonicalizes
+    # both. A per-filename cache keeps the resolve off the hot per-line path; both runs normalize
+    # identically, so the comparison is stable.
+    target_real = os.path.realpath(target_abspath)
+    covered: set[int] = set()
+    _norm: dict[str, bool] = {}
+
+    def _is_target(fn: str) -> bool:
+        hit = _norm.get(fn)
+        if hit is None:
+            hit = os.path.realpath(fn) == target_real
+            _norm[fn] = hit
+        return hit
+
+    def _local(frame: Any, event: str, _arg: Any) -> Any:
+        if event == "line" and _is_target(frame.f_code.co_filename):
+            covered.add(frame.f_lineno)
+        return _local
+
+    def _dispatch(frame: Any, event: str, _arg: Any) -> Any:
+        if event == "call" and _is_target(frame.f_code.co_filename):
+            return _local
+        return None
+
+    with (
+        contextlib.redirect_stdout(io.StringIO()),
+        contextlib.redirect_stderr(io.StringIO()),
+    ):
+        sys.settrace(_dispatch)
+        try:
+            rc = pytest.main(
+                [
+                    *node_ids,
+                    "-p",
+                    "no:cacheprovider",
+                    "-q",
+                    "--no-header",
+                    "--capture=sys",
+                ]
+            )
+        finally:
+            sys.settrace(None)
+    return {"lines": sorted(covered), "outcome": isolated_test_outcome(int(rc), False)}
+
+
 def _setup(spec: dict[str, Any]) -> None:
     root = spec["project_root"]
     os.chdir(root)
@@ -193,6 +253,18 @@ def _serve() -> int:
 def main() -> int:
     if "--serve" in sys.argv[1:]:
         return _serve()
+    if "--baseline" in sys.argv[1:]:
+        # Traced baseline run of the unmutated target, for the determinism check (#19). One fresh
+        # process, one JSON line: {"lines": [...], "outcome": "..."}. The tracer's own redirect is
+        # restored before this write, so the protocol line lands on the real stdout.
+        real_stdout = sys.stdout
+        spec = json.loads(sys.stdin.read())
+        _setup(spec)
+        target = _resolve_target(spec["project_root"], spec["target_file"])
+        payload = _trace_baseline_run(target, spec["node_ids"])
+        real_stdout.write(json.dumps(payload) + "\n")
+        real_stdout.flush()
+        return 0
     spec = json.loads(sys.stdin.read())
     _setup(spec)
     target = _resolve_target(spec["project_root"], spec["target_file"])

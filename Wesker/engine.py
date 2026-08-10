@@ -34,10 +34,12 @@ from .line_coverage import trace_suite as _trace_suite
 from .isolation import (
     IsolatedMutantWorker,
     IsolatedRun,
+    baseline_determinism,
     callable_shape_hazards,
     execution_mode_standing,
     fast_mode_standing,
     mutant_verdict,
+    run_baseline_traced_isolated,
     scope_fast_mode_standing,
     should_recycle,
 )
@@ -400,6 +402,11 @@ class ProfilingResult:
     #: "refuse_*" here is why an in_process result is not gateable — the NAMED refusal the issue asks
     #: for. Default "n/a" leaves every existing construction (and the isolated path) unaffected.
     fast_mode: str = "n/a"
+    #: The repeated-fresh-baseline determinism standing (#19): "deterministic" when two fresh isolated
+    #: baseline runs agreed on outcome AND covered lines, "nondeterministic" when they disagreed (→
+    #: not gateable), or "unchecked" (the default) when the opt-in `check_determinism` run did not
+    #: happen. An unrepeatable baseline cannot ground a gateable verdict.
+    determinism: str = "unchecked"
     is_gateable: bool = True
     # Module names the LIVE collection resolved to more than one file (#58). Non-empty means
     # the measurement may be perfectly counted and still be about the wrong copy of the code,
@@ -611,6 +618,7 @@ class ProfilingResult:
             "coverage_depth": self.coverage_depth,
             "execution_mode": self.execution_mode,
             "fast_mode": self.fast_mode,
+            "determinism": self.determinism,
             "execution_standing": self.execution_standing,
             "is_gateable": self.is_gateable,
             "budget_exhausted": self.budget_exhausted,
@@ -3959,6 +3967,7 @@ def _measurement_gateable(
     budget_ok: bool,
     identity_unambiguous: bool = True,
     fast_shape_ok: bool = True,
+    deterministic_ok: bool = True,
 ) -> bool:
     """Whether a profiling result may gate a downstream verdict (COMPLETE, auto-apply, CI).
 
@@ -3971,7 +3980,9 @@ def _measurement_gateable(
     False when this ran in the in_process FAST mode over a NON-hermetic test shape (#19) — a
     subprocess/thread/signal/custom-collector the mode's thread-abandon cannot contain — so the
     counts may be perturbed by state the run could not isolate; the isolated mode passes True here
-    because a whole process is killable. Any one False makes the counts a floor, not a verdict.
+    because a whole process is killable. ``deterministic_ok`` is False when a repeated fresh baseline
+    disagreed on outcome or covered lines (#19) — an unrepeatable baseline cannot ground a verdict.
+    Any one False makes the counts a floor, not a verdict.
 
     Defaults True so a caller that has not OBSERVED a conjunct keeps its previous meaning; an
     unasked question must not become a refusal.
@@ -3982,6 +3993,7 @@ def _measurement_gateable(
         and budget_ok
         and identity_unambiguous
         and fast_shape_ok
+        and deterministic_ok
     )
 
 
@@ -4879,6 +4891,7 @@ def run_function_profiling(
     trace_progress: Callable[[int, int, float], None] | None = None,
     trace_session_budget_s: float | None = DEFAULT_TRACE_SESSION_BUDGET_S,
     isolated: bool = False,
+    check_determinism: bool = False,
 ) -> ProfilingResult:
     """Profiling mode — generate mutants (exhaustive by default), evaluate with budget.
 
@@ -5192,6 +5205,36 @@ def run_function_profiling(
         )
         _fast_shape_ok = _fast_mode == "hermetic"
 
+    # Repeated-fresh-baseline nondeterminism check (#19), OPT-IN. Two baselines from matched fresh
+    # ISOLATED state, compared on outcome AND covered lines: an unrepeatable baseline cannot ground a
+    # gateable verdict. Isolated only — the in_process fast path shares an interpreter, so "fresh
+    # state" is not available and the check is meaningless there. Default off: a second full baseline
+    # doubles that cost, and only a proof-facing run needs it.
+    _determinism = "unchecked"
+    if isolated and check_determinism:
+        import os
+
+        from Wesker.ci import _PROJECT_ROOT, callable_test_id
+
+        _dnodes = [tid for t in test_functions if "::" in (tid := callable_test_id(t))]
+        _dtarget = source_path or ""
+        if _dnodes and _dtarget:
+            _droot = _PROJECT_ROOT.get() or os.getcwd()
+            _dtimeout = max(per_mutant_timeout_ms / 1000.0, _ISOLATED_MIN_TIMEOUT_S)
+            _la, _oa, _ca = run_baseline_traced_isolated(
+                _droot, _dnodes, _dtarget, _dtimeout
+            )
+            _lb, _ob, _cb = run_baseline_traced_isolated(
+                _droot, _dnodes, _dtarget, _dtimeout
+            )
+            # A run that could not be contained is not a trustworthy baseline either.
+            _determinism = (
+                baseline_determinism(_la, _oa, _lb, _ob)
+                if (_ca and _cb)
+                else "nondeterministic"
+            )
+    _determinism_ok = _determinism != "nondeterministic"
+
     # The per-TestId outcome-qualified ledger (#17), from the SAME failed/truncated sets `_barred`
     # is built from, so the typed view and the derived `admissible_line_coverage` cannot disagree.
     # Containment is measurement-wide (absorbing), so it is stamped on every item. (The converged
@@ -5220,6 +5263,7 @@ def run_function_profiling(
             not budget_exhausted,
             _identity_standing != "ambiguous",
             _fast_shape_ok,
+            _determinism_ok,
         ),
         collection_conflicts=_identity_conflicts,
         # A cut is any invalid measurement — budget overrun OR an uncontained worker (#13/#14),
@@ -5235,6 +5279,9 @@ def run_function_profiling(
         # The NAMED fast-mode shape standing (#19): why an in_process result is (not) gateable — a
         # "refuse_<hazard>" is the explicit refusal the issue asks for, "n/a" under isolated.
         fast_mode=_fast_mode,
+        # The repeated-fresh-baseline determinism standing (#19): "nondeterministic" here is why an
+        # otherwise-complete run is not gateable; "unchecked" when the opt-in did not run.
+        determinism=_determinism,
         elapsed_ms=_elapsed(start),
         line_coverage=line_cov,
         admissible_line_coverage=_admissible_coverage(line_cov, _barred),

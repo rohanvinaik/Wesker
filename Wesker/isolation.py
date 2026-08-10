@@ -277,6 +277,52 @@ def run_mutant_isolated(
         return IsolatedRun(-9, True, contained, out or "")
 
 
+def run_baseline_traced_isolated(
+    project_root: str,
+    node_ids: Sequence[str],
+    target_file: str,
+    timeout_s: float,
+) -> tuple[list[int], str, bool]:
+    """Trace the UNMUTATED baseline once in a fresh killable worker (#19).
+
+    Returns ``(covered_target_lines, outcome, contained)``. Two calls from matched fresh state feed
+    :func:`baseline_determinism`: a differing line-set or outcome across the two means the baseline
+    is not repeatable, so no verdict measured against it may gate. A timeout yields no lines and a
+    ``timeout`` outcome — itself an untrustworthy baseline. The worker traces the target file's line
+    events around a real pytest run and emits one JSON line; pytest's own output is captured inside
+    the worker, so the LAST line of stdout is the protocol payload even if a stray byte precedes it.
+    """
+    payload = json.dumps(
+        {
+            "project_root": project_root,
+            "node_ids": list(node_ids),
+            "target_file": target_file,
+        }
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "Wesker._isolated_worker", "--baseline"],
+        cwd=project_root,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, _ = proc.communicate(payload, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        contained = _terminate_group(proc)
+        return [], "timeout", contained
+    lines = [ln for ln in (out or "").splitlines() if ln.strip()]
+    if not lines:
+        return [], "error", True
+    try:
+        data = json.loads(lines[-1])
+        return list(data.get("lines", [])), str(data.get("outcome", "error")), True
+    except (ValueError, TypeError):
+        return [], "error", True
+
+
 def should_recycle(evaluated: int, max_per_worker: int) -> bool:
     """Whether a persistent isolated worker has done enough mutants to recycle (#19, pure — pinned).
 

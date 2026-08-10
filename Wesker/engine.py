@@ -31,6 +31,7 @@ from .line_coverage import failing_on_baseline as _failing_on_baseline
 from .line_coverage import trace_line_coverage as _trace_line_coverage
 from .line_coverage import trace_suite as _trace_suite
 from .tce import WARRANT_BYTECODE, nodes_equivalent
+from .trace_evidence import TraceEvidence, build_trace_ledger
 from .memory_guard import over_budget as _over_budget
 from .memory_guard import reclaim as _reclaim
 from .memory_guard import run_baseline_bytes as _mem_baseline
@@ -394,6 +395,14 @@ class ProfilingResult:
     # reach, which is also what `_build_test_scope` correctly scopes on: routing wants a test
     # that reaches the line even when it cannot prove anything about it.
     admissible_line_coverage: dict[str, list[int]] = field(default_factory=dict)
+    # The per-TestId outcome-qualified baseline ledger (#17): the typed source the two coverage
+    # views above derive from, WITHOUT loss through early unioning. Each entry names the item's
+    # baseline outcome, whether its trace was truncated or the measurement uncontained, and whether
+    # it may therefore discharge a statement obligation. `observed_union` / `admissible_union` are
+    # the named views over it. Arc/branch obligations are a follow-up — the tracer records
+    # statements today, so this ledger is statement-level with the outcome qualification the proof
+    # view was missing.
+    trace_evidence: tuple[TraceEvidence, ...] = ()
     survivor_records: list[dict] = field(default_factory=list)
     killed_records: list[dict] = field(default_factory=list)
     budget_exhausted: bool = False
@@ -486,6 +495,26 @@ class ProfilingResult:
         ]
         return list(self.survivor_records) + crash_survivors
 
+    @property
+    def observed_union(self) -> set[int]:
+        """Every line ANY test executed — conservative routing/diagnostic reach (#17).
+
+        The union that used to close the line ledger; kept as a NAMED view so a consumer that
+        wants observed reach (routing) asks for it explicitly and never gets it where proof is
+        meant.
+        """
+        return {ln for ev in self.trace_evidence for ln in ev.lines}
+
+    @property
+    def admissible_union(self) -> set[int]:
+        """Every line an ADMISSIBLE observation executed — the lines proof may rest on (#17).
+
+        Baseline-green, contained, non-truncated owners only. This is the union a certificate's
+        line ledger may close on; the failing-only counterexample leaves the false-branch line
+        OUT of it, which is the whole point.
+        """
+        return {ln for ev in self.trace_evidence if ev.admissible for ln in ev.lines}
+
     def to_dict(self) -> dict:
         # Mutants whose outcome measured the HARNESS, not the suite (#18) — never built, never
         # installed, never entered. `total_mutants` excludes them, so EMITTING THIS IS PART OF
@@ -574,6 +603,22 @@ class ProfilingResult:
         # converged entry point emits no line data at all, so neither key appears there.
         if self.admissible_line_coverage:
             d["admissible_line_coverage"] = self.admissible_line_coverage
+        # The typed per-TestId ledger the two views derive from (#17), so a certificate consumer can
+        # name the exact admissible owner of each obligation instead of unioning. Serialized as
+        # dicts; omitted when empty (the converged path carries none).
+        if self.trace_evidence:
+            d["trace_evidence"] = [
+                {
+                    "test_id": ev.test_id,
+                    "lines": list(ev.lines),
+                    "baseline_passed": ev.baseline_passed,
+                    "truncated": ev.truncated,
+                    "contained": ev.contained,
+                    "admissible": ev.admissible,
+                    "reason": ev.reason,
+                }
+                for ev in self.trace_evidence
+            ]
         if self.executable_lines:
             d["executable_lines"] = self.executable_lines
         if self.failing_tests:
@@ -4908,6 +4953,14 @@ def run_function_profiling(
     # own answer about module identity, not a reconstruction of it.
     _identity_standing, _identity_conflicts = _live_collection_identity()
 
+    # The per-TestId outcome-qualified ledger (#17), from the SAME failed/truncated sets `_barred`
+    # is built from, so the typed view and the derived `admissible_line_coverage` cannot disagree.
+    # Containment is measurement-wide (absorbing), so it is stamped on every item. (The converged
+    # entry point emits no per-TestId line data, so it carries no ledger — nothing is lost there.)
+    _failed_ids = _sb.inert_ids if _sb is not None else set(failing)
+    _truncated_ids = _sb.truncated if _sb is not None else set(_trace_truncated)
+    _evidence = build_trace_ledger(line_cov, _failed_ids, _truncated_ids, _contained)
+
     return ProfilingResult(
         function_key=func_key,
         categories_tested=len(per_cat),
@@ -4932,6 +4985,7 @@ def run_function_profiling(
         elapsed_ms=_elapsed(start),
         line_coverage=line_cov,
         admissible_line_coverage=_admissible_coverage(line_cov, _barred),
+        trace_evidence=_evidence,
         executable_lines=exec_lines,
         failing_tests=failing,
         tests_discovered=len(test_functions),

@@ -28,6 +28,7 @@ import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 
 def isolated_test_outcome(returncode: int, timed_out: bool) -> str:
@@ -65,6 +66,16 @@ class IsolatedRun:
     #: consumer must treat the measurement as uncontained/cut, exactly as the in-process path does.
     contained: bool
     stdout: str
+    #: The kill vocabulary the worker classified for this mutant (assertion/exception/crash), or
+    #: None. Set only on the server path, where a mutant's failure reasons cross back as data; the
+    #: one-shot and timeout paths leave it None (a timeout's reason is named by `mutant_verdict`).
+    killed_by: str | None = None
+    #: False when the mutant would not compile — the worker installed nothing, so the outcome
+    #: measures the harness, not the suite (#18). The engine scores that `harness_error`, outside
+    #: the denominator, never a survivor; True (the default) preserves every existing construction.
+    constructed: bool = True
+    #: The first node that failed under the mutant, for the kill matrix; None when none did.
+    test_name: str | None = None
 
     @property
     def outcome(self) -> str:
@@ -152,6 +163,52 @@ def mutant_verdict(outcome: str) -> str:
     if outcome == "passed":
         return "survived"
     return "harness"
+
+
+def classify_kill_reason(is_assertion: bool, is_declared_failure: bool) -> str:
+    """Name WHY one isolated node failed, in the engine's kill vocabulary (#19, pure — pinned).
+
+    The isolated worker runs real pytest, so a failure arrives as a report's ``excinfo`` rather
+    than the caught exception ``engine._run_test_with_timeout`` sees in-process — but the RULE
+    must be identical, or the isolated path's ``value_killed`` split silently disagrees with the
+    in-process one. That ladder, from engine.py:
+
+    * ``AssertionError`` → ``assertion`` — the test's assert pinned the return VALUE.
+    * a pytest DECLARED failure (``pytest.raises`` violated / ``pytest.fail``; see
+      ``engine._is_declared_failure``) → ``exception`` — a stated contract the mutant broke,
+      the same strength as an assertion (both make ``value_killed`` count).
+    * anything else that raised → ``crash`` — the mutant merely RAN differently; the value is
+      not pinned, so it is a run-only kill (a value-survivor downstream).
+
+    Assertion outranks a declared failure when both describe the same node, matching the
+    in-process ``except AssertionError`` arm winning over the ``BaseException`` arm. The impure
+    boundary supplies the two booleans off ``excinfo`` and NEVER calls this for a pass or a skip.
+    """
+    if is_assertion:
+        return "assertion"
+    if is_declared_failure:
+        return "exception"
+    return "crash"
+
+
+def aggregate_kill_reason(reasons: list[str]) -> str:
+    """Combine per-node kill reasons into ONE verdict for the mutant (#19, pure — pinned).
+
+    The worker runs several nodes in one pytest invocation, so a mutant can be killed by more
+    than one — one by assertion, another by crash. This is the same precedence
+    ``evaluate_mutant``'s ``record_all_killers`` branch keeps (its inline twin, kept in step so a
+    future refactor can share this): a VALUE PIN outranks a run-only kill, and among value pins
+    ``assertion`` is named before ``exception``. Order-independent — a mutant ANY node kills by
+    assertion is value-killed regardless of which node ran first. ``""`` when nothing killed
+    (every node passed); the caller reads the kill itself from pytest's exit code, not from here.
+    """
+    if "assertion" in reasons:
+        return "assertion"
+    if "exception" in reasons:
+        return "exception"
+    if "crash" in reasons:
+        return "crash"
+    return ""
 
 
 def run_mutant_isolated(
@@ -268,13 +325,26 @@ class IsolatedMutantWorker:
     def alive(self) -> bool:
         return self._alive and self._proc.poll() is None
 
-    def evaluate(self, mutant_source: str, timeout_s: float) -> IsolatedRun:
-        """Evaluate ONE mutant on the reused worker. A hang kills the group and retires the worker."""
+    def evaluate(
+        self,
+        mutant_source: str,
+        timeout_s: float,
+        node_ids: Sequence[str] | None = None,
+    ) -> IsolatedRun:
+        """Evaluate ONE mutant on the reused worker. A hang kills the group and retires the worker.
+
+        ``node_ids`` overrides the session's set for THIS mutant — per-mutant test scoping, so the
+        isolated verdict matches the in-process scoped one (only the tests reaching the mutated line
+        run); None uses the session default the worker was opened with.
+        """
         if not self.alive:
             return IsolatedRun(-9, True, self._reap(), "")
+        spec: dict[str, Any] = {"mutant_source": mutant_source}
+        if node_ids is not None:
+            spec["node_ids"] = list(node_ids)
         try:
             assert self._proc.stdin is not None and self._proc.stdout is not None
-            self._proc.stdin.write(json.dumps({"mutant_source": mutant_source}) + "\n")
+            self._proc.stdin.write(json.dumps(spec) + "\n")
             self._proc.stdin.flush()
         except (BrokenPipeError, ValueError, AssertionError):
             self._alive = False
@@ -292,10 +362,22 @@ class IsolatedMutantWorker:
             return IsolatedRun(-9, True, self._reap(), "")
         self._evaluated += 1
         try:
-            rc = int(json.loads(line).get("rc", 2))
+            data = json.loads(line)
+            rc = int(data.get("rc", 2))
         except (ValueError, TypeError):
-            rc = 2  # unreadable line -> a collection-class code, never a silent pass
-        return IsolatedRun(rc, False, True, "")
+            data, rc = (
+                {},
+                2,
+            )  # unreadable line -> a collection-class code, never a silent pass
+        return IsolatedRun(
+            rc,
+            False,
+            True,
+            "",
+            killed_by=data.get("killed_by"),
+            constructed=bool(data.get("constructed", True)),
+            test_name=data.get("test_name"),
+        )
 
     def _reap(self) -> bool:
         return _terminate_group(self._proc)

@@ -237,3 +237,97 @@ def test_a_hanging_mutant_retires_the_worker_but_stays_contained(tmp_path):
         assert mutant_verdict(h.outcome) == "killed"
     finally:
         worker.close()
+
+
+# ── the typed kill vocabulary survives isolation (increment 4) ───────────────────
+#
+# pytest's exit code says only killed/survived. The engine's `value_killed` split needs to know
+# WHY — a value pin (assertion/exception) versus a run-only kill (crash/timeout). These prove the
+# reason crosses back out of the isolated process intact, matching the in-process classifier, so
+# routing profiling through the worker does not silently collapse the split.
+
+
+def test_an_assertion_kill_reports_killed_by_assertion(tmp_path):
+    """A test whose assert catches the changed value pins it: killed_by='assertion' — a value kill."""
+    _tiny_project(tmp_path)  # test_f asserts f(1) == 2
+    worker = IsolatedMutantWorker(str(tmp_path), ["test_t.py::test_f"], "t.py", "f")
+    try:
+        r = worker.evaluate("def f(x):\n    return x - 1\n", 30.0)
+        assert mutant_verdict(r.outcome) == "killed"
+        assert r.killed_by == "assertion"
+        assert r.constructed is True
+        assert r.test_name == "test_t.py::test_f"
+    finally:
+        worker.close()
+
+
+def test_a_violated_raises_contract_reports_killed_by_exception(tmp_path):
+    """A `pytest.raises` contract the mutant breaks is a DECLARED failure (pytest's 'DID NOT RAISE'),
+    the same strength as an assertion — killed_by='exception', which `value_killed` also counts.
+    This is the case a bare pass/fail exit code cannot tell apart from a crash."""
+    (tmp_path / "g.py").write_text(
+        "def g(x):\n    if x < 0:\n        raise ValueError('neg')\n    return x\n"
+    )
+    (tmp_path / "test_g.py").write_text(
+        "import pytest\n\nfrom g import g\n\n\n"
+        "def test_g():\n    with pytest.raises(ValueError):\n        g(-1)\n"
+    )
+    worker = IsolatedMutantWorker(str(tmp_path), ["test_g.py::test_g"], "g.py", "g")
+    try:
+        # The mutant drops the guard, so g(-1) no longer raises → the contract is violated.
+        r = worker.evaluate("def g(x):\n    return x\n", 30.0)
+        assert mutant_verdict(r.outcome) == "killed"
+        assert r.killed_by == "exception"
+    finally:
+        worker.close()
+
+
+def test_an_unexpected_raise_reports_killed_by_crash(tmp_path):
+    """A mutant that blows up where no test stated a contract only proves it RUNS differently —
+    killed_by='crash', a run-only kill the value-spec view treats as a survivor."""
+    _tiny_project(tmp_path)  # test_f only asserts f(1) == 2; no exception contract
+    worker = IsolatedMutantWorker(str(tmp_path), ["test_t.py::test_f"], "t.py", "f")
+    try:
+        r = worker.evaluate("def f(x):\n    raise RuntimeError('boom')\n", 30.0)
+        assert mutant_verdict(r.outcome) == "killed"
+        assert r.killed_by == "crash"
+    finally:
+        worker.close()
+
+
+def test_a_noncompiling_mutant_is_not_constructed_never_a_survivor(tmp_path):
+    """A mutant that will not compile installed nothing — the node ran the ORIGINAL and passed. That
+    is a fact about the harness, not the suite: constructed=False, so the engine scores it
+    harness_error, never a false survivor that deflates the kill score."""
+    _tiny_project(tmp_path)
+    worker = IsolatedMutantWorker(str(tmp_path), ["test_t.py::test_f"], "t.py", "f")
+    try:
+        r = worker.evaluate("def f(x)\n    return x - 1\n", 30.0)  # missing colon
+        assert r.constructed is False
+    finally:
+        worker.close()
+
+
+def test_per_mutant_node_ids_override_the_session_default(tmp_path):
+    """A mutant may carry its own node_ids (per-mutant test scoping). Here the session default names
+    a passing test, but the mutant is evaluated only against a DIFFERENT test that catches it —
+    proving the override, not the session set, selected the run."""
+    (tmp_path / "t.py").write_text("def f(x):\n    return x + 1\n")
+    (tmp_path / "test_t.py").write_text(
+        "from t import f\n\n\n"
+        "def test_never_reached():\n    assert True\n\n\n"
+        "def test_catches():\n    assert f(1) == 2\n"
+    )
+    worker = IsolatedMutantWorker(
+        str(tmp_path), ["test_t.py::test_never_reached"], "t.py", "f"
+    )
+    try:
+        r = worker.evaluate(
+            "def f(x):\n    return x - 1\n",
+            30.0,
+            node_ids=["test_t.py::test_catches"],
+        )
+        assert mutant_verdict(r.outcome) == "killed"
+        assert r.killed_by == "assertion"
+    finally:
+        worker.close()

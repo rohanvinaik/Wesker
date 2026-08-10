@@ -19,6 +19,7 @@ The mutant-installation and node-ID lifecycle that run INSIDE the worker build o
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import json
 import os
@@ -29,6 +30,24 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
+
+# Names whose presence in a test's OWN source marks a shape the in_process fast mode cannot contain
+# (#19). Matched against AST Name/Attribute identifiers, never raw text — a string literal or comment
+# that merely mentions "subprocess" must not refuse a hermetic test. Deliberately broad within each
+# group: over-refusal routes a test to the always-sound isolated mode, the safe direction.
+_SUBPROCESS_NAMES = frozenset(
+    {
+        "subprocess",
+        "multiprocessing",
+        "Popen",
+        "fork",
+        "forkpty",
+        "posix_spawn",
+        "posix_spawnp",
+    }
+)
+_THREAD_NAMES = frozenset({"threading", "_thread", "Thread", "start_new_thread"})
+_SIGNAL_NAMES = frozenset({"signal", "setitimer", "sigwait", "pthread_kill"})
 
 
 def isolated_test_outcome(returncode: int, timed_out: bool) -> str:
@@ -352,6 +371,96 @@ def baseline_determinism(
     if set(coverage_a) != set(coverage_b):
         return "nondeterministic"
     return "deterministic"
+
+
+def hazards_from_names(names: list[str], parseable: bool) -> list[str]:
+    """Which fast-mode SHAPE hazards a set of referenced names reveals (#19, pure — pinned).
+
+    The DECISION half of :func:`scan_source_hazards`, split out to be pinnable: the AST walk that
+    collects the names is plumbing over `ast` objects `--input` cannot express, but the name-set ->
+    hazard mapping is a total function over ``list[str]``/``bool``. Returns the sorted subset of
+    {spawns_subprocess, starts_background_thread, signal_main_thread} present. ``parseable`` False
+    means the source could not be read at all, so every source-detectable hazard is reported — a scan
+    that cannot read the test must not silently clear it (over-refusal is the safe direction: the
+    isolated mode measures it soundly regardless).
+    """
+    if not parseable:
+        return ["signal_main_thread", "spawns_subprocess", "starts_background_thread"]
+    nameset = set(names)
+    hazards: list[str] = []
+    if nameset & _SUBPROCESS_NAMES:
+        hazards.append("spawns_subprocess")
+    if nameset & _THREAD_NAMES:
+        hazards.append("starts_background_thread")
+    if nameset & _SIGNAL_NAMES:
+        hazards.append("signal_main_thread")
+    return sorted(hazards)
+
+
+def scan_source_hazards(source: str) -> list[str]:
+    """Names the fast-mode SHAPE hazards a test's own source reveals (#19; AST-walk plumbing).
+
+    An AST walk, NOT a text scan: a `subprocess` named only in a comment, docstring, or string
+    literal must not refuse a hermetic test — only a real `Name`/`Attribute` reference counts (the
+    same discipline the repo's grep ban encodes). The walk over `ast` objects is not input-synthesis
+    pinnable, so it is hand-tested; the pinned decision it feeds is :func:`hazards_from_names`.
+    `custom_collector` and `stateful_fixture` come from the pytest item, not the source, and are
+    decided at bind time.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return hazards_from_names([], parseable=False)
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            names.add(node.attr)
+            if isinstance(node.value, ast.Name):
+                names.add(node.value.id)
+        elif isinstance(node, ast.Name):
+            names.add(node.id)
+    return hazards_from_names(sorted(names), parseable=True)
+
+
+#: The shape facts `fast_mode_standing` consumes, in its parameter order — the key set of the
+#: `__wesker_shape__` tag and the argument names, kept identical so `fast_mode_standing(**facts)` binds.
+_SHAPE_KEYS = (
+    "spawns_subprocess",
+    "starts_background_thread",
+    "custom_collector",
+    "signal_main_thread",
+    "stateful_fixture",
+)
+
+
+def callable_shape_hazards(call: Any) -> dict[str, bool]:
+    """The fast-mode shape facts stamped on a discovered test callable (#19).
+
+    Accessor of the ``__wesker_shape__`` tag ``pytest_discovery`` stamps at collection, where the
+    live pytest item is in scope. Absent — a callable from the live-session path, an inline synthesis
+    callable, or any non-discovery source — every hazard defaults False (hermetic): those paths carry
+    no shape signal and must not be refused on a missing tag. A declaration may have overwritten a
+    detected value; this reads whatever stands.
+    """
+    stamped = getattr(call, "__wesker_shape__", None)
+    if not isinstance(stamped, dict):
+        return dict.fromkeys(_SHAPE_KEYS, False)
+    return {k: bool(stamped.get(k, False)) for k in _SHAPE_KEYS}
+
+
+def scope_fast_mode_standing(standings: list[str]) -> str:
+    """The fast-mode standing of a WHOLE scoped test set (#19, pure — pinned).
+
+    in_process is gateable only if EVERY covering test is hermetic: one hazardous test can leave
+    state, a live thread, or an unreaped subprocess that perturbs the others' measurement in the
+    shared interpreter. So the scope is ``hermetic`` only when all are; otherwise it takes the FIRST
+    refusal, so the hazard is NAMED rather than merely counted. An empty scope is ``hermetic`` —
+    nothing runs that could escape containment.
+    """
+    for standing in standings:
+        if standing != "hermetic":
+            return standing
+    return "hermetic"
 
 
 class IsolatedMutantWorker:

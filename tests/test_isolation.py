@@ -541,3 +541,139 @@ def test_a_flipped_outcome_or_shifted_coverage_is_nondeterministic():
         baseline_determinism([1, 2], "passed", [1, 2, 3], "passed")
         == "nondeterministic"
     )
+
+
+# ── shape detection + the in_process gateability flip (increment 5b) ─────────────
+#
+# The impure half: detect hazards at collection, and make a non-hermetic in_process result
+# non-gateable. This is where "conditional" (4c) finally gets teeth.
+
+
+def test_the_scan_reads_the_ast_not_the_text():
+    """THE load-bearing property of the detector: a hazard named only in a comment, docstring, or
+    string literal is NOT a real reference and must not refuse a hermetic test. A real call does."""
+    from Wesker.isolation import scan_source_hazards
+
+    assert scan_source_hazards("def t():\n    subprocess.run(['x'])\n") == [
+        "spawns_subprocess"
+    ]
+    assert scan_source_hazards("def t():\n    threading.Thread()\n") == [
+        "starts_background_thread"
+    ]
+    assert scan_source_hazards("def t():\n    signal.signal(2, 0)\n") == [
+        "signal_main_thread"
+    ]
+    # subprocess mentioned only in a docstring / comment / string — no AST reference, no refusal.
+    assert (
+        scan_source_hazards(
+            'def t():\n    "uses subprocess and threading"\n    return 1\n'
+        )
+        == []
+    )
+    assert (
+        scan_source_hazards("def t():\n    x = 'signal'  # subprocess threading\n")
+        == []
+    )
+    # a clean test clears; unparseable is conservatively refused on every source-detectable hazard.
+    assert scan_source_hazards("def t():\n    assert 1 == 2\n") == []
+    assert scan_source_hazards("def (:") == [
+        "signal_main_thread",
+        "spawns_subprocess",
+        "starts_background_thread",
+    ]
+
+
+def test_hazards_from_names_and_scope_intent():
+    from Wesker.isolation import hazards_from_names, scope_fast_mode_standing
+
+    assert hazards_from_names(["os", "subprocess"], True) == ["spawns_subprocess"]
+    assert hazards_from_names([], False) == [
+        "signal_main_thread",
+        "spawns_subprocess",
+        "starts_background_thread",
+    ]
+    # the scope is hermetic only if every test is; else the first refusal names the hazard.
+    assert scope_fast_mode_standing(["hermetic", "hermetic"]) == "hermetic"
+    assert scope_fast_mode_standing(["hermetic", "refuse_thread"]) == "refuse_thread"
+    assert scope_fast_mode_standing([]) == "hermetic"
+
+
+def test_the_accessor_defaults_hermetic_without_a_stamp():
+    """A callable from the live-session path or an inline synthesis callable carries no shape stamp;
+    it must read hermetic, not be refused on a missing tag."""
+    from Wesker.isolation import callable_shape_hazards
+
+    def bare():
+        pass
+
+    assert callable_shape_hazards(bare) == {
+        "spawns_subprocess": False,
+        "starts_background_thread": False,
+        "custom_collector": False,
+        "signal_main_thread": False,
+        "stateful_fixture": False,
+    }
+    bare.__wesker_shape__ = {"spawns_subprocess": True}
+    assert callable_shape_hazards(bare)["spawns_subprocess"] is True
+
+
+def test_collection_stamps_the_shape_a_test_reveals(tmp_path):
+    """End-to-end detection: pytest collection stamps `__wesker_shape__` from the test's own source,
+    where the live item is in scope."""
+    from Wesker.isolation import callable_shape_hazards
+    from Wesker.pytest_discovery import collect_pytest_callables
+
+    (tmp_path / "test_shapes.py").write_text(
+        "import subprocess\n\n\n"
+        "def test_spawns():\n    subprocess.run(['true'])\n\n\n"
+        "def test_clean():\n    assert 1 + 1 == 2\n"
+    )
+    cbs = collect_pytest_callables(str(tmp_path), [str(tmp_path)])
+    assert cbs is not None
+    shapes = {getattr(c, "__qualname__", ""): callable_shape_hazards(c) for c in cbs}
+    spawns = next(v for k, v in shapes.items() if "test_spawns" in k)
+    clean = next(v for k, v in shapes.items() if "test_clean" in k)
+    assert spawns["spawns_subprocess"] is True
+    assert clean["spawns_subprocess"] is False
+
+
+def test_in_process_gateability_now_requires_hermetic_shapes(tmp_path):
+    """THE increment-5 payoff: a non-hermetic in_process result is no longer gateable, and NAMES the
+    hazard; a hermetic one still gates conditionally; the isolated mode contains any shape, so its
+    gateability is untouched. This is 'conditional' getting its teeth."""
+    from Wesker.ci import _PROJECT_ROOT
+    from Wesker.engine import run_function_profiling
+    from Wesker.filter import filter_categories
+
+    node, func_obj, tests = _real_project(tmp_path)
+    try:
+        cats = filter_categories(node)
+        token = _PROJECT_ROOT.set(str(tmp_path))
+        try:
+            clean = run_function_profiling(
+                node, "m.py::in_range", cats, tests, func_obj
+            )
+            assert clean.fast_mode == "hermetic"
+            assert clean.is_gateable is True
+            assert clean.execution_standing == "conditional"
+
+            # Stamp one covering test as spawning a subprocess: the whole in_process scope refuses.
+            tests[0].__wesker_shape__ = {"spawns_subprocess": True}
+            hazardous = run_function_profiling(
+                node, "m.py::in_range", cats, tests, func_obj
+            )
+            assert hazardous.fast_mode == "refuse_subprocess"
+            assert hazardous.is_gateable is False
+            assert hazardous.execution_standing == "cut"
+            assert hazardous.to_dict()["fast_mode"] == "refuse_subprocess"
+
+            # The isolated mode kills a whole process — shape is irrelevant, gateability untouched.
+            iso = run_function_profiling(
+                node, "m.py::in_range", cats, tests, func_obj, isolated=True
+            )
+            assert iso.fast_mode == "n/a"
+            assert iso.is_gateable is True
+        finally:
+            _PROJECT_ROOT.reset(token)
+    finally:
+        _drop_project(tmp_path)

@@ -34,8 +34,11 @@ from .line_coverage import trace_suite as _trace_suite
 from .isolation import (
     IsolatedMutantWorker,
     IsolatedRun,
+    callable_shape_hazards,
     execution_mode_standing,
+    fast_mode_standing,
     mutant_verdict,
+    scope_fast_mode_standing,
     should_recycle,
 )
 from .tce import WARRANT_BYTECODE, nodes_equivalent
@@ -391,6 +394,12 @@ class ProfilingResult:
     #: runaway thread to stop. `execution_mode_standing` maps this + containment to a gateability tier
     #: (Detective #60 consumes it). Defaults "in_process" so every existing construction keeps meaning.
     execution_mode: str = "in_process"
+    #: The fast-mode SHAPE standing over this function's covering tests (#19): "hermetic" when every
+    #: in_process-measured test is containable, "refuse_<hazard>" naming the first that is not, or
+    #: "n/a" under the isolated mode (a whole process is killable, so shape is irrelevant). A
+    #: "refuse_*" here is why an in_process result is not gateable — the NAMED refusal the issue asks
+    #: for. Default "n/a" leaves every existing construction (and the isolated path) unaffected.
+    fast_mode: str = "n/a"
     is_gateable: bool = True
     # Module names the LIVE collection resolved to more than one file (#58). Non-empty means
     # the measurement may be perfectly counted and still be about the wrong copy of the code,
@@ -601,6 +610,7 @@ class ProfilingResult:
             "effective_kill_pct": effective_kill_pct,
             "coverage_depth": self.coverage_depth,
             "execution_mode": self.execution_mode,
+            "fast_mode": self.fast_mode,
             "execution_standing": self.execution_standing,
             "is_gateable": self.is_gateable,
             "budget_exhausted": self.budget_exhausted,
@@ -3948,6 +3958,7 @@ def _measurement_gateable(
     all_contained: bool,
     budget_ok: bool,
     identity_unambiguous: bool = True,
+    fast_shape_ok: bool = True,
 ) -> bool:
     """Whether a profiling result may gate a downstream verdict (COMPLETE, auto-apply, CI).
 
@@ -3956,13 +3967,22 @@ def _measurement_gateable(
     worker could not be stopped (#14). ``budget_ok`` is False when the aggregate or memory budget
     was cut (#13). ``identity_unambiguous`` is False when the live collection resolved a dotted
     module name to more than one file (#58) — the counts may be perfectly measured and still be
-    about the wrong copy of the code, which no other conjunct here can see. Any one False makes
-    the counts a floor, not a verdict.
+    about the wrong copy of the code, which no other conjunct here can see. ``fast_shape_ok`` is
+    False when this ran in the in_process FAST mode over a NON-hermetic test shape (#19) — a
+    subprocess/thread/signal/custom-collector the mode's thread-abandon cannot contain — so the
+    counts may be perturbed by state the run could not isolate; the isolated mode passes True here
+    because a whole process is killable. Any one False makes the counts a floor, not a verdict.
 
-    Defaults True so a caller that has not OBSERVED identity keeps its previous meaning; an
+    Defaults True so a caller that has not OBSERVED a conjunct keeps its previous meaning; an
     unasked question must not become a refusal.
     """
-    return base_gateable and all_contained and budget_ok and identity_unambiguous
+    return (
+        base_gateable
+        and all_contained
+        and budget_ok
+        and identity_unambiguous
+        and fast_shape_ok
+    )
 
 
 def _measure_scoped_baseline(
@@ -5157,6 +5177,21 @@ def run_function_profiling(
     # own answer about module identity, not a reconstruction of it.
     _identity_standing, _identity_conflicts = _live_collection_identity()
 
+    # Fast-mode SHAPE gate (#19): the in_process mode contains a runaway only by asking a thread to
+    # stop, so it is gateable only over HERMETIC covering tests; a subprocess/thread/signal/
+    # custom-collector shape it cannot contain refuses the whole scope. The isolated mode kills a
+    # whole process, so shape is irrelevant there — it is "n/a" and always passes the gate. Computed
+    # once over the discovered tests from the shape stamped at collection (an inline/legacy callable
+    # carries no stamp and reads hermetic — those paths have no shape signal to refuse on).
+    if isolated:
+        _fast_mode = "n/a"
+        _fast_shape_ok = True
+    else:
+        _fast_mode = scope_fast_mode_standing(
+            [fast_mode_standing(**callable_shape_hazards(t)) for t in test_functions]
+        )
+        _fast_shape_ok = _fast_mode == "hermetic"
+
     # The per-TestId outcome-qualified ledger (#17), from the SAME failed/truncated sets `_barred`
     # is built from, so the typed view and the derived `admissible_line_coverage` cannot disagree.
     # Containment is measurement-wide (absorbing), so it is stamped on every item. (The converged
@@ -5180,7 +5215,11 @@ def run_function_profiling(
         killed_records=killed_records,
         budget_exhausted=budget_exhausted,
         is_gateable=_measurement_gateable(
-            True, _contained, not budget_exhausted, _identity_standing != "ambiguous"
+            True,
+            _contained,
+            not budget_exhausted,
+            _identity_standing != "ambiguous",
+            _fast_shape_ok,
         ),
         collection_conflicts=_identity_conflicts,
         # A cut is any invalid measurement — budget overrun OR an uncontained worker (#13/#14),
@@ -5193,6 +5232,9 @@ def run_function_profiling(
         # can only ASK a runaway thread to stop. `execution_mode_standing` (4c) turns this into a
         # gateability tier; Detective #60 consumes it.
         execution_mode="isolated" if isolated else "in_process",
+        # The NAMED fast-mode shape standing (#19): why an in_process result is (not) gateable — a
+        # "refuse_<hazard>" is the explicit refusal the issue asks for, "n/a" under isolated.
+        fast_mode=_fast_mode,
         elapsed_ms=_elapsed(start),
         line_coverage=line_cov,
         admissible_line_coverage=_admissible_coverage(line_cov, _barred),

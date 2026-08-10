@@ -129,6 +129,39 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
                 runnable.__wesker_origin__ = str(origin)  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         return runnable
 
+    def _tag_shape(
+        runnable: Callable[..., Any], it: Any, source_obj: Any
+    ) -> Callable[..., Any]:
+        # Fast-mode shape facts (#19), stamped where the pytest item is live. Source hazards come
+        # from an AST scan of the test's OWN source — a helper it calls that spawns a subprocess is
+        # invisible here (documented; over-refusal on what IS visible stays sound). `stateful_fixture`
+        # is False by construction: `_bind_item` skips any test needing a runtime fixture, so bound
+        # callables are fixture-free (an autouse SESSION fixture is a known gap). Source that cannot
+        # be read is treated as unclearable — every source-detectable hazard is flagged.
+        from Wesker.isolation import _SHAPE_KEYS, scan_source_hazards
+
+        shape = dict.fromkeys(_SHAPE_KEYS, False)
+        real = getattr(source_obj, "__wrapped__", source_obj)
+        try:
+            src: str | None = inspect.getsource(real)
+        except (OSError, TypeError):
+            src = None
+        detected = (
+            scan_source_hazards(src)
+            if src is not None
+            else ["signal_main_thread", "spawns_subprocess", "starts_background_thread"]
+        )
+        for hazard in detected:
+            shape[hazard] = True
+        # A standard test item is `Function`; a unittest method `TestCaseFunction`. Anything else is
+        # a custom collector whose lifecycle the in_process fast mode cannot assume it understands.
+        if type(it).__name__ not in ("Function", "TestCaseFunction"):
+            shape["custom_collector"] = True
+        with contextlib.suppress(Exception):
+            # Dynamic tag: valid Python, absent from FunctionType's stub.
+            runnable.__wesker_shape__ = shape  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        return runnable
+
     callables: list[Callable[..., Any]] = []
     for it in items:
         cls = getattr(it, "cls", None)
@@ -138,7 +171,10 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
                 or str(getattr(it, "name", "")).split("[")[0]
             )
             if method:
-                callables.append(_tag_origin(make_tc_runner(cls, method), it))
+                runner = _tag_shape(
+                    make_tc_runner(cls, method), it, getattr(cls, method, None)
+                )
+                callables.append(_tag_origin(runner, it))
             continue
         fn = getattr(it, "function", None)
         if not callable(fn):
@@ -146,7 +182,7 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
         runnable = _bind_item(it, fn)
         if runnable is None:
             continue  # requires real runtime fixtures we can't supply in-process (v1)
-        callables.append(_tag_origin(runnable, it))
+        callables.append(_tag_origin(_tag_shape(runnable, it, fn), it))
     return callables
 
 

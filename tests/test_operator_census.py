@@ -70,6 +70,47 @@ def test_the_filter_agrees_with_the_census_by_construction():
         assert derived == filter_categories(node, pure)
 
 
+def test_the_profile_surfaces_the_operator_census_first_class():
+    """#22: the census is now a first-class field on EVERY profile, so what the policy withheld and
+    WHY is auditable per run — not only via a separate `category_census` query. A purity-asserted
+    constructor's suppressed receiver-state alternatives are NAMED on the result and in its JSON."""
+    from Wesker.engine import run_function_profiling
+
+    node = _ctor_node()
+    pure = run_function_profiling(
+        node,
+        "p.py::P.__init__",
+        filter_categories(node, is_pure=True),
+        [],
+        None,
+        is_pure=True,
+    )
+    assert pure.operator_census[MutationCategory.STATE]["disposition"] == "withheld"
+    d = pure.to_dict()
+    assert (
+        d["operator_census"][MutationCategory.STATE.value]["disposition"] == "withheld"
+    )
+    assert d["operator_census"][MutationCategory.STATE.value]["withheld"] == 2
+
+    # The control: without an asserted purity the same sites are generated, and the census agrees
+    # with the tested categories BY CONSTRUCTION (the filter derives from the census) on the profile.
+    plain = run_function_profiling(
+        node,
+        "p.py::P.__init__",
+        filter_categories(node, is_pure=False),
+        [],
+        None,
+        is_pure=False,
+    )
+    assert plain.operator_census[MutationCategory.STATE]["disposition"] == "generated"
+    generated = {
+        c
+        for c, row in plain.operator_census.items()
+        if row["disposition"] == "generated"
+    }
+    assert generated == filter_categories(node, is_pure=False)
+
+
 def test_partial_suppression_still_counts_as_generated():
     """`generated` wins when both are positive: policy removed some sites and the operator is
     still represented, so the universe is not missing it — while the withheld count travels

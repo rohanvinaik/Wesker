@@ -487,6 +487,12 @@ class ProfilingResult:
     # signal, not weak tests. -1 = not populated (older callers), so consumers can
     # tell "no tests" apart from "unknown". Prevents a silent, misleading 0%.
     tests_discovered: int = -1
+    # The candidate-operator policy census (#22): what the policy did to EVERY category on this
+    # target — generated, or withheld/not_applicable with a reason — so a reader can audit not just
+    # how many mutants ran but why the absent ones are absent (a purity-suppressed STATE alternative
+    # is a reviewable judgement, not a silent gap). Keyed by MutationCategory; empty on the converged
+    # path and any construction that does not supply it. Serialized (enum -> str) in to_dict.
+    operator_census: dict = field(default_factory=dict)
 
     # --- Value-specification view -------------------------------------------------
     # An assertion kill pins WHAT the function returns; a crash/timeout kill only proves
@@ -681,6 +687,12 @@ class ProfilingResult:
         # only, emitted when non-empty like the other record views, and never shrinking the universe.
         if self.empirical_redundancy_groups:
             d["empirical_redundancy_groups"] = self.empirical_redundancy_groups
+        # The candidate-operator policy census (#22): enum keys -> category names for JSON, emitted
+        # whenever present so a reader can audit what the policy did to every category on this target.
+        if self.operator_census:
+            d["operator_census"] = {
+                cat.value: row for cat, row in self.operator_census.items()
+            }
         if self.survivor_records:
             d["survivor_records"] = self.survivor_records
         # The value-unspecified set: true survivors PLUS crash/timeout kills. This is what a
@@ -4968,6 +4980,7 @@ def run_function_profiling(
     isolated: bool = False,
     check_determinism: bool = False,
     worker_mem_limit_mb: int | None = None,
+    is_pure: bool = False,
 ) -> ProfilingResult:
     """Profiling mode — generate mutants (exhaustive by default), evaluate with budget.
 
@@ -5349,6 +5362,14 @@ def run_function_profiling(
         replayed_ids=_replayed_ids,
     )
 
+    # The candidate-operator policy census (#22), a first-class field on every profile so what the
+    # policy withheld and WHY is auditable per run. Derived from the SAME `category_census` the
+    # category filter is (`filter.filter_categories`), so the census and the tested set cannot
+    # disagree. Local import: `filter` imports `MutationCategory` from this module.
+    from Wesker.filter import category_census
+
+    _operator_census = category_census(func_node, is_pure)
+
     return ProfilingResult(
         function_key=func_key,
         categories_tested=len(per_cat),
@@ -5396,6 +5417,7 @@ def run_function_profiling(
         executable_lines=exec_lines,
         failing_tests=failing,
         tests_discovered=len(test_functions),
+        operator_census=_operator_census,
         trace_truncated=sorted(_trace_truncated),
     )
 

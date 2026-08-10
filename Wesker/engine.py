@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, TypeGuard
 
 from .interrupt import abandon as _abandon
 from .line_coverage import admissible_coverage as _admissible_coverage
+from .line_coverage import arcs_from_trace as _arcs_from_trace
 from .line_coverage import coverage_from_trace as _coverage_from_trace
 from .line_coverage import executable_lines as _executable_lines
 from .line_coverage import failing_on_baseline as _failing_on_baseline
@@ -2438,6 +2439,7 @@ class SessionBaseline:
         "truncated",
         "inert_ids",
         "uncontained",
+        "arcs",
     )
 
     def __init__(
@@ -2449,12 +2451,17 @@ class SessionBaseline:
         truncated: set[str] | None = None,
         inert_ids: set[str] | None = None,
         uncontained: set[str] | None = None,
+        arcs: dict[str, dict[str, set[tuple[int, int]]]] | None = None,
     ) -> None:
         self.traced = traced
         self.failing = failing
         self.inert = inert
         self.n_tests = n_tests
         self.truncated = truncated or set()
+        # Per-TestId branch edges, keyed exactly like `traced` (#17). Empty on an older baseline or
+        # a build that did not request arcs; a consumer reads it as "no arc evidence", never as
+        # "no branch reached". Spliced by `affected` in `replaced`, since it is test-id-keyed.
+        self.arcs = arcs or {}
         # `inert` addressed by TEST ID rather than `id()` (issue #17). The `id()` form is a
         # fact about THIS heap and cannot key the traced map, which is why line completeness
         # was judged from a union that still contained baseline-failing tests: the engine knew
@@ -2501,6 +2508,10 @@ class SessionBaseline:
         """
         traced = {k: v for k, v in self.traced.items() if k not in affected}
         traced.update(partial.traced)
+        # Arcs splice exactly like `traced` — same test-id keys, same affected set — so a rewritten
+        # test's old branch edges drop with its old line trace and the re-measured ones take over.
+        arcs = {k: v for k, v in self.arcs.items() if k not in affected}
+        arcs.update(partial.arcs)
         return SessionBaseline(
             traced,
             [n for n in self.failing if n not in affected] + partial.failing,
@@ -2516,6 +2527,7 @@ class SessionBaseline:
             # retract it, and dropping the entry would let a rewritten file quietly restore
             # gateability to a session that is still hosting the thread.
             self.uncontained | partial.uncontained,
+            arcs,
         )
 
 
@@ -2728,6 +2740,9 @@ def build_session_baseline(
 
     truncated: set[str] = set()
     uncontained: set[str] = set()
+    # Branch edges alongside statements (#17), populated from the v4 cache cell on a hit and from a
+    # fresh trace on a miss — so a warm session carries arcs without re-tracing for them.
+    arcs: dict[str, dict[str, set[tuple[int, int]]]] = {}
     traced = _trace_suite(
         test_functions,
         target_files,
@@ -2737,6 +2752,7 @@ def build_session_baseline(
         trace_session_budget_s,
         cache,
         uncontained,
+        arcs,
     )
     failing: list[str] = []
     inert: set[int] = set()
@@ -2788,6 +2804,7 @@ def build_session_baseline(
         truncated,
         set(cached_inert),
         uncontained,
+        arcs,
     )
 
 
@@ -2913,6 +2930,7 @@ def _build_test_scope(
     trace_progress: Callable[[int, int, float], None] | None = None,
     trace_session_budget_s: float | None = None,
     uncontained: set[str] | None = None,
+    arcs_out: dict[str, list[tuple[int, int]]] | None = None,
 ) -> tuple[
     Callable[[Mutant], list[Callable[..., None]]],
     dict[str, list[int]],
@@ -2975,6 +2993,14 @@ def _build_test_scope(
         line_cov = _coverage_from_trace(
             session.traced, target_file or "", set(exec_lines)
         )
+        # Arcs come from the SAME session baseline, filtered to this function's lines (#17). Only
+        # the session path carries them — a precomputed-probe or per-function trace has no arc
+        # map — so a consumer that asked for arcs but hit those paths reads an empty ledger, not
+        # a false "no branch reached".
+        if arcs_out is not None:
+            arcs_out.update(
+                _arcs_from_trace(session.arcs, target_file or "", set(exec_lines))
+            )
         failing = session.failing
         inert = session.inert
         if truncated is not None:
@@ -4759,6 +4785,7 @@ def run_function_profiling(
 
     _trace_truncated: set[str] = set()
     _baseline_uncontained: set[str] = set()
+    _arc_cov: dict[str, list[tuple[int, int]]] = {}
     _tests_for, line_cov, exec_lines, failing = _build_test_scope(
         func_node,
         test_functions,
@@ -4771,6 +4798,7 @@ def run_function_profiling(
         trace_progress,
         trace_session_budget_s,
         _baseline_uncontained,
+        _arc_cov,
     )
 
     # Live baseline for the adaptive per-mutant allowance (#13): time the ORIGINAL over the tests
@@ -4971,7 +4999,9 @@ def run_function_profiling(
     # entry point emits no per-TestId line data, so it carries no ledger — nothing is lost there.)
     _failed_ids = _sb.inert_ids if _sb is not None else set(failing)
     _truncated_ids = _sb.truncated if _sb is not None else set(_trace_truncated)
-    _evidence = build_trace_ledger(line_cov, _failed_ids, _truncated_ids, _contained)
+    _evidence = build_trace_ledger(
+        line_cov, _failed_ids, _truncated_ids, _contained, arc_coverage=_arc_cov
+    )
 
     return ProfilingResult(
         function_key=func_key,

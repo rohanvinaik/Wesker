@@ -60,7 +60,13 @@ _VERSION = (
     # missing its match, every previously-inert test silently readmitted to kill attribution.
     # A misread is worse than a miss: the miss costs one cold trace, the misread is wrong and
     # says nothing. This is the case the version field exists for.
-    3  # the on-disk shape; bump to orphan every prior entry rather than misread one
+    #
+    # 4 (issue #17): each per-file cell went from a bare `[lines]` to `{"lines": [...], "arcs":
+    # [[a,b],...]}` so a warm cache carries branch edges, not only statements. A v3 cell is a
+    # list, a v4 cell a dict, so a v3 file loaded under v4 would raise the moment `trace_suite`
+    # read `cell["lines"]` — the version bump orphans every v3 entry so it re-traces once under
+    # the new shape rather than crashing on the old one.
+    4  # the on-disk shape; bump to orphan every prior entry rather than misread one
 )
 
 
@@ -179,7 +185,7 @@ def save(
     project_root: str,
     targets: str,
     budgets: tuple[float | None, float | None],
-    entries: dict[str, dict[str, list[int]]],
+    entries: dict[str, dict[str, Any]],
     failing: list[str],
     inert_names: list[str],
 ) -> None:

@@ -165,3 +165,47 @@ def test_arc_capture_is_off_by_default():
 
     _hits, _cut, _contained, arcs = _trace_one_multi(_noop, set(), capture_arcs=False)
     assert arcs == {}
+
+
+def test_arcs_auto_populate_a_profiling_result_through_the_session_baseline(tmp_path):
+    """The session-baseline auto-wiring (#17): a profile run under a live session carries arcs in
+    every trace_evidence entry, and `admissible_arc_union` leaves the failing test's branch edge
+    OUT — the whole chain (session baseline → _build_test_scope → ledger), not just the tracer."""
+    (tmp_path / "arcapp.py").write_text(
+        "def choose(flag):\n    if flag:\n        return 1\n    return 0\n"
+    )
+    (tmp_path / "test_arcapp.py").write_text(
+        "from arcapp import choose\n\n\n"
+        "def test_true():\n    assert choose(True) == 1\n\n\n"
+        "def test_false_fails():\n    assert choose(False) == 1\n"
+    )
+    for name in ("arcapp", "test_arcapp"):
+        sys.modules.pop(name, None)
+
+    from Wesker.ci import run_with_live_suite
+
+    seen: dict = {}
+
+    def _body():
+        from Detective.engine import profile
+
+        r = profile("arcapp.py", "choose", str(tmp_path))
+        seen["by_id"] = {ev.test_id.rsplit("::", 1)[-1]: ev for ev in r.trace_evidence}
+        seen["adm_arcs"] = set(r.admissible_arc_union)
+
+    cwd = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        run_with_live_suite(str(tmp_path), _body, target_files=["arcapp.py"])
+    finally:
+        os.chdir(cwd)
+
+    by_id = seen["by_id"]
+    assert by_id["test_true"].arcs == ((2, 3),), (
+        "the green owner's True-edge arc is missing"
+    )
+    assert by_id["test_false_fails"].arcs == ((2, 4),)  # observed, but inadmissible
+    assert (2, 3) in seen["adm_arcs"], "the admissible True edge is absent"
+    assert (2, 4) not in seen["adm_arcs"], (
+        "a failing test's arc closed a branch obligation — #17"
+    )

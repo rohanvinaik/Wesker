@@ -368,7 +368,7 @@ def trace_suite(
     truncated: set[str] | None = None,
     progress: Callable[[int, int, float], None] | None = None,
     session_budget_s: float | None = None,
-    cache: dict[str, dict[str, list[int]]] | None = None,
+    cache: dict[str, dict[str, Any]] | None = None,
     uncontained: set[str] | None = None,
     arcs_out: dict[str, dict[str, set[tuple[int, int]]]] | None = None,
 ) -> dict[str, dict[str, set[int]]]:
@@ -456,21 +456,24 @@ def trace_suite(
             if truncated is not None:
                 truncated.update(callable_test_id(t) for t in test_functions[i:])
             break
-        # An arc run bypasses the LINE cache entirely (#17): the v3 cache stores only lines, so a
-        # hit would yield no arcs — an under-counted arc ledger that reads as a false branch gap.
-        # Forcing `fp = None` means arc runs neither read nor write the line cache, so they always
-        # trace fresh AND leave the line cache pure for the ordinary (cache-warm) profiling path.
-        want_arcs = arcs_out is not None
-        fp = (
-            test_fingerprint(test_fn) if (cache is not None and not want_arcs) else None
-        )
+        # Arcs travel WITH lines in the v4 cache cell (#17): `{file: {"lines": [...], "arcs":
+        # [[a,b],...]}}`. Capture is ALWAYS on so a warm cache is always complete — bypassing the
+        # cache to obtain arcs would re-trace the whole suite every session, the 11-minute cost
+        # this cache exists to remove. Arcs are only EXPOSED when a caller passes `arcs_out`; the
+        # cost of carrying them in the cell is the branch obligations #17 owns.
+        fp = test_fingerprint(test_fn) if cache is not None else None
         hit = cache.get(fp) if (cache is not None and fp is not None) else None
         arc_file: dict[str, set[tuple[int, int]]] = {}
         if hit is not None:
             # Measured before, by this engine, on these target files, under these budgets. The
             # trace is function-independent, so re-running it cannot produce a different answer —
-            # only the same one, slower.
-            per_file, was_cut = {f: set(v) for f, v in hit.items()}, False
+            # only the same one, slower. Cell is the v4 dict; `.get` on `arcs` tolerates a cell an
+            # older path may have written without one.
+            per_file = {f: set(cell["lines"]) for f, cell in hit.items()}
+            arc_file = {
+                f: {tuple(a) for a in cell.get("arcs", ())} for f, cell in hit.items()
+            }
+            was_cut = False
         else:
             # The redirect isolates the TEST's own stdout/stderr and must wrap the test ONLY —
             # not the loop. Wrapped around the loop it also swallows `progress`, which reports on
@@ -481,7 +484,7 @@ def trace_suite(
                 contextlib.redirect_stderr(io.StringIO()),
             ):
                 per_file, was_cut, contained, arc_file = _trace_one_multi(
-                    test_fn, target_files, budget_s, capture_arcs=want_arcs
+                    test_fn, target_files, budget_s, capture_arcs=True
                 )
             # See `trace_line_coverage`: an unstoppable worker is not an ordinary cut (#19).
             if not contained and uncontained is not None:
@@ -490,13 +493,19 @@ def trace_suite(
                 # NOT when cut: a truncated trace is under-counted, and downstream that is
                 # indistinguishable from "no test reaches this line". Storing it would make one
                 # slow afternoon a permanent false gap.
-                cache[fp] = {f: sorted(v) for f, v in per_file.items()}
+                cache[fp] = {
+                    f: {
+                        "lines": sorted(per_file[f]),
+                        "arcs": sorted(list(a) for a in arc_file.get(f, ())),
+                    }
+                    for f in per_file
+                }
         if was_cut and truncated is not None:
             truncated.add(name)
         bucket = out.setdefault(name, {})
         for f, lines in per_file.items():
             bucket[f] = bucket.get(f, set()) | lines
-        if want_arcs:
+        if arcs_out is not None:
             abucket = arcs_out.setdefault(name, {})
             for f, aset in arc_file.items():
                 abucket[f] = abucket.get(f, set()) | aset
@@ -623,6 +632,61 @@ def coverage_from_trace(
 
     return {
         name: sorted(_lines_for(files) & exec_lines) for name, files in traced.items()
+    }
+
+
+def arcs_from_trace(
+    traced_arcs: dict[str, dict[str, set[tuple[int, int]]]],
+    target_file: str,
+    exec_lines: set[int],
+) -> dict[str, list[tuple[int, int]]]:
+    """One function's view of a :func:`trace_suite` ARC result (#17) — the per-function filter.
+
+    The arc sibling of :func:`coverage_from_trace`: same file-identity resolution (a persisted
+    trace may key the target under a symlink/case spelling), then keep only the arcs BOTH of whose
+    endpoints lie in the function's executable lines. A cross-boundary arc — into or out of the
+    function via a call or return — is not one of ITS branch edges, so it is dropped rather than
+    attributed to the function it merely entered or left.
+    """
+    if not target_file or not exec_lines:
+        return {}
+    aliases: list[str] = []
+    try:
+        st = os.stat(target_file)
+    except OSError:
+        st = None
+    if st is not None:
+        target_id = (st.st_dev, st.st_ino)
+        checked: set[str] = {target_file}
+        for files in traced_arcs.values():
+            for key in files:
+                if key in checked:
+                    continue
+                checked.add(key)
+                try:
+                    kst = os.stat(key)
+                except OSError:
+                    continue
+                if (kst.st_dev, kst.st_ino) == target_id:
+                    aliases.append(key)
+
+    def _arcs_for(files: dict[str, set[tuple[int, int]]]) -> set[tuple[int, int]]:
+        got = files.get(target_file)
+        if got is not None:
+            return got
+        for key in aliases:
+            got = files.get(key)
+            if got is not None:
+                return got
+        return set()
+
+    return {
+        name: sorted(
+            arc
+            for arc in _arcs_for(files)
+            if arc[0] in exec_lines and arc[1] in exec_lines
+        )
+        for name, files in traced_arcs.items()
     }
 
 

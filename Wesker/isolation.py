@@ -270,6 +270,31 @@ def should_recycle(evaluated: int, max_per_worker: int) -> bool:
     return max_per_worker > 0 and evaluated >= max_per_worker
 
 
+def execution_mode_standing(execution_mode: str, measurement_gateable: bool) -> str:
+    """The gateability TIER a profiling result earns from its execution mode (#19, pure — pinned).
+
+    `measurement_gateable` is the result's existing measurement-level validity (`is_gateable`:
+    contained, in-budget, unambiguous identity, exhaustive depth). The standing layers the mode on
+    top of it, and it is INFORMATIONAL — it does not change `is_gateable`, so no in-process
+    certificate is downgraded before the fast-mode shape check (increment 5) gives "conditional" its
+    teeth.
+
+    * ``cut`` — the measurement is not valid to gate on for ANY reason the existing conjunction
+      already names (an uncontained worker, a cut budget, an ambiguous module identity). The mode
+      cannot rescue an invalid measurement, so this is checked first.
+    * ``gateable`` — measured under ``isolated``, where containment is a real SIGKILL guarantee: the
+      counts may gate a downstream verdict outright.
+    * ``conditional`` — measured under ``in_process``, where a runaway can only be ASKED to stop.
+      The counts are valid, but the mode's containment is best-effort, so gating is conditional on
+      the hermetic-shape check that increment 5 will require. Until then this is a label, not a gate.
+    """
+    if not measurement_gateable:
+        return "cut"
+    if execution_mode == "isolated":
+        return "gateable"
+    return "conditional"
+
+
 class IsolatedMutantWorker:
     """A PERSISTENT isolated worker evaluating many mutants in one interpreter (#19).
 

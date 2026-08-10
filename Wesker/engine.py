@@ -34,6 +34,7 @@ from .line_coverage import trace_suite as _trace_suite
 from .isolation import (
     IsolatedMutantWorker,
     IsolatedRun,
+    execution_mode_standing,
     mutant_verdict,
     should_recycle,
 )
@@ -469,6 +470,18 @@ class ProfilingResult:
     # of record — any ProfilingResult, however constructed, reports the split correctly.
 
     @property
+    def execution_standing(self) -> str:
+        """The gateability tier this result earns from its execution mode (#19).
+
+        `isolated` + a valid measurement -> "gateable"; `in_process` + valid -> "conditional"
+        (the counts hold, but in-process containment is best-effort — increment 5's shape check is
+        what will let it gate); an invalid measurement -> "cut". Derived, never stored, so it cannot
+        drift from `execution_mode`/`is_gateable`; INFORMATIONAL — it does not change `is_gateable`,
+        so no in-process certificate is downgraded before that shape check lands.
+        """
+        return execution_mode_standing(self.execution_mode, self.is_gateable)
+
+    @property
     def value_killed(self) -> int:
         """Mutants whose return value is pinned — assertion kills only."""
         return sum(cr.value_killed for cr in self.per_category)
@@ -588,6 +601,7 @@ class ProfilingResult:
             "effective_kill_pct": effective_kill_pct,
             "coverage_depth": self.coverage_depth,
             "execution_mode": self.execution_mode,
+            "execution_standing": self.execution_standing,
             "is_gateable": self.is_gateable,
             "budget_exhausted": self.budget_exhausted,
             "elapsed_ms": round(self.elapsed_ms, 1),

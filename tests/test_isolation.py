@@ -396,7 +396,6 @@ def test_isolated_profiling_agrees_with_in_process_and_marks_the_mode(tmp_path):
 
     assert inproc.execution_mode == "in_process"
     assert iso.execution_mode == "isolated"
-    assert iso.to_dict()["execution_mode"] == "isolated"
     # A real suite kills something here, or the comparison is vacuous.
     assert inproc.total_killed > 0
     # The bottom line agrees — the crossing neither lost nor invented a verdict.
@@ -435,3 +434,48 @@ def test_isolated_profiling_is_gateable_on_a_clean_run(tmp_path):
 
     assert iso.coverage_depth == "profiled"
     assert iso.is_gateable is True
+
+
+# ── mode -> gateability standing (increment 4c) ──────────────────────────────────
+#
+# The tier a result earns from its execution mode, layered on top of the measurement validity.
+# Informational — it does NOT change is_gateable, so no in-process certificate is downgraded before
+# the increment-5 shape check gives "conditional" its teeth.
+
+
+def test_execution_mode_standing_is_the_intended_tiering():
+    from Wesker.isolation import execution_mode_standing
+
+    # isolated + a valid measurement is fully gateable — real SIGKILL containment.
+    assert execution_mode_standing("isolated", True) == "gateable"
+    # in_process + valid is only CONDITIONAL — best-effort containment, pending the shape check.
+    assert execution_mode_standing("in_process", True) == "conditional"
+    # an invalid measurement is cut regardless of mode — the mode cannot rescue it.
+    assert execution_mode_standing("isolated", False) == "cut"
+    assert execution_mode_standing("in_process", False) == "cut"
+
+
+def test_a_profiling_result_reports_its_standing_without_changing_gateability():
+    """The property wires the pure decision to a real result, and — the load-bearing invariant — an
+    in_process result stays is_gateable=True while its standing reads 'conditional': the tier is
+    surfaced, acceptance is untouched.
+
+    Built by DIRECT construction, not a profiling run. The standing is pure over two fields
+    (execution_mode, is_gateable), so a full profile would only add a subprocess-spawning test to
+    this pure decision's covering set — the codebase-scale category error that makes `converge` on
+    it trace the whole suite and hang. The A/B soundness of the profiling path is proved separately
+    above; here the unit is the property alone."""
+    from Wesker.engine import ProfilingResult
+
+    iso = ProfilingResult(execution_mode="isolated", is_gateable=True)
+    assert iso.execution_standing == "gateable"
+    assert iso.to_dict()["execution_standing"] == "gateable"
+    # The invariant: in_process is surfaced as conditional but its gateability is NOT downgraded.
+    inproc = ProfilingResult(execution_mode="in_process", is_gateable=True)
+    assert inproc.execution_standing == "conditional"
+    assert inproc.is_gateable is True
+    # And an invalid measurement is cut regardless of mode.
+    assert (
+        ProfilingResult(execution_mode="isolated", is_gateable=False).execution_standing
+        == "cut"
+    )

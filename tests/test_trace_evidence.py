@@ -57,6 +57,47 @@ def test_containment_is_absorbing_and_checked_first():
     )
 
 
+def test_a_replayed_reach_is_routing_not_proof():
+    """#20: a green, contained, whole reach that was REPLAYED from the trace cache is still only
+    routing — cached reach is keyed by source, not the fixture/config context, so it may be stale
+    and must never close an admissible obligation. Checked last, after the measurement-validity
+    refusals: a replay of an otherwise-perfect observation is refused for proof."""
+    assert (
+        trace_admissibility(
+            baseline_passed=True, truncated=False, contained=True, fresh=False
+        )
+        == "refuse_replayed"
+    )
+    # Fresh keeps the pre-#20 meaning: a green, contained, whole, freshly-observed reach is proof.
+    assert (
+        trace_admissibility(
+            baseline_passed=True, truncated=False, contained=True, fresh=True
+        )
+        == "admissible"
+    )
+
+
+def test_the_ledger_keeps_a_replayed_owner_out_of_the_admissible_view():
+    """A replayed owner is RECORDED (routing still sees the reach) but marked inadmissible with
+    provenance, so it cannot silently become fresh admissible coverage."""
+    ledger = build_trace_ledger(
+        line_coverage={"t_fresh": [1, 2], "t_replayed": [3, 4]},
+        failed_ids=set(),
+        truncated_ids=set(),
+        contained=True,
+        replayed_ids={"t_replayed"},
+    )
+    by_id = {ev.test_id: ev for ev in ledger}
+    assert by_id["t_fresh"].provenance == "fresh"
+    assert by_id["t_fresh"].admissible is True
+    assert by_id["t_replayed"].provenance == "replayed"
+    assert by_id["t_replayed"].reason == "refuse_replayed"
+    assert by_id["t_replayed"].admissible is False
+    # The proof basis (admissible lines) rests only on the fresh owner; the replayed lines are out.
+    admissible_lines = {ln for ev in ledger if ev.admissible for ln in ev.lines}
+    assert admissible_lines == {1, 2}
+
+
 # ── the ledger: observed keeps everything, admissible keeps only proof ─────────────
 
 

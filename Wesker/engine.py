@@ -680,6 +680,7 @@ class ProfilingResult:
                     "contained": ev.contained,
                     "admissible": ev.admissible,
                     "reason": ev.reason,
+                    "provenance": ev.provenance,
                     **({"arcs": [list(a) for a in ev.arcs]} if ev.arcs else {}),
                 }
                 for ev in self.trace_evidence
@@ -2492,6 +2493,7 @@ class SessionBaseline:
         "inert_ids",
         "uncontained",
         "arcs",
+        "replayed",
     )
 
     def __init__(
@@ -2504,6 +2506,7 @@ class SessionBaseline:
         inert_ids: set[str] | None = None,
         uncontained: set[str] | None = None,
         arcs: dict[str, dict[str, set[tuple[int, int]]]] | None = None,
+        replayed: set[str] | None = None,
     ) -> None:
         self.traced = traced
         self.failing = failing
@@ -2527,6 +2530,11 @@ class SessionBaseline:
         # shares it. #14 made the mutation runner refuse to gate on that condition; the baseline
         # trace reached it through a path that discarded the answer.
         self.uncontained = uncontained or set()
+        # Tests whose reach was REPLAYED from the trace cache, not measured this session (#20). Kept
+        # apart from the freshly-traced ones so the proof view can refuse a replay (source-keyed reach
+        # can go stale under a fixture/config change) while routing still uses it. Empty on a cold
+        # cache or the pre-#20 path — nothing replayed means every trace is fresh and admissible.
+        self.replayed = replayed or set()
 
     def replaced(
         self,
@@ -2580,6 +2588,10 @@ class SessionBaseline:
             # gateability to a session that is still hosting the thread.
             self.uncontained | partial.uncontained,
             arcs,
+            # A re-traced test is FRESHLY measured, so it LEAVES `replayed` — spliced by `affected`
+            # like the other id-keyed sets. `partial.replayed` is a fresh miss (empty), so this just
+            # drops the re-measured names from the replay set, promoting them back to admissible (#20).
+            {n for n in self.replayed if n not in affected} | partial.replayed,
         )
 
 
@@ -2792,6 +2804,8 @@ def build_session_baseline(
 
     truncated: set[str] = set()
     uncontained: set[str] = set()
+    # Reach served from the cache, not measured this session (#20) — routing-usable, proof-inadmissible.
+    replayed: set[str] = set()
     # Branch edges alongside statements (#17), populated from the v4 cache cell on a hit and from a
     # fresh trace on a miss — so a warm session carries arcs without re-tracing for them.
     arcs: dict[str, dict[str, set[tuple[int, int]]]] = {}
@@ -2805,6 +2819,7 @@ def build_session_baseline(
         cache,
         uncontained,
         arcs,
+        replayed,
     )
     failing: list[str] = []
     inert: set[int] = set()
@@ -2857,6 +2872,7 @@ def build_session_baseline(
         set(cached_inert),
         uncontained,
         arcs,
+        replayed,
     )
 
 
@@ -5209,7 +5225,7 @@ def run_function_profiling(
     # `_trace_truncated` directly and those are the whole story.
     _sb = session_baseline()
     _barred = sorted(
-        (_sb.inert_ids | _sb.truncated)
+        (_sb.inert_ids | _sb.truncated | _sb.replayed)
         if _sb is not None
         else (set(failing) | set(_trace_truncated))
     )
@@ -5288,8 +5304,16 @@ def run_function_profiling(
     # entry point emits no per-TestId line data, so it carries no ledger — nothing is lost there.)
     _failed_ids = _sb.inert_ids if _sb is not None else set(failing)
     _truncated_ids = _sb.truncated if _sb is not None else set(_trace_truncated)
+    # Reach REPLAYED from the cache (#20): kept out of the admissible proof basis — a source-keyed
+    # cache hit is routing, not a trace observed this session. Empty without a live session.
+    _replayed_ids = _sb.replayed if _sb is not None else set()
     _evidence = build_trace_ledger(
-        line_cov, _failed_ids, _truncated_ids, _contained, arc_coverage=_arc_cov
+        line_cov,
+        _failed_ids,
+        _truncated_ids,
+        _contained,
+        arc_coverage=_arc_cov,
+        replayed_ids=_replayed_ids,
     )
 
     return ProfilingResult(

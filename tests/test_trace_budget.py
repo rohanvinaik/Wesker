@@ -238,3 +238,20 @@ def test_progress_is_not_swallowed_by_the_consumer_output_redirect():
     finally:
         sys.stderr = real
     assert written.getvalue().strip() == "1/2 2/2"
+
+
+def test_trace_suite_marks_a_cache_hit_as_replayed():
+    """#20: a cold trace is FRESH (a miss, measured now); a warm read of the same cache is REPLAYED —
+    routing-usable but proof-inadmissible. The provenance is what keeps cache reuse from becoming
+    fresh admissible coverage."""
+    from Wesker.trace_cache import test_fingerprint
+
+    cache: dict = {}
+    name = callable_test_id(_fast)
+    cold: set[str] = set()
+    trace_suite([_fast], {_FILE}, cache=cache, replayed=cold)
+    assert cold == set(), "a cold trace is freshly measured — nothing is replayed"
+    assert test_fingerprint(_fast) in cache, "the fresh trace warmed the cache"
+    warm: set[str] = set()
+    trace_suite([_fast], {_FILE}, cache=cache, replayed=warm)
+    assert warm == {name}, "the second read is served from cache -> replayed"

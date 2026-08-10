@@ -23,13 +23,16 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 
-def trace_admissibility(baseline_passed: bool, truncated: bool, contained: bool) -> str:
-    """Whether a baseline observation may discharge a proof obligation (#17, pure — pinned).
+def trace_admissibility(
+    baseline_passed: bool, truncated: bool, contained: bool, fresh: bool = True
+) -> str:
+    """Whether a baseline observation may discharge a proof obligation (#17/#20, pure — pinned).
 
-    Only a baseline-GREEN, CONTAINED, non-TRUNCATED observation is admissible; every other case
-    names WHY, because "the test failed", "its trace was cut", and "the measurement escaped
-    containment" are different facts a certificate and a user must keep apart. Raw reachability
-    stays available as the observed view — this decides only what may be PROOF.
+    Only a baseline-GREEN, CONTAINED, non-TRUNCATED, FRESHLY-observed trace is admissible; every
+    other case names WHY, because "the test failed", "its trace was cut", "the measurement escaped
+    containment", and "this reach was replayed from cache" are different facts a certificate and a
+    user must keep apart. Raw reachability stays available as the observed view — this decides only
+    what may be PROOF.
 
     Order encodes precedence, and it is not arbitrary:
 
@@ -41,7 +44,15 @@ def trace_admissibility(baseline_passed: bool, truncated: bool, contained: bool)
       completeness a truncated union would manufacture.
     * ``refuse_failed`` — the item is baseline-RED (or skipped/errored): it does not pass on the
       unmutated program, so its execution proves nothing about the code under test.
-    * ``admissible`` — green, contained, whole: the evidence a proof obligation may rest on.
+    * ``refuse_replayed`` — the reach was served from the trace CACHE, not measured this session
+      (#20). Cached reach is keyed by source, not by the full fixture/conftest/plugin/config
+      context, so a context change can make it stale; it is useful ROUTING (shortlist a test) but
+      "structurally incapable of being mistaken for fresh admissible coverage". A proof obligation
+      must rest on a trace observed THIS session, never a replay. Checked last: a replay of a green,
+      contained, whole test is still only routing.
+    * ``admissible`` — green, contained, whole, freshly observed: the evidence a proof may rest on.
+
+    ``fresh`` defaults True so a caller that does not track provenance keeps the pre-#20 meaning.
     """
     if not contained:
         return "refuse_uncontained"
@@ -49,6 +60,8 @@ def trace_admissibility(baseline_passed: bool, truncated: bool, contained: bool)
         return "refuse_truncated"
     if not baseline_passed:
         return "refuse_failed"
+    if not fresh:
+        return "refuse_replayed"
     return "admissible"
 
 
@@ -73,6 +86,11 @@ class TraceEvidence:
     #: Governed by the SAME admissibility as ``lines``: a failing/truncated/uncontained owner's
     #: arcs prove nothing either.
     arcs: tuple[tuple[int, int], ...] = ()
+    #: Where this reach came from (#20): ``fresh`` (traced THIS session) or ``replayed`` (served from
+    #: the source-keyed trace cache). A replay is routing-usable but proof-INADMISSIBLE — the reason
+    #: is then ``refuse_replayed`` — so cache reuse is structurally incapable of becoming fresh
+    #: admissible coverage. Default ``fresh`` keeps every pre-#20 construction admissible.
+    provenance: str = "fresh"
 
     @property
     def admissible(self) -> bool:
@@ -86,6 +104,7 @@ def build_trace_ledger(
     truncated_ids: Iterable[str],
     contained: bool,
     arc_coverage: Mapping[str, Iterable[tuple[int, int]]] | None = None,
+    replayed_ids: Iterable[str] | None = None,
 ) -> tuple[TraceEvidence, ...]:
     """The per-TestId ledger over every item with observed line coverage (#17).
 
@@ -101,11 +120,15 @@ def build_trace_ledger(
     """
     failed = set(failed_ids)
     truncated = set(truncated_ids)
+    replayed = set(replayed_ids or ())
     arcs = arc_coverage or {}
     ledger: list[TraceEvidence] = []
     for test_id in sorted(line_coverage):
         passed = test_id not in failed
         is_truncated = test_id in truncated
+        # #20: reach served from the cache is `replayed`, and `trace_admissibility` refuses it for
+        # proof — routing may still use it, but it may not close an admissible obligation.
+        fresh = test_id not in replayed
         ledger.append(
             TraceEvidence(
                 test_id=test_id,
@@ -113,8 +136,9 @@ def build_trace_ledger(
                 baseline_passed=passed,
                 truncated=is_truncated,
                 contained=contained,
-                reason=trace_admissibility(passed, is_truncated, contained),
+                reason=trace_admissibility(passed, is_truncated, contained, fresh),
                 arcs=tuple(sorted(set(arcs.get(test_id, ())))),
+                provenance="fresh" if fresh else "replayed",
             )
         )
     return tuple(ledger)

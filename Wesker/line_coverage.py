@@ -371,6 +371,7 @@ def trace_suite(
     cache: dict[str, dict[str, Any]] | None = None,
     uncontained: set[str] | None = None,
     arcs_out: dict[str, dict[str, set[tuple[int, int]]]] | None = None,
+    replayed: set[str] | None = None,
 ) -> dict[str, dict[str, set[int]]]:
     """Trace the WHOLE suite ONCE: ``{test_id: {file: lines}}``.
 
@@ -474,6 +475,11 @@ def trace_suite(
                 f: {tuple(a) for a in cell.get("arcs", ())} for f, cell in hit.items()
             }
             was_cut = False
+            # REPLAYED, not measured this session (#20): this reach came from the cache, keyed by
+            # source only. Named here so the proof view can refuse it while routing still uses it —
+            # cache reuse must be structurally incapable of becoming fresh admissible coverage.
+            if replayed is not None:
+                replayed.add(name)
         else:
             # The redirect isolates the TEST's own stdout/stderr and must wrap the test ONLY —
             # not the loop. Wrapped around the loop it also swallows `progress`, which reports on

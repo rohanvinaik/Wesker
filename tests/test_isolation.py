@@ -19,10 +19,12 @@ import time
 import pytest
 
 from Wesker.isolation import (
+    IsolatedMutantWorker,
     isolated_test_outcome,
     mutant_verdict,
     run_mutant_isolated,
     run_pytest_node_isolated,
+    should_recycle,
 )
 
 
@@ -195,3 +197,43 @@ def test_a_hanging_mutant_is_killed_by_timeout_and_contained(tmp_path):
     )
     assert r.timed_out is True and r.contained is True
     assert mutant_verdict(r.outcome) == "killed"
+
+
+# ── the persistent recycled worker (increment 3) ────────────────────────────────
+
+
+def test_recycle_fires_at_the_cap_and_never_when_disabled():
+    assert should_recycle(50, 50) is True
+    assert should_recycle(51, 50) is True
+    assert should_recycle(49, 50) is False
+    assert should_recycle(9999, 0) is False  # 0 = never recycle on count
+
+
+def test_one_worker_serves_many_mutants_with_correct_verdicts(tmp_path):
+    """The efficiency AND the soundness together: a single interpreter evaluates several mutants —
+    one import, N verdicts — and each verdict is right (kill vs survive), with the mutant torn down
+    per test so it never leaks into the next."""
+    _tiny_project(tmp_path)
+    worker = IsolatedMutantWorker(str(tmp_path), ["test_t.py::test_f"], "t.py", "f")
+    try:
+        k = worker.evaluate("def f(x):\n    return x - 1\n", 30.0)
+        assert mutant_verdict(k.outcome) == "killed"
+        s = worker.evaluate("def f(x):\n    return x + 1 if x != 42 else 0\n", 30.0)
+        assert mutant_verdict(s.outcome) == "survived"
+        assert worker.evaluated == 2 and worker.alive  # one import, two mutants
+    finally:
+        worker.close()
+
+
+def test_a_hanging_mutant_retires_the_worker_but_stays_contained(tmp_path):
+    """A hang on the reused worker kills its whole group and marks it dead, so the caller recycles a
+    fresh one — the runaway cannot linger and perturb the next mutant."""
+    _tiny_project(tmp_path)
+    worker = IsolatedMutantWorker(str(tmp_path), ["test_t.py::test_f"], "t.py", "f")
+    try:
+        h = worker.evaluate("def f(x):\n    while True:\n        pass\n", 2.0)
+        assert h.timed_out is True and h.contained is True
+        assert worker.alive is False, "a hung worker must be retired, not reused"
+        assert mutant_verdict(h.outcome) == "killed"
+    finally:
+        worker.close()

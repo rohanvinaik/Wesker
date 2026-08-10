@@ -19,8 +19,10 @@ The mutant-installation and node-ID lifecycle that run INSIDE the worker build o
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -197,3 +199,111 @@ def run_mutant_isolated(
         except (subprocess.TimeoutExpired, ValueError):
             out = ""
         return IsolatedRun(-9, True, contained, out or "")
+
+
+def should_recycle(evaluated: int, max_per_worker: int) -> bool:
+    """Whether a persistent isolated worker has done enough mutants to recycle (#19, pure — pinned).
+
+    A worker reused across mutants can accumulate application state a per-test lifecycle does not
+    reset — a singleton, a registry, a module-level cache. Recycling to a fresh process after a
+    bounded count discards that drift before it can perturb a verdict; ``max_per_worker <= 0`` means
+    never recycle on count (a caller relying on other drift detection). The count is inclusive: at
+    exactly the cap the worker is spent.
+    """
+    return max_per_worker > 0 and evaluated >= max_per_worker
+
+
+class IsolatedMutantWorker:
+    """A PERSISTENT isolated worker evaluating many mutants in one interpreter (#19).
+
+    The one-shot `run_mutant_isolated` pays pytest startup per mutant; this reuses one worker so a
+    whole survivor set is measured for the cost of one import, and the caller recycles it (via
+    `should_recycle` / a hang) rather than spawn per mutant. Every mutant is still installed and
+    torn down per test, so the mutant itself never leaks between evaluations; recycling bounds the
+    application-state drift a reused process can accumulate.
+
+    A single mutant that hangs terminates the whole process GROUP — the worker AND any child — and
+    marks this worker dead, so the caller recycles a fresh one; the hung mutant's result is a
+    contained timeout kill.
+    """
+
+    def __init__(
+        self,
+        project_root: str,
+        node_ids: Sequence[str],
+        target_file: str,
+        func_qualname: str,
+    ) -> None:
+        self._proc = subprocess.Popen(
+            [sys.executable, "-m", "Wesker._isolated_worker", "--serve"],
+            cwd=project_root,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True,
+        )
+        self._alive = True
+        self._evaluated = 0
+        session = json.dumps(
+            {
+                "project_root": project_root,
+                "node_ids": list(node_ids),
+                "target_file": target_file,
+                "func_qualname": func_qualname,
+            }
+        )
+        try:
+            assert self._proc.stdin is not None
+            self._proc.stdin.write(session + "\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, ValueError, AssertionError):
+            self._alive = False
+
+    @property
+    def evaluated(self) -> int:
+        return self._evaluated
+
+    @property
+    def alive(self) -> bool:
+        return self._alive and self._proc.poll() is None
+
+    def evaluate(self, mutant_source: str, timeout_s: float) -> IsolatedRun:
+        """Evaluate ONE mutant on the reused worker. A hang kills the group and retires the worker."""
+        if not self.alive:
+            return IsolatedRun(-9, True, self._reap(), "")
+        try:
+            assert self._proc.stdin is not None and self._proc.stdout is not None
+            self._proc.stdin.write(json.dumps({"mutant_source": mutant_source}) + "\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, ValueError, AssertionError):
+            self._alive = False
+            return IsolatedRun(-9, True, self._reap(), "")
+        ready, _, _ = select.select([self._proc.stdout], [], [], timeout_s)
+        if not ready:
+            # The mutant hung the worker. Kill the whole group and retire it — a fresh worker takes
+            # the next mutant, and this one is a contained timeout kill.
+            contained = self._reap()
+            self._alive = False
+            return IsolatedRun(-9, True, contained, "")
+        line = self._proc.stdout.readline()
+        if not line:  # the worker died mid-evaluation
+            self._alive = False
+            return IsolatedRun(-9, True, self._reap(), "")
+        self._evaluated += 1
+        try:
+            rc = int(json.loads(line).get("rc", 2))
+        except (ValueError, TypeError):
+            rc = 2  # unreadable line -> a collection-class code, never a silent pass
+        return IsolatedRun(rc, False, True, "")
+
+    def _reap(self) -> bool:
+        return _terminate_group(self._proc)
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            if self._proc.stdin is not None:
+                self._proc.stdin.close()
+        if self._proc.poll() is None:
+            self._reap()
+        self._alive = False

@@ -295,6 +295,65 @@ def execution_mode_standing(execution_mode: str, measurement_gateable: bool) -> 
     return "conditional"
 
 
+def fast_mode_standing(
+    spawns_subprocess: bool,
+    starts_background_thread: bool,
+    custom_collector: bool,
+    signal_main_thread: bool,
+    stateful_fixture: bool,
+) -> str:
+    """Whether the in_process FAST mode may be trusted for a test's SHAPE (#19, pure — pinned).
+
+    in_process containment is a thread abandon — it ASKS a runaway to stop and cannot force it. So
+    the fast mode is sound only for HERMETIC shapes; a test that escapes the interpreter or the
+    per-test lifecycle must be REFUSED to the isolated mode rather than measured on a guarantee the
+    mode cannot keep. Issue #19: "explicit warning/refusal for subprocess, background-thread, custom
+    collector, signal/main-thread, or stateful fixture requirements ... never silently upgraded to
+    the isolated guarantee." Each hazard is NAMED (a consumer reports which one refused), in the
+    issue's own listing order; all-clear is ``hermetic``.
+
+    Over-refusal is the safe direction: a shape wrongly flagged hazardous is merely routed to the
+    always-sound isolated mode, while a hazard wrongly cleared would measure on a false containment —
+    the one error a proof-facing tool must not make.
+    """
+    if spawns_subprocess:
+        return "refuse_subprocess"
+    if starts_background_thread:
+        return "refuse_thread"
+    if custom_collector:
+        return "refuse_collector"
+    if signal_main_thread:
+        return "refuse_signal"
+    if stateful_fixture:
+        return "refuse_fixture"
+    return "hermetic"
+
+
+def baseline_determinism(
+    coverage_a: list[int],
+    outcome_a: str,
+    coverage_b: list[int],
+    outcome_b: str,
+) -> str:
+    """Whether two fresh-state baseline runs agree — the proof-facing nondeterminism check (#19,
+    pure — pinned).
+
+    A gateable measurement must be REPEATABLE: run the unmutated baseline twice from matched fresh
+    state, and if the pass/fail outcome or the covered lines differ, the function is nondeterministic
+    and no mutant verdict measured against it can be trusted. Issue #19: "execute baseline more than
+    once from matched fresh state; classify inconsistent outcomes/coverage as nondeterministic."
+
+    Outcome is checked before coverage because a flipped pass/fail is the louder signal, but either
+    disagreement is decisive. Coverage is compared as a SET — order and repeats from the tracer are
+    not signal, only WHICH lines ran.
+    """
+    if outcome_a != outcome_b:
+        return "nondeterministic"
+    if set(coverage_a) != set(coverage_b):
+        return "nondeterministic"
+    return "deterministic"
+
+
 class IsolatedMutantWorker:
     """A PERSISTENT isolated worker evaluating many mutants in one interpreter (#19).
 

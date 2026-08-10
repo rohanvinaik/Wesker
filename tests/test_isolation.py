@@ -479,3 +479,65 @@ def test_a_profiling_result_reports_its_standing_without_changing_gateability():
         ProfilingResult(execution_mode="isolated", is_gateable=False).execution_standing
         == "cut"
     )
+
+
+# ── fast-mode shape refusal + baseline determinism (increment 5a) ────────────────
+#
+# The two proof-facing gates that give the in_process fast mode its limits. Pure decisions,
+# pinned in isolation before any wiring — the shape detector and the repeated-baseline harness
+# (5b/5c) will supply their inputs.
+
+
+def test_a_hermetic_shape_clears_the_fast_mode():
+    from Wesker.isolation import fast_mode_standing
+
+    assert fast_mode_standing(False, False, False, False, False) == "hermetic"
+
+
+def test_each_hazardous_shape_is_refused_by_name():
+    """A shape in_process containment cannot honestly measure is refused to the isolated mode, and
+    NAMED so a consumer can say which hazard refused it."""
+    from Wesker.isolation import fast_mode_standing
+
+    assert fast_mode_standing(True, False, False, False, False) == "refuse_subprocess"
+    assert fast_mode_standing(False, True, False, False, False) == "refuse_thread"
+    assert fast_mode_standing(False, False, True, False, False) == "refuse_collector"
+    assert fast_mode_standing(False, False, False, True, False) == "refuse_signal"
+    assert fast_mode_standing(False, False, False, False, True) == "refuse_fixture"
+
+
+def test_the_loudest_hazard_wins_and_over_refusal_is_safe():
+    """When several hazards coincide, one refusal is reported (precedence = the issue's listing);
+    the point is that ANY hazard refuses, routing the test to the always-sound isolated mode."""
+    from Wesker.isolation import fast_mode_standing
+
+    assert fast_mode_standing(True, True, True, True, True) == "refuse_subprocess"
+    assert fast_mode_standing(False, True, False, True, False) == "refuse_thread"
+
+
+def test_matched_fresh_baselines_are_deterministic():
+    from Wesker.isolation import baseline_determinism
+
+    assert (
+        baseline_determinism([1, 2, 3], "passed", [1, 2, 3], "passed")
+        == "deterministic"
+    )
+    # Coverage is a SET: order and repeats from the tracer are not signal.
+    assert (
+        baseline_determinism([3, 1, 2, 2], "passed", [1, 2, 3], "passed")
+        == "deterministic"
+    )
+
+
+def test_a_flipped_outcome_or_shifted_coverage_is_nondeterministic():
+    """Either a changed pass/fail OR a changed covered-line set across two fresh baselines means the
+    function cannot ground a gateable verdict."""
+    from Wesker.isolation import baseline_determinism
+
+    assert (
+        baseline_determinism([1, 2], "passed", [1, 2], "failed") == "nondeterministic"
+    )
+    assert (
+        baseline_determinism([1, 2], "passed", [1, 2, 3], "passed")
+        == "nondeterministic"
+    )

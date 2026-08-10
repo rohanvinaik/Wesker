@@ -19,6 +19,7 @@ The mutant-installation and node-ID lifecycle that run INSIDE the worker build o
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -123,6 +124,74 @@ def run_pytest_node_isolated(
         contained = _terminate_group(proc)
         # Drain whatever the worker emitted before the kill, without blocking on a group that may
         # not be fully gone; the outcome is already `timeout`, this is only for diagnostics.
+        try:
+            out, _ = proc.communicate(timeout=1.0)
+        except (subprocess.TimeoutExpired, ValueError):
+            out = ""
+        return IsolatedRun(-9, True, contained, out or "")
+
+
+def mutant_verdict(outcome: str) -> str:
+    """Map an isolated worker's pytest OUTCOME to a mutant verdict (#19, pure — pinned).
+
+    The worker runs the covering node IDs against the mutant; pytest's exit is the verdict.
+
+    * ``failed`` — a node FAILED under the mutant: the suite detected the mutation → ``killed``.
+    * ``timeout`` — the mutant made a node hang past its budget: a run-only kill, detected by time
+      → ``killed`` (the worker was terminated; containment travels separately on the run).
+    * ``passed`` — every node passed under the mutant: nothing distinguished it → ``survived``.
+    * ``no_tests`` / ``error`` — no node ran, or the run could not collect: this measures the
+      HARNESS, not the suite, and belongs on NEITHER side of the denominator → ``harness``, the
+      same discipline ``engine.mutant_disposition`` keeps for the in-process path so a collection
+      failure never inflates a kill score.
+    """
+    if outcome in ("failed", "timeout"):
+        return "killed"
+    if outcome == "passed":
+        return "survived"
+    return "harness"
+
+
+def run_mutant_isolated(
+    project_root: str,
+    node_ids: Sequence[str],
+    target_file: str,
+    func_qualname: str,
+    mutant_source: str,
+    timeout_s: float,
+) -> IsolatedRun:
+    """Evaluate ONE mutant against exact node IDs in a killable worker process (#19).
+
+    The worker (`Wesker._isolated_worker`) installs the mutant through the REAL pytest lifecycle —
+    the same `_patch_mutant_into_test` / `_unpatch_mutant` the in-process evaluator uses, from a
+    plugin — and exits with pytest's code; `IsolatedRun.outcome` + :func:`mutant_verdict` name the
+    result. A mutant that hangs is terminated with its whole process group, and ``contained`` says
+    whether that was confirmed, so a runaway mutant cannot leave a live worker perturbing the next
+    measurement — the containment the in-process thread path cannot guarantee.
+    """
+    payload = json.dumps(
+        {
+            "project_root": project_root,
+            "node_ids": list(node_ids),
+            "target_file": target_file,
+            "func_qualname": func_qualname,
+            "mutant_source": mutant_source,
+        }
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "Wesker._isolated_worker"],
+        cwd=project_root,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, _ = proc.communicate(payload, timeout=timeout_s)
+        return IsolatedRun(proc.returncode, False, True, out or "")
+    except subprocess.TimeoutExpired:
+        contained = _terminate_group(proc)
         try:
             out, _ = proc.communicate(timeout=1.0)
         except (subprocess.TimeoutExpired, ValueError):

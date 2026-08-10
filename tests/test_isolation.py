@@ -18,7 +18,12 @@ import time
 
 import pytest
 
-from Wesker.isolation import isolated_test_outcome, run_pytest_node_isolated
+from Wesker.isolation import (
+    isolated_test_outcome,
+    mutant_verdict,
+    run_mutant_isolated,
+    run_pytest_node_isolated,
+)
 
 
 # ── the pure decision ──────────────────────────────────────────────────────────
@@ -114,3 +119,79 @@ def test_the_module_uses_a_real_process_group():
     src = inspect.getsource(isolation.run_pytest_node_isolated)
     assert "start_new_session=True" in src
     assert "killpg" in inspect.getsource(isolation._terminate_group)
+
+
+# ── the mutant verdict decision ─────────────────────────────────────────────────
+
+
+def test_a_failed_or_timed_out_node_is_a_kill():
+    assert mutant_verdict("failed") == "killed"
+    assert mutant_verdict("timeout") == "killed"
+
+
+def test_all_nodes_passing_is_a_survivor():
+    assert mutant_verdict("passed") == "survived"
+
+
+def test_a_collection_or_empty_run_is_harness_never_a_kill():
+    """A harness/collection state measures the engine, not the suite — never a kill."""
+    assert mutant_verdict("no_tests") == "harness"
+    assert mutant_verdict("error") == "harness"
+
+
+# ── end-to-end: isolated mutant evaluation is SOUND ─────────────────────────────
+
+
+def _tiny_project(tmp_path) -> None:
+    (tmp_path / "t.py").write_text("def f(x):\n    return x + 1\n")
+    (tmp_path / "test_t.py").write_text(
+        "from t import f\n\n\ndef test_f():\n    assert f(1) == 2\n"
+    )
+
+
+def test_a_mutant_a_test_kills_reports_killed(tmp_path):
+    """The soundness proof: a mutant that changes the pinned value is detected as killed, through
+    the real pytest lifecycle in an isolated process."""
+    _tiny_project(tmp_path)
+    r = run_mutant_isolated(
+        str(tmp_path),
+        ["test_t.py::test_f"],
+        "t.py",
+        "f",
+        "def f(x):\n    return x - 1\n",
+        30.0,
+    )
+    assert r.contained and not r.timed_out
+    assert mutant_verdict(r.outcome) == "killed"
+
+
+def test_a_mutant_no_test_kills_reports_survived(tmp_path):
+    """The other half: a mutant the suite does NOT distinguish survives — the isolated verdict must
+    not manufacture a kill the tests did not make."""
+    _tiny_project(tmp_path)
+    r = run_mutant_isolated(
+        str(tmp_path),
+        ["test_t.py::test_f"],
+        "t.py",
+        "f",
+        # differs only at x == 42, which the single test never exercises
+        "def f(x):\n    return x + 1 if x != 42 else 0\n",
+        30.0,
+    )
+    assert r.contained and mutant_verdict(r.outcome) == "survived"
+
+
+def test_a_hanging_mutant_is_killed_by_timeout_and_contained(tmp_path):
+    """A mutant that never returns hangs the node; the isolated worker terminates its process group
+    and reports a contained timeout kill — the containment an in-process thread cannot guarantee."""
+    _tiny_project(tmp_path)
+    r = run_mutant_isolated(
+        str(tmp_path),
+        ["test_t.py::test_f"],
+        "t.py",
+        "f",
+        "def f(x):\n    while True:\n        pass\n",
+        2.0,
+    )
+    assert r.timed_out is True and r.contained is True
+    assert mutant_verdict(r.outcome) == "killed"

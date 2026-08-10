@@ -73,3 +73,30 @@ def test_distinct_obligations_counts_groups_plus_each_survivor():
     matrix = {"A": ["t1"], "B": ["t1"], "C": ["t2"], "s": []}
     assert redundancy_groups(matrix) == [["A", "B"], ["C"]]
     assert distinct_obligations(matrix, survivors=3) == 5
+
+
+def test_profiling_result_surfaces_redundancy_without_shrinking_the_universe():
+    """W#25 wiring: a ProfilingResult exposes the empirical grouping and distinct-obligation count as
+    a PRESENTATION view. THE LOAD-BEARING INVARIANT — the proof universe is untouched: `total_mutants`
+    and `universe_size` stay the full set, so `COMPLETE (operator universe)` still means the whole
+    universe. Dynamic subsumption groups OUTPUT; it never shrinks the denominator a claim rests on."""
+    from Wesker.engine import ProfilingResult
+
+    r = ProfilingResult(
+        total_mutants=4,
+        total_killed=3,
+        total_survived=1,
+        universe_size=4,
+        # A and B are killed by exactly the same tests; C by a different one.
+        kill_matrix={"A": ["t1", "t2"], "B": ["t1", "t2"], "C": ["t3"]},
+    )
+    assert r.empirical_redundancy_groups == [["A", "B"], ["C"]]
+    # 2 killed-groups + 1 survivor = 3 distinct obligations behind 4 mutants.
+    assert r.distinct_obligations == 3
+
+    d = r.to_dict()
+    assert d["distinct_obligations"] == 3
+    assert d["empirical_redundancy_groups"] == [["A", "B"], ["C"]]
+    # The universe the completeness claim rests on is UNCHANGED by the presentation view.
+    assert d["total_mutants"] == 4
+    assert d["universe_size"] == 4

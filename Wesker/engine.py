@@ -44,6 +44,8 @@ from .isolation import (
     scope_fast_mode_standing,
     should_recycle,
 )
+from .subsumption import distinct_obligations as _distinct_obligations
+from .subsumption import redundancy_groups
 from .tce import WARRANT_BYTECODE, nodes_equivalent
 from .trace_evidence import TraceEvidence, build_trace_ledger
 from .memory_guard import memory_enforcement_standing
@@ -505,6 +507,29 @@ class ProfilingResult:
         return execution_mode_standing(self.execution_mode, self.is_gateable)
 
     @property
+    def empirical_redundancy_groups(self) -> list[list[str]]:
+        """Killed mutants the CURRENT suite cannot tell apart, grouped (W#25).
+
+        Two mutants killed by exactly the same tests are indistinguishable BY THIS SUITE, so a
+        reader considering both is considering a distinction the evidence does not contain. This is a
+        PRESENTATION view — a dynamic, suite-relative OBSERVATION, never a proof. It MUST NOT shrink
+        the universe `COMPLETE (operator universe)` is claimed over: `total_mutants` / `total_killed`
+        stay the full universe, and this only groups the OUTPUT. Derived, so it cannot drift.
+        """
+        return redundancy_groups(self.kill_matrix)
+
+    @property
+    def distinct_obligations(self) -> int:
+        """How many ACTUALLY-DISTINCT behavioural obligations this run witnesses (W#25).
+
+        Each group of mutually-redundant killed mutants counts once, and each true survivor is its
+        own distinct gap (a survivor's empty killer set means "nothing detected this", never "these
+        behave the same"). The honest, actionable number behind a large kill/survivor list —
+        presentation only, and never a denominator a completeness claim rests on.
+        """
+        return _distinct_obligations(self.kill_matrix, self.total_survived)
+
+    @property
     def value_killed(self) -> int:
         """Mutants whose return value is pinned — assertion kills only."""
         return sum(cr.value_killed for cr in self.per_category)
@@ -622,6 +647,10 @@ class ProfilingResult:
             ),
             "survival_rate": round(self.survival_rate, 3),
             "effective_kill_pct": effective_kill_pct,
+            # W#25 presentation: the count of ACTUALLY-DISTINCT obligations (redundant killed mutants
+            # collapsed, each survivor its own). A reporting view over the SAME full universe —
+            # `total_mutants`/`universe_size`/`COMPLETE` are unchanged; this never shrinks them.
+            "distinct_obligations": self.distinct_obligations,
             "coverage_depth": self.coverage_depth,
             "execution_mode": self.execution_mode,
             "fast_mode": self.fast_mode,
@@ -648,6 +677,10 @@ class ProfilingResult:
         }
         if self.kill_matrix:
             d["kill_matrix"] = self.kill_matrix
+        # W#25: killed mutants this suite cannot tell apart, grouped for the reader — presentation
+        # only, emitted when non-empty like the other record views, and never shrinking the universe.
+        if self.empirical_redundancy_groups:
+            d["empirical_redundancy_groups"] = self.empirical_redundancy_groups
         if self.survivor_records:
             d["survivor_records"] = self.survivor_records
         # The value-unspecified set: true survivors PLUS crash/timeout kills. This is what a

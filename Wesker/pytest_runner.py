@@ -236,6 +236,23 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
             # The origin tag makes `ci.callable_origin` total for this wrapper even
             # when the item has no `function` (no __wrapped__ to follow).
             run.__wesker_origin__ = str(origin)  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+    # Fixture-closure origins (#15): the files where this item's fixtures are DEFINED. A test can
+    # reach the target ONLY through a fixture — autouse, a conftest fixture, a plugin — while its
+    # own body names nothing; a static name scan then drops it as irrelevant (reproduced: an
+    # autouse fixture calling the target, the test dropped, read as "no test reaches this target").
+    # Stamping the fixture-definition files lets routing keep it on a fixture edge. Best-effort:
+    # any failure leaves the tag absent, which routes to `unknown` (kept), never breaking collection.
+    with contextlib.suppress(Exception):
+        _info = getattr(item, "_fixtureinfo", None)
+        _name2defs = getattr(_info, "name2fixturedefs", None) or {}
+        _fx_origins: set[str] = set()
+        for _defs in _name2defs.values():
+            for _fd in _defs or ():
+                _code = getattr(getattr(_fd, "func", None), "__code__", None)
+                _f = getattr(_code, "co_filename", None)
+                if _f:
+                    _fx_origins.add(str(_f))
+        run.__wesker_fixture_origins__ = tuple(sorted(_fx_origins))  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     return run
 
 

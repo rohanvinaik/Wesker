@@ -51,14 +51,19 @@ def symlinked(tmp_path):
 
 
 def test_the_live_filter_survives_a_symlinked_root(symlinked):
-    """The defect. The item's origin is the REAL path, the scoped list the LINKED one — the
-    same file by two names. Compared literally they never match and the suite empties."""
+    """The defect. The item's origin is the REAL path, the scoped list the LINKED one — the same
+    file by two names. Compared literally they never match. Exercised in ``conservative`` mode,
+    where a `candidate` verdict DEPENDS on the origin matching the scoped list — the default keeps
+    everything as `unknown` (#15), which would make this pass even if canonicalisation were broken.
+    So conservative mode is what keeps this test discriminating."""
     real, link = symlinked
     item = _make_test_callable(str(real / "tests" / "test_shipping.py"))
 
     token = ci._LIVE_SUITE.set([item])
     try:
-        got = ci.discover_test_callables(str(link), "shipping.py", ["shipping_cost"])
+        got = ci.discover_test_callables(
+            str(link), "shipping.py", ["shipping_cost"], conservative=True
+        )
     finally:
         ci._LIVE_SUITE.reset(token)
 
@@ -69,8 +74,12 @@ def test_the_live_filter_survives_a_symlinked_root(symlinked):
 
 
 def test_an_unrelated_test_is_still_excluded(symlinked):
-    """The control, and the guard against 'fixing' this by widening. Canonicalising must make
-    the same file compare equal — not make different files compare equal."""
+    """The control, and the guard against 'fixing' the symlink defect by widening. Canonicalising
+    must make the same file compare equal — not make different files compare equal. In
+    ``conservative`` mode the unrelated test (no name, no fixture edge → `unknown`) is dropped
+    while the scoped test is kept, so this asserts narrowing still discriminates once the origin is
+    canonicalised. (By default #15 KEEPS the unrelated test — that is the one-sided guarantee, and
+    it has its own test in test_route_test_item.py.)"""
     real, link = symlinked
     (real / "tests" / "test_unrelated.py").write_text(
         "def test_arith():\n    assert 2 + 2 == 4\n"
@@ -80,9 +89,12 @@ def test_an_unrelated_test_is_still_excluded(symlinked):
 
     token = ci._LIVE_SUITE.set([scoped_item, other_item])
     try:
-        got = ci.discover_test_callables(str(link), "shipping.py", ["shipping_cost"])
+        got = ci.discover_test_callables(
+            str(link), "shipping.py", ["shipping_cost"], conservative=True
+        )
     finally:
         ci._LIVE_SUITE.reset(token)
 
     origins = {os.path.basename(ci.callable_origin(c) or "") for c in got}
     assert "test_unrelated.py" not in origins
+    assert "test_shipping.py" in origins

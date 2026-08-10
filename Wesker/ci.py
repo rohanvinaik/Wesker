@@ -316,6 +316,123 @@ def relevant_test_files(
     return found
 
 
+def route_test_item(
+    names_target: bool,
+    fixture_reaches: bool,
+    observed_reach: str,
+    dynamic_uncertain: bool,
+) -> str:
+    """Route ONE collected item against a target — skip only the provably-impossible (#15, pure — pinned).
+
+    The selector is one-sided by design. Dropping a genuinely relevant test removes kills and
+    covered lines, so it OVERSTATES a specification gap; it can never manufacture a kill. So the
+    only item skipped is one with POSITIVE evidence it cannot reach the target; everything else
+    stays in the candidate pool. The code names BOTH the verdict and its reason, because "ruled
+    out", "plausibly reaches", and "could not tell" are different facts a report must keep apart —
+    collapsing `unknown` into `impossible` is the exact false-negative this closes (a
+    fixture-reached test, dropped, read as `no test reaches this target` → needless synthesis).
+
+    `observed_reach` is the ONLY sound source of impossibility — a prior trace that ran this node
+    and recorded the lines it hit:
+      * ``reached``     — the node executed the target: candidate, on observation.
+      * ``not_reached`` — the node ran and did not touch the target: impossible, on observation.
+      * ``unseen``      — no trace has watched this node; a static miss cannot be promoted to
+                          impossibility, only widened to unknown.
+
+    Static evidence only ever makes an item a CANDIDATE (a positive prior), never impossible:
+      * ``names_target``    — the item's own file statically references the target (static_import);
+      * ``fixture_reaches`` — a fixture in the item's closure is defined in a file that references
+                              the target (fixture_edge) — the autouse/conftest path a name scan
+                              cannot see, and the concrete bug this issue reproduced.
+
+    ``dynamic_uncertain`` widens to unknown rather than excluding: plugins or dynamic imports mean
+    the static picture is incomplete, and incomplete is not proof of irrelevance.
+    """
+    if observed_reach == "reached":
+        return "candidate_observed"
+    if observed_reach == "not_reached":
+        return "impossible_observed"
+    if names_target:
+        return "candidate_static"
+    if fixture_reaches:
+        return "candidate_fixture"
+    if dynamic_uncertain:
+        return "unknown_dynamic"
+    return "unknown_no_path"
+
+
+def route_admits(code: str, conservative: bool) -> bool:
+    """Whether a routed item stays in the candidate pool (#15, pure — pinned).
+
+    Default (sound, one-sided): everything but a provably-impossible item stays — `unknown` is
+    KEPT, because a static miss is not proof of irrelevance. `conservative` is the opt-in
+    fast/lossy mode: it narrows to CANDIDATES only, dropping `unknown`, trading the one-sided
+    guarantee for speed. A gap produced under `conservative` is a conservative shortlist result
+    and must be labelled so by the caller, never rendered as a proof of specification.
+    """
+    if code.startswith("impossible"):
+        return False
+    if conservative:
+        return code.startswith("candidate")
+    return True
+
+
+def callable_fixture_origins(call: Any) -> tuple[str, ...]:
+    """The files where a live item's fixtures are DEFINED, or () (#15).
+
+    Stamped at build time by ``pytest_runner._make_item_callable`` from the item's
+    ``_fixtureinfo``. Empty for the legacy/re-collected backends and for any item whose closure
+    could not be read — all of which route to ``unknown`` (kept), never to a false ``impossible``.
+    Read through this accessor, not a raw attribute, so a backend that carries the closure
+    differently has one seam to change."""
+    got = getattr(call, "__wesker_fixture_origins__", ())
+    return tuple(got) if got else ()
+
+
+def _fixture_files_reaching_target(live: list[Any], func_names: list[str]) -> set[str]:
+    """Fixture-definition files whose source statically references the target (#15, fixture edge).
+
+    A fixture file — a conftest, a plugin, the test module itself — that imports the target's
+    module or names a target function is a positive reach for every item whose closure includes it:
+    the autouse/conftest path a test-body name scan cannot see. Built from the union of
+    fixture-origin files across the live suite and scanned with the same static-impact map the
+    test-file selector uses, so a fixture that calls ``target(...)`` is caught by the same key."""
+    files = {os.path.realpath(f) for c in live for f in callable_fixture_origins(c)}
+    if not files:
+        return set()
+    impact = _build_static_impact_map(sorted(files))
+    reaching: set[str] = set()
+    for func_name in func_names:
+        for key in _impact_lookup_keys(func_name):
+            for tf in impact.get(key, []):
+                reaching.add(os.path.realpath(tf))
+    return reaching
+
+
+def _route_live_callables(
+    live: list[Any], scoped: list[str], func_names: list[str], conservative: bool
+) -> list[Any]:
+    """Filter the live suite by routing each item (#15) — keep all but the provably-impossible.
+
+    Without an observed trace nothing is impossible, so the DEFAULT keeps the whole live suite:
+    a static miss is not proof of irrelevance, and dropping a fixture-reached test was the exact
+    false gap this closes. The value the routing adds is that ``conservative`` can now narrow to
+    static/fixture candidates WITHOUT dropping a fixture-reached test, and every kept/dropped
+    decision carries a reason. Observed-trace impossibility (the sound narrowing that makes
+    successive passes cheap) is the follow-up owned with the trace evidence (#20/#17)."""
+    keep_files = {os.path.realpath(p) for p in scoped}
+    fixture_ref = _fixture_files_reaching_target(live, func_names)
+    kept: list[Any] = []
+    for c in live:
+        names_target = os.path.realpath(callable_origin(c) or "") in keep_files
+        fx = {os.path.realpath(f) for f in callable_fixture_origins(c)}
+        fixture_reaches = bool(fx & fixture_ref)
+        code = route_test_item(names_target, fixture_reaches, "unseen", False)
+        if route_admits(code, conservative):
+            kept.append(c)
+    return kept
+
+
 # ── Test callable loading ────────────────────────────────────────
 
 
@@ -699,6 +816,7 @@ def discover_test_callables(
     func_names: list[str],
     backend: str = "auto",
     extra_dirs: list[str] | None = None,
+    conservative: bool = False,
 ) -> list[Any]:
     """Discover runnable test callables — a dial over two backends.
 
@@ -741,29 +859,25 @@ def discover_test_callables(
     scoped = relevant_test_files(project_root, full_path, func_names)
     extra = [os.path.abspath(d) for d in (extra_dirs or []) if os.path.isdir(d)]
 
-    # Nothing statically reaches the target, and no out-of-tree root was named: return the
-    # empty suite rather than the whole tree. Widening here would put every unrelated test
-    # through a full mutant pass to learn what `scoped` already said — that none of them
-    # mention this code. The caller reads [] as "synthesize", which is the honest and far
-    # cheaper answer; see `relevant_test_files`.
-    if not scoped and not extra:
-        return []
-
+    # A live session collected the whole suite once, WITH real fixtures/conftest/lifecycle —
+    # route over what it already holds. This runs BEFORE the empty-`scoped` early return below,
+    # and that ordering is the fix (#15): an empty static shortlist is NOT "no test reaches this
+    # target" when the live suite may reach it through a fixture edge the name scan cannot see.
+    # The default keeps every item that is not provably impossible (unknown stays in the pool), so
+    # a fixture-reached test is no longer dropped as a false gap; `conservative` narrows to
+    # static/fixture candidates. Origin/closure resolve through the contract accessors, and
+    # comparisons are `realpath` — a live origin is pytest-canonicalised while `scoped` carries the
+    # caller's spelling, so on any symlinked root the two must be normalised or the filter silently
+    # empties the suite.
     live = _LIVE_SUITE.get()
     if live is not None:
-        # The session collected the whole suite once; narrowing is a filter over what it
-        # already holds, so the fixtures/conftest/lifecycle that make it outrank the other
-        # backends are preserved. Origin resolves through the contract accessor — a raw
-        # `__code__` read attributes every wrapper to pytest_runner.py.
-        # `realpath`, not `abspath` (#15). A live item's origin comes from pytest, which
-        # CANONICALISES it, while `scoped` carries whatever spelling the caller typed — so on
-        # any symlinked root (`/var` -> `/private/var` on macOS, a symlinked checkout, a
-        # case-insensitive rename) the two never match and this filter silently returns the
-        # EMPTY suite. A discovery that finds nothing reads downstream as "no test reaches this
-        # target", which is the synthesize path: the run would quietly stop measuring the suite
-        # it has and start inventing one.
-        keep = {os.path.realpath(p) for p in scoped}
-        return [c for c in live if os.path.realpath(callable_origin(c) or "") in keep]
+        return _route_live_callables(live, scoped, func_names, conservative)
+
+    # Non-live: no already-collected suite to keep, and nothing statically reaches the target with
+    # no out-of-tree root named — return empty rather than run every unrelated test through a full
+    # mutant pass to relearn what `scoped` already said. The caller reads [] as "synthesize".
+    if not scoped and not extra:
+        return []
 
     if backend in ("auto", "pytest"):
         try:

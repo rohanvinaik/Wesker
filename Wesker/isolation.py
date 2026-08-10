@@ -95,6 +95,13 @@ class IsolatedRun:
     constructed: bool = True
     #: The first node that failed under the mutant, for the kill matrix; None when none did.
     test_name: str | None = None
+    #: Installation-and-entry proof (#18), from the server path. `installed` is True once any node
+    #: rebound an owner to the mutant; `ran` counts nodes that reached the call phase (0 keeps entry
+    #: `unobserved`, never a false `not_entered`); `entered_probe` is True when the mutant was CALLED.
+    #: Defaults preserve every prior construction (installed True, ran 0, entered_probe False).
+    installed: bool = True
+    ran: int = 0
+    entered_probe: bool = False
 
     @property
     def outcome(self) -> str:
@@ -509,6 +516,26 @@ def scope_fast_mode_standing(standings: list[str]) -> str:
     return "hermetic"
 
 
+def entry_disposition(ran: int, entered: bool) -> str:
+    """Whether the isolated worker OBSERVED the mutant being entered (#18, pure — pinned).
+
+    Installation and ENTRY are different events (see ``engine._entry_probe``): a decorator,
+    ``lru_cache``, a closure cell, a registry list, or an object field can hold the ORIGINAL while
+    the namespace holds the mutant, so an installed mutant that a test never actually CALLS is a
+    survivor about our harness, not the user's tests — the exact adequacy inflation #18 exists to
+    stop.
+
+    But "no node ran" must NOT read as "not entered". With an empty run the entry probe was never
+    called, and scoring that ``not_entered`` would empty the denominator and report a function whose
+    covering tests never executed as fully specified — the one false COMPLETE this engine must never
+    produce. So ``ran <= 0`` is ``unobserved`` (the pre-#18 scored default, `entered=None`); only a
+    node that RAN without entering the mutant is ``not_entered``.
+    """
+    if ran <= 0:
+        return "unobserved"
+    return "entered" if entered else "not_entered"
+
+
 class IsolatedMutantWorker:
     """A PERSISTENT isolated worker evaluating many mutants in one interpreter (#19).
 
@@ -616,6 +643,9 @@ class IsolatedMutantWorker:
             killed_by=data.get("killed_by"),
             constructed=bool(data.get("constructed", True)),
             test_name=data.get("test_name"),
+            installed=bool(data.get("installed", True)),
+            ran=int(data.get("ran", 0)),
+            entered_probe=bool(data.get("entered", False)),
         )
 
     def _reap(self) -> bool:

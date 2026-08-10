@@ -36,6 +36,7 @@ from .isolation import (
     IsolatedRun,
     baseline_determinism,
     callable_shape_hazards,
+    entry_disposition,
     execution_mode_standing,
     fast_mode_standing,
     mutant_verdict,
@@ -4776,16 +4777,19 @@ def _isolated_result(
     mutant: Mutant, run: IsolatedRun, elapsed_ms: float
 ) -> MutantResult:
     """One isolated worker verdict -> a MutantResult with the SAME inputs the in-process path feeds
-    `mutant_disposition` (#19).
+    `mutant_disposition` (#18/#19).
 
-    `entered` stays None: the worker does not instrument entry, so a killed mutant is
-    `killed_after_entry` and a survivor `survived_after_entry` — the pre-#18 unobserved-entry
-    default, which is the conservative direction (it never withholds a real kill). A timed-out run is
-    a run-only `timeout` kill carrying its own containment. A verdict that measured the HARNESS and
-    not the suite — the mutant would not compile, or its covering tests could not be collected (a
-    pytest collection/usage exit) — is marked `constructed=False`, so `mutant_disposition` scores it
-    `harness_error`, outside the denominator, never a false survivor that deflates the score.
+    The worker now PROVES installation and entry (#18): `installed` is True only when an owner was
+    rebound to the mutant, and `entry_disposition(ran, entered_probe)` names whether a node that ran
+    actually CALLED it — so a mutant installed but never entered (a decorator/lru_cache/capture
+    holding the original) scores `not_entered`, outside the denominator, instead of a false survivor.
+    An empty run stays `unobserved` (entered=None, the conservative pre-#18 default) so a function
+    whose covering tests never executed cannot read as fully specified. A timed-out run is a run-only
+    `timeout` kill; a verdict that measured the HARNESS — the mutant would not compile, or its
+    covering tests could not be collected — is `constructed=False`, scored `harness_error`.
     """
+    _entered_map = {"entered": True, "not_entered": False, "unobserved": None}
+    entered = _entered_map[entry_disposition(run.ran, run.entered_probe)]
     if run.timed_out:
         return MutantResult(
             mutant=mutant,
@@ -4793,6 +4797,8 @@ def _isolated_result(
             killed_by="timeout",
             contained=run.contained,
             test_name=run.test_name,
+            installed=run.installed,
+            entered=entered,
             elapsed_ms=elapsed_ms,
         )
     verdict = mutant_verdict(run.outcome)
@@ -4811,12 +4817,16 @@ def _isolated_result(
             killed_by=run.killed_by or "crash",
             test_name=run.test_name,
             contained=run.contained,
+            installed=run.installed,
+            entered=entered,
             elapsed_ms=elapsed_ms,
         )
     return MutantResult(
         mutant=mutant,
         killed=False,
         contained=run.contained,
+        installed=run.installed,
+        entered=entered,
         elapsed_ms=elapsed_ms,
     )
 

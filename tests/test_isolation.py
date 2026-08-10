@@ -839,3 +839,116 @@ def test_a_nondeterministic_baseline_cuts_gateability_end_to_end(tmp_path):
             _PROJECT_ROOT.reset(token)
     finally:
         _drop_counter(tmp_path)
+
+
+# ── isolated installation + entry PROOF (#18) ───────────────────────────────────
+#
+# A survivor is a specification gap only after the intended mutant was constructed, INSTALLED, and
+# ENTERED. The isolated worker now proves the last two, so a mutant a test never actually calls is
+# excluded, not counted as a false survivor.
+
+
+def test_entry_disposition_intent():
+    from Wesker.isolation import entry_disposition
+
+    assert entry_disposition(1, True) == "entered"
+    assert entry_disposition(1, False) == "not_entered"
+    # No node ran -> UNOBSERVED, never a false not_entered (that would empty the denominator).
+    assert entry_disposition(0, False) == "unobserved"
+    assert entry_disposition(0, True) == "unobserved"
+
+
+def _capture_project(tmp_path):
+    """`h` is mutated, but `call_it` invokes a captured reference to the ORIGINAL — so the mutant is
+    never on the call path the test takes, though the test reaches h's line. Its mutants must be
+    excluded (not installed / not entered), never counted as survivors."""
+    import ast
+    import importlib
+    import sys
+
+    (tmp_path / "cap.py").write_text(
+        "def h():\n    return 1\n\n\n_captured = h\n\n\ndef call_it():\n    return _captured()\n"
+    )
+    (tmp_path / "test_cap.py").write_text(
+        "from cap import call_it\n\n\ndef test_it():\n    assert call_it() == 1\n"
+    )
+    node = ast.parse((tmp_path / "cap.py").read_text()).body[0]  # def h
+    sys.path.insert(0, str(tmp_path))
+    m = importlib.import_module("cap")
+    tm = importlib.import_module("test_cap")
+    tm.test_it.__qualname__ = "test_cap.py::test_it"
+    return node, m.h, [tm.test_it]
+
+
+def _drop_cap(tmp_path):
+    import sys
+
+    sys.path[:] = [p for p in sys.path if p != str(tmp_path)]
+    sys.modules.pop("cap", None)
+    sys.modules.pop("test_cap", None)
+
+
+def test_a_mutant_never_entered_is_excluded_not_a_false_survivor(tmp_path):
+    """THE #18 payoff on the isolated path: mutants of a function the test reaches only through a
+    captured original are NOT installed/entered on the call path, so they are scored outside the
+    denominator — zero false survivors, every unscored one named."""
+    from Wesker.ci import _PROJECT_ROOT
+    from Wesker.engine import run_function_profiling
+    from Wesker.filter import filter_categories
+
+    node, func_obj, tests = _capture_project(tmp_path)
+    try:
+        token = _PROJECT_ROOT.set(str(tmp_path))
+        try:
+            r = run_function_profiling(
+                node,
+                "cap.py::h",
+                filter_categories(node),
+                tests,
+                func_obj,
+                isolated=True,
+            )
+            assert r.total_survived == 0, (
+                "a never-entered mutant must not be a survivor"
+            )
+            assert r.total_killed == 0
+            unscored = sum(cr.unscored for cr in r.per_category)
+            assert unscored > 0, (
+                "the never-entered mutants must be scored outside the denominator"
+            )
+            # Every unscored one is NAMED (not_installed / not_entered), never an unqualified survivor.
+            reasons = {k for cr in r.per_category for k in cr.unscored_by}
+            assert reasons <= {"not_installed", "not_entered", "harness_error"}
+        finally:
+            _PROJECT_ROOT.reset(token)
+    finally:
+        _drop_cap(tmp_path)
+
+
+def test_a_normally_entered_mutant_is_still_scored(tmp_path):
+    """The guard against over-exclusion: a plain function the test calls directly IS installed and
+    entered, so its mutants are scored normally — the entry proof must not empty the denominator."""
+    from Wesker.ci import _PROJECT_ROOT
+    from Wesker.engine import run_function_profiling
+    from Wesker.filter import filter_categories
+
+    node, func_obj, tests = _real_project(tmp_path)
+    try:
+        token = _PROJECT_ROOT.set(str(tmp_path))
+        try:
+            r = run_function_profiling(
+                node,
+                "m.py::in_range",
+                filter_categories(node),
+                tests,
+                func_obj,
+                isolated=True,
+            )
+            assert r.total_mutants > 0, (
+                "a normally-entered function's mutants must be scored"
+            )
+            assert r.total_killed > 0
+        finally:
+            _PROJECT_ROOT.reset(token)
+    finally:
+        _drop_project(tmp_path)

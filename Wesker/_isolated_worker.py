@@ -46,6 +46,8 @@ def _build_mutant(target_file: str, func_name: str, mutant_source: str) -> Any |
     or the mutant will not compile — the caller reports ``constructed=False`` so the engine scores it
     ``harness_error`` (outside the denominator), never a survivor.
     """
+    from Wesker.engine import _entry_probe
+
     spec = importlib.util.spec_from_file_location("_wesker_mutant_target", target_file)
     if spec is None or spec.loader is None:
         return None
@@ -56,7 +58,11 @@ def _build_mutant(target_file: str, func_name: str, mutant_source: str) -> Any |
         exec(compile(mutant_source, "<mutant>", "exec"), namespace)  # noqa: S102
     except Exception:  # noqa: BLE001 — a mutant that will not compile installs nothing
         return None
-    return namespace.get(func_name)
+    obj = namespace.get(func_name)
+    # Wrap so ENTERING the mutant is observable (#18), exactly as `evaluate_mutant` does in-process:
+    # `.entered` flips True on the first call, so a mutant installed but never reached (a decorator/
+    # capture/registry holding the original) is seen as not_entered, not a false survivor.
+    return _entry_probe(obj) if obj is not None else None
 
 
 class _MutantPlugin:
@@ -76,6 +82,12 @@ class _MutantPlugin:
         self._func_name = func_qualname.split(".")[-1]
         self.reasons: list[str] = []
         self.first_failing_node: str | None = None
+        #: Installation-and-entry proof (#18). `installed` is True once any node rebound an owner to
+        #: the mutant; `ran` counts nodes that reached the call phase (so an empty run stays
+        #: `unobserved`, never a false `not_entered`); `.entered` on the wrapped mutant records whether
+        #: it was actually CALLED.
+        self.installed = False
+        self.ran = 0
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_call(self, item: Any) -> Any:
@@ -94,6 +106,9 @@ class _MutantPlugin:
             patched, saved, target = _patch_mutant_into_test(
                 proof, test_fn, self._qualname, self._mutated
             )
+            if patched:
+                self.installed = True
+            self.ran += 1
             try:
                 outcome = yield
             finally:
@@ -156,6 +171,11 @@ def _evaluate_full(
         "killed_by": aggregate_kill_reason(plugin.reasons) or None,
         "constructed": mutated is not None,
         "test_name": plugin.first_failing_node,
+        # Installation-and-entry proof (#18): the engine feeds these to `mutant_disposition` so an
+        # installed-but-never-entered mutant scores `not_entered`, outside the denominator.
+        "installed": plugin.installed,
+        "ran": plugin.ran,
+        "entered": bool(getattr(mutated, "entered", False)),
     }
 
 

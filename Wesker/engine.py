@@ -46,6 +46,7 @@ from .isolation import (
 )
 from .tce import WARRANT_BYTECODE, nodes_equivalent
 from .trace_evidence import TraceEvidence, build_trace_ledger
+from .memory_guard import memory_enforcement_standing
 from .memory_guard import over_budget as _over_budget
 from .memory_guard import reclaim as _reclaim
 from .memory_guard import run_baseline_bytes as _mem_baseline
@@ -403,6 +404,11 @@ class ProfilingResult:
     #: "refuse_*" here is why an in_process result is not gateable — the NAMED refusal the issue asks
     #: for. Default "n/a" leaves every existing construction (and the isolated path) unaffected.
     fast_mode: str = "n/a"
+    #: The memory-budget standing over the isolated workers (W#21): "cut" when a mutant hit the
+    #: worker's address-space cap (that mutant is non-gateable), else "enforced" / "telemetry_only"
+    #: — the HONEST capability, never claiming a guarantee an unaccepting platform did not keep — or
+    #: "n/a" on the in_process path. Default "n/a" leaves every existing construction unaffected.
+    memory_standing: str = "n/a"
     #: The repeated-fresh-baseline determinism standing (#19): "deterministic" when two fresh isolated
     #: baseline runs agreed on outcome AND covered lines, "nondeterministic" when they disagreed (→
     #: not gateable), or "unchecked" (the default) when the opt-in `check_determinism` run did not
@@ -619,6 +625,7 @@ class ProfilingResult:
             "coverage_depth": self.coverage_depth,
             "execution_mode": self.execution_mode,
             "fast_mode": self.fast_mode,
+            "memory_standing": self.memory_standing,
             "determinism": self.determinism,
             "execution_standing": self.execution_standing,
             "is_gateable": self.is_gateable,
@@ -4788,6 +4795,13 @@ def _isolated_result(
     `timeout` kill; a verdict that measured the HARNESS — the mutant would not compile, or its
     covering tests could not be collected — is `constructed=False`, scored `harness_error`.
     """
+    if run.memory_cut:
+        # W#21: the mutant hit the worker's address-space cap. This is a budget CUT, not a kill —
+        # `contained=False` routes it to the `cut` disposition (unscored) and makes the run
+        # non-gateable via the same #14 path; the typed memory reason is surfaced on the result.
+        return MutantResult(
+            mutant=mutant, killed=False, contained=False, elapsed_ms=elapsed_ms
+        )
     _entered_map = {"entered": True, "not_entered": False, "unobserved": None}
     entered = _entered_map[entry_disposition(run.ran, run.entered_probe)]
     if run.timed_out:
@@ -4835,9 +4849,9 @@ def _evaluate_isolated(
     worker: IsolatedMutantWorker | None,
     mutant: Mutant,
     scoped_tests: list[Callable[..., None]],
-    iso_ctx: tuple[str, str, str, int],
+    iso_ctx: tuple[str, str, str, int, int | None],
     per_mutant_timeout_ms: float,
-) -> tuple[MutantResult, IsolatedMutantWorker | None]:
+) -> tuple[MutantResult, IsolatedMutantWorker | None, IsolatedRun | None]:
     """Evaluate one mutant in a killable isolated worker, recycling the worker when spent (#19).
 
     Returns the verdict AND the (possibly fresh) worker, which the caller threads forward — a hang
@@ -4856,10 +4870,10 @@ def _evaluate_isolated(
     """
     from Wesker.ci import callable_test_id
 
-    root, target, qualname, recycle_cap = iso_ctx
+    root, target, qualname, recycle_cap, mem_limit = iso_ctx
     node_ids = [tid for c in scoped_tests if "::" in (tid := callable_test_id(c))]
     if not node_ids:
-        return MutantResult(mutant=mutant, killed=False, elapsed_ms=0.0), worker
+        return MutantResult(mutant=mutant, killed=False, elapsed_ms=0.0), worker, None
     if (
         worker is None
         or not worker.alive
@@ -4867,15 +4881,17 @@ def _evaluate_isolated(
     ):
         if worker is not None:
             worker.close()
-        worker = IsolatedMutantWorker(root, [], target, qualname)
+        worker = IsolatedMutantWorker(
+            root, [], target, qualname, mem_limit_bytes=mem_limit
+        )
     try:
         source = ast.unparse(mutant.mutated_node)
     except Exception:  # noqa: BLE001 — an un-unparseable mutant is un-evaluable: conservative survivor
-        return MutantResult(mutant=mutant, killed=False, elapsed_ms=0.0), worker
+        return MutantResult(mutant=mutant, killed=False, elapsed_ms=0.0), worker, None
     timeout_s = max(per_mutant_timeout_ms / 1000.0, _ISOLATED_MIN_TIMEOUT_S)
     t0 = time.monotonic()
     run = worker.evaluate(source, timeout_s, node_ids=node_ids)
-    return _isolated_result(mutant, run, _elapsed(t0)), worker
+    return _isolated_result(mutant, run, _elapsed(t0)), worker, run
 
 
 def run_function_profiling(
@@ -4902,6 +4918,7 @@ def run_function_profiling(
     trace_session_budget_s: float | None = DEFAULT_TRACE_SESSION_BUDGET_S,
     isolated: bool = False,
     check_determinism: bool = False,
+    worker_mem_limit_mb: int | None = None,
 ) -> ProfilingResult:
     """Profiling mode — generate mutants (exhaustive by default), evaluate with budget.
 
@@ -5009,7 +5026,9 @@ def run_function_profiling(
     # whole function. Root comes from the session ContextVar the baseline tracer already used, so the
     # worker's cwd matches the measured collection rather than a re-derived guess.
     _iso_worker: IsolatedMutantWorker | None = None
-    _iso_ctx: tuple[str, str, str, int] | None = None
+    _iso_ctx: tuple[str, str, str, int, int | None] | None = None
+    _mem_cut = False
+    _mem_enforced = False
     if isolated:
         import os
 
@@ -5020,6 +5039,10 @@ def run_function_profiling(
             source_path or "",
             qualname or "",
             _ISOLATED_WORKER_RECYCLE,
+            # The worker's address-space cap (W#21). Opt-in: None leaves the worker uncapped
+            # (telemetry only). A whole-worker ceiling, so a runaway mutant fails as a catchable
+            # MemoryError instead of taking the box down — a hard budget only where the OS accepts it.
+            worker_mem_limit_mb * 1024 * 1024 if worker_mem_limit_mb else None,
         )
     for count, mutant in enumerate(mutants):
         if progress is not None:
@@ -5048,9 +5071,12 @@ def run_function_profiling(
         )
         if isolated:
             assert _iso_ctx is not None
-            result, _iso_worker = _evaluate_isolated(
+            result, _iso_worker, _iso_run = _evaluate_isolated(
                 _iso_worker, mutant, _tests_for(mutant), _iso_ctx, per_mutant_timeout_ms
             )
+            if _iso_run is not None:
+                _mem_cut = _mem_cut or _iso_run.memory_cut
+                _mem_enforced = _mem_enforced or _iso_run.mem_enforced
         try:
             if not isolated:
                 result = evaluate_mutant(
@@ -5245,6 +5271,17 @@ def run_function_profiling(
             )
     _determinism_ok = _determinism != "nondeterministic"
 
+    # W#21 memory standing: "cut" when a mutant hit the worker's address-space cap (already
+    # non-gateable through that mutant's `contained=False`), else the HONEST enforcement capability —
+    # "enforced" only where the OS accepted the cap, "telemetry_only" otherwise, so a run over an
+    # unenforced limit is never described as memory-guaranteed. "n/a" on the in_process path.
+    if not isolated:
+        _memory_standing = "n/a"
+    elif _mem_cut:
+        _memory_standing = "cut"
+    else:
+        _memory_standing = memory_enforcement_standing(_mem_enforced)
+
     # The per-TestId outcome-qualified ledger (#17), from the SAME failed/truncated sets `_barred`
     # is built from, so the typed view and the derived `admissible_line_coverage` cannot disagree.
     # Containment is measurement-wide (absorbing), so it is stamped on every item. (The converged
@@ -5289,6 +5326,9 @@ def run_function_profiling(
         # The NAMED fast-mode shape standing (#19): why an in_process result is (not) gateable — a
         # "refuse_<hazard>" is the explicit refusal the issue asks for, "n/a" under isolated.
         fast_mode=_fast_mode,
+        # W#21: "cut" when a mutant hit the worker's memory cap (non-gateable), else the honest
+        # enforced/telemetry capability, "n/a" in-process.
+        memory_standing=_memory_standing,
         # The repeated-fresh-baseline determinism standing (#19): "nondeterministic" here is why an
         # otherwise-complete run is not gateable; "unchecked" when the opt-in did not run.
         determinism=_determinism,

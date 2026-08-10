@@ -952,3 +952,90 @@ def test_a_normally_entered_mutant_is_still_scored(tmp_path):
             _PROJECT_ROOT.reset(token)
     finally:
         _drop_project(tmp_path)
+
+
+# ── memory: enforce a budget in the killable worker, cut on overrun (W#21) ───────
+#
+# `apply_address_limit` (RLIMIT_AS) is now wired into the worker; a mutant that exceeds it fails as a
+# catchable MemoryError -> typed CUT, non-gateable. Enforcement is honestly reported (a Linux bonus;
+# macOS/Windows often report telemetry_only), so nothing claims a guarantee the platform did not keep.
+
+
+def test_memory_enforcement_standing_intent():
+    from Wesker.memory_guard import memory_enforcement_standing
+
+    assert memory_enforcement_standing(True) == "enforced"
+    # The OS did not accept the cap -> observation only; must NOT read as a guarantee.
+    assert memory_enforcement_standing(False) == "telemetry_only"
+
+
+def test_the_worker_flags_a_memory_error_as_a_budget_cut_and_survives(tmp_path):
+    """A mutant that exhausts memory (here, raises MemoryError — what the address-space cap produces)
+    is a CUT, not a kill; the worker reports it and STAYS ALIVE, so the parent can keep measuring."""
+    _tiny_project(tmp_path)
+    worker = IsolatedMutantWorker(str(tmp_path), ["test_t.py::test_f"], "t.py", "f")
+    try:
+        cut = worker.evaluate("def f(x):\n    raise MemoryError('boom')\n", 30.0)
+        assert cut.memory_cut is True
+        # A normal mutant is not a memory cut, and the worker is reused across both.
+        normal = worker.evaluate("def f(x):\n    return x - 1\n", 30.0)
+        assert normal.memory_cut is False
+        assert worker.alive is True
+    finally:
+        worker.close()
+
+
+def test_a_memory_cut_maps_to_a_non_gateable_cut_disposition():
+    """The engine turns a worker memory cut into a non-gateable `cut` disposition — unscored, never a
+    kill or a survivor."""
+    import ast
+
+    from Wesker.engine import (
+        _isolated_result,
+        generate_mutants,
+        mutant_disposition,
+    )
+    from Wesker.filter import filter_categories
+    from Wesker.isolation import IsolatedRun
+
+    node = ast.parse("def f(x):\n    return x + 1\n").body[0]
+    mutant = generate_mutants(node, filter_categories(node))[0]
+    res = _isolated_result(
+        mutant, IsolatedRun(1, False, True, "", memory_cut=True), 0.0
+    )
+    assert res.contained is False, "a memory cut must be non-gateable"
+    assert res.killed is False
+    assert (
+        mutant_disposition(
+            res.constructed, res.installed, res.entered, res.contained, res.killed
+        )
+        == "cut"
+    )
+
+
+def test_a_normal_isolated_run_reports_its_memory_capability_honestly(tmp_path):
+    """With no cap requested, an isolated run reports `telemetry_only` — memory was measured, not
+    bounded — and stays gateable; the capability never overstates the guarantee."""
+    from Wesker.ci import _PROJECT_ROOT
+    from Wesker.engine import run_function_profiling
+    from Wesker.filter import filter_categories
+
+    node, func_obj, tests = _real_project(tmp_path)
+    try:
+        token = _PROJECT_ROOT.set(str(tmp_path))
+        try:
+            r = run_function_profiling(
+                node,
+                "m.py::in_range",
+                filter_categories(node),
+                tests,
+                func_obj,
+                isolated=True,
+            )
+            assert r.memory_standing == "telemetry_only"
+            assert r.to_dict()["memory_standing"] == "telemetry_only"
+            assert r.is_gateable is True
+        finally:
+            _PROJECT_ROOT.reset(token)
+    finally:
+        _drop_project(tmp_path)

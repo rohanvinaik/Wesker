@@ -88,6 +88,9 @@ class _MutantPlugin:
         #: it was actually CALLED.
         self.installed = False
         self.ran = 0
+        #: True when a node hit `MemoryError` under the worker's address-space cap (W#21) — a budget
+        #: CUT, not a kill: the measurement could not complete, so the engine marks it non-gateable.
+        self.memory_cut = False
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_call(self, item: Any) -> Any:
@@ -129,6 +132,12 @@ class _MutantPlugin:
             return
         exc = excinfo[1]
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            return
+        if isinstance(exc, MemoryError):
+            # The address-space cap fired (W#21): the run exceeded its budget, so this is a CUT, not a
+            # kill. Flag it and record no kill reason — pytest's rc will read `failed`, but the engine
+            # checks the memory cut first and never scores it.
+            self.memory_cut = True
             return
         reason = classify_kill_reason(
             isinstance(exc, AssertionError), bool(is_declared_failure(exc))
@@ -176,7 +185,24 @@ def _evaluate_full(
         "installed": plugin.installed,
         "ran": plugin.ran,
         "entered": bool(getattr(mutated, "entered", False)),
+        # W#21: this mutant hit the worker's address-space cap — a budget CUT, not a kill.
+        "memory_cut": plugin.memory_cut,
     }
+
+
+def _apply_mem_limit(mem_limit_bytes: Any) -> bool:
+    """Apply the worker's address-space cap (W#21), returning whether the OS accepted it.
+
+    A positive ``mem_limit_bytes`` caps ``RLIMIT_AS`` so a runaway mutant fails as a catchable
+    ``MemoryError`` instead of taking the box down; Linux cooperates, macOS/Windows frequently do
+    not, and the returned bool is what `memory_guard.memory_enforcement_standing` turns into an
+    honest enforced/telemetry-only capability.
+    """
+    if not mem_limit_bytes:
+        return False
+    from Wesker.memory_guard import apply_address_limit
+
+    return apply_address_limit(int(mem_limit_bytes))
 
 
 def _trace_baseline_run(target_abspath: str, node_ids: list[str]) -> dict[str, Any]:
@@ -255,6 +281,9 @@ def _serve() -> int:
     real_stdout = sys.stdout  # captured BEFORE any redirect: the protocol channel
     session = json.loads(sys.stdin.readline())
     _setup(session)
+    # Apply the address-space cap ONCE per worker, at session start, before any mutant runs (W#21).
+    # `enforced` rides on every response so the parent reports an honest enforced/telemetry capability.
+    enforced = _apply_mem_limit(session.get("mem_limit_bytes"))
     target = _resolve_target(session["project_root"], session["target_file"])
     qualname = session["func_qualname"]
     session_nodes = session.get("node_ids", [])
@@ -265,6 +294,7 @@ def _serve() -> int:
         spec = json.loads(line)
         nodes = spec.get("node_ids") or session_nodes
         payload = _evaluate_full(target, qualname, nodes, spec["mutant_source"])
+        payload["enforced"] = enforced
         real_stdout.write(json.dumps(payload) + "\n")
         real_stdout.flush()
     return 0

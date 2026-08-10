@@ -217,6 +217,21 @@ def memory_budget_standing(
     return "exhausted" if growth_bytes > budget_bytes else "within"
 
 
+def memory_enforcement_standing(applied: bool) -> str:
+    """Whether an isolated worker's memory budget is ENFORCED or only observed (W#21, pure — pinned).
+
+    A hard budget is a promise only if the OS keeps it. `apply_address_limit` sets ``RLIMIT_AS`` so a
+    runaway allocation fails as a catchable ``MemoryError`` — but Linux cooperates, macOS often
+    rejects lowering the limit, and Windows has no ``resource`` module at all, so the cap frequently
+    does not land. When it did (``applied``), the boundary is ``enforced``: a mutant cannot grow the
+    worker past the cap. When it did not, the run is ``telemetry_only`` — memory is measured, not
+    bounded, and a consumer must NOT describe the result as memory-guaranteed. Naming the two apart is
+    the whole point of W#21's "do not describe a guarantee when the platform offers only observation":
+    collapsing them is how an unenforced run comes to read as a bounded one.
+    """
+    return "enforced" if applied else "telemetry_only"
+
+
 def run_baseline_bytes() -> int:
     """The RSS a run starts from. Capture once, before the work, and pass it to `over_budget`.
 

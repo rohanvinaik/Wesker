@@ -102,6 +102,12 @@ class IsolatedRun:
     installed: bool = True
     ran: int = 0
     entered_probe: bool = False
+    #: W#21 — memory budget signals from the server path. `memory_cut` is True when this mutant hit
+    #: the worker's address-space cap (a budget CUT, not a kill → non-gateable). `mem_enforced` says
+    #: whether the OS actually accepted the cap, so the parent reports an honest enforced/telemetry
+    #: capability rather than claiming a guarantee the platform did not keep.
+    memory_cut: bool = False
+    mem_enforced: bool = False
 
     @property
     def outcome(self) -> str:
@@ -556,6 +562,7 @@ class IsolatedMutantWorker:
         node_ids: Sequence[str],
         target_file: str,
         func_qualname: str,
+        mem_limit_bytes: int | None = None,
     ) -> None:
         self._proc = subprocess.Popen(
             [sys.executable, "-m", "Wesker._isolated_worker", "--serve"],
@@ -568,12 +575,16 @@ class IsolatedMutantWorker:
         )
         self._alive = True
         self._evaluated = 0
+        # `mem_limit_bytes` caps the worker's whole address space ONCE at session start (W#21), so a
+        # runaway mutant fails as a catchable MemoryError instead of taking the box down; None leaves
+        # the worker uncapped (telemetry only).
         session = json.dumps(
             {
                 "project_root": project_root,
                 "node_ids": list(node_ids),
                 "target_file": target_file,
                 "func_qualname": func_qualname,
+                "mem_limit_bytes": mem_limit_bytes,
             }
         )
         try:
@@ -646,6 +657,8 @@ class IsolatedMutantWorker:
             installed=bool(data.get("installed", True)),
             ran=int(data.get("ran", 0)),
             entered_probe=bool(data.get("entered", False)),
+            memory_cut=bool(data.get("memory_cut", False)),
+            mem_enforced=bool(data.get("enforced", False)),
         )
 
     def _reap(self) -> bool:

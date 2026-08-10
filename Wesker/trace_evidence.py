@@ -67,10 +67,16 @@ class TraceEvidence:
     contained: bool
     #: :func:`trace_admissibility` code — ``admissible`` or the reason it is not.
     reason: str
+    #: The (prev_line, cur_line) branch edges this item executed inside the target (#17), so a
+    #: consumer can distinguish the two sides of a conditional that ``lines`` alone collapses.
+    #: Empty unless the trace was run with arc capture (opt-in — it doubles the hot callback).
+    #: Governed by the SAME admissibility as ``lines``: a failing/truncated/uncontained owner's
+    #: arcs prove nothing either.
+    arcs: tuple[tuple[int, int], ...] = ()
 
     @property
     def admissible(self) -> bool:
-        """Whether this observation may discharge a statement obligation."""
+        """Whether this observation may discharge a statement OR arc obligation."""
         return self.reason == "admissible"
 
 
@@ -79,6 +85,7 @@ def build_trace_ledger(
     failed_ids: Iterable[str],
     truncated_ids: Iterable[str],
     contained: bool,
+    arc_coverage: Mapping[str, Iterable[tuple[int, int]]] | None = None,
 ) -> tuple[TraceEvidence, ...]:
     """The per-TestId ledger over every item with observed line coverage (#17).
 
@@ -87,9 +94,14 @@ def build_trace_ledger(
     reason, so a consumer sees "observed but does not prove" rather than the item silently
     vanishing (which is what an early ``admissible_line_coverage`` filter did, losing the fact
     that the line WAS reached, just not admissibly).
+
+    ``arc_coverage`` (optional) supplies each item's branch edges — from a trace run with arc
+    capture; when omitted, ``arcs`` is empty and only the statement view is populated. Arcs carry
+    the SAME per-item admissibility as lines, since they are the same observation seen finer.
     """
     failed = set(failed_ids)
     truncated = set(truncated_ids)
+    arcs = arc_coverage or {}
     ledger: list[TraceEvidence] = []
     for test_id in sorted(line_coverage):
         passed = test_id not in failed
@@ -102,6 +114,7 @@ def build_trace_ledger(
                 truncated=is_truncated,
                 contained=contained,
                 reason=trace_admissibility(passed, is_truncated, contained),
+                arcs=tuple(sorted(set(arcs.get(test_id, ())))),
             )
         )
     return tuple(ledger)

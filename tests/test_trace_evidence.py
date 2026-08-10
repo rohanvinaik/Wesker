@@ -109,3 +109,59 @@ def test_the_failing_only_counterexample_is_not_admissibly_complete(tmp_path):
     ids = {ev.test_id.rsplit("::", 1)[-1]: ev for ev in r.trace_evidence}
     assert ids["test_failing_only_cover"].admissible is False
     assert ids["test_green_branch"].admissible is True
+
+
+# ── arcs: branch edges, carrying the same admissibility as lines ───────────────────
+
+
+def test_arcs_carry_the_same_admissibility_as_lines():
+    """An arc from a failing owner is RETAINED but inadmissible — the same qualification lines get,
+    since an arc is the same observation seen finer."""
+    ledger = build_trace_ledger(
+        line_coverage={"t_ok": [2, 3], "t_fail": [2, 4]},
+        failed_ids={"t_fail"},
+        truncated_ids=set(),
+        contained=True,
+        arc_coverage={"t_ok": [(2, 3)], "t_fail": [(2, 4)]},
+    )
+    by_id = {ev.test_id: ev for ev in ledger}
+    assert by_id["t_ok"].arcs == ((2, 3),) and by_id["t_ok"].admissible is True
+    assert by_id["t_fail"].arcs == ((2, 4),) and by_id["t_fail"].admissible is False
+
+
+def test_arc_capture_distinguishes_both_branches_of_a_conditional(tmp_path):
+    """The #17 branch obligation. Line coverage cannot tell the True edge of a conditional from the
+    False edge; arc capture records `(2, 3)` for one and `(2, 4)` for the other."""
+    import importlib.util
+    import os
+
+    from Wesker.line_coverage import trace_suite
+
+    path = tmp_path / "cond.py"
+    path.write_text("def pick(flag):\n    if flag:\n        return 1\n    return 0\n")
+    spec = importlib.util.spec_from_file_location("condmod_arc_it", str(path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    def t_true():
+        assert module.pick(True) == 1
+
+    def t_false():
+        assert module.pick(False) == 0
+
+    arcs: dict = {}
+    trace_suite([t_true, t_false], {os.path.realpath(str(path))}, arcs_out=arcs)
+    observed = {a for files in arcs.values() for aset in files.values() for a in aset}
+    assert (2, 3) in observed, "the True edge was not recorded"
+    assert (2, 4) in observed, "the False edge was not recorded"
+
+
+def test_arc_capture_is_off_by_default():
+    """The hot path is untouched unless a caller opts in: no `arcs_out`, no arc work."""
+    from Wesker.line_coverage import _trace_one_multi
+
+    def _noop():
+        pass
+
+    _hits, _cut, _contained, arcs = _trace_one_multi(_noop, set(), capture_arcs=False)
+    assert arcs == {}

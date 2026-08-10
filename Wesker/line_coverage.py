@@ -293,8 +293,9 @@ def _trace_one_multi(
     test_fn: Callable[..., None],
     target_files: set[str],
     budget_s: float | None = None,
-) -> tuple[dict[str, set[int]], bool, bool]:
-    """Every line ``test_fn()`` executes in ANY of ``target_files``: ``({file: lines}, truncated)``.
+    capture_arcs: bool = False,
+) -> tuple[dict[str, set[int]], bool, bool, dict[str, set[tuple[int, int]]]]:
+    """Every line ``test_fn()`` executes in ANY of ``target_files``: ``({file: lines}, cut, contained, {file: arcs})``.
 
     Identical machinery to :func:`_trace_one` — the dispatch already decides per FRAME
     whether to trace, so watching N files costs the same single pass as watching one.
@@ -302,14 +303,27 @@ def _trace_one_multi(
     only per-function part, and it is a set operation over data already in hand.
 
     ``budget_s`` bounds this one test (see :func:`_trace_one` for the rationale and the
-    outside-the-interpreter boundary). The second element reports whether the budget CUT this
+    outside-the-interpreter boundary). The third element reports whether the budget CUT this
     test, so the caller can name it: a truncated trace under-reports coverage, which reads
     downstream as "no test reaches this line" — a silent cap would turn a timing accident into a
     false completeness verdict. Suite-wide this matters more than per-function, since one heavy
     test stalls the single shared baseline every function then reuses.
+
+    ``capture_arcs`` (#17): also record the ARC each line event completes — the ``(prev_line,
+    cur_line)`` transition WITHIN a frame — so a consumer can distinguish the two edges of a
+    conditional (``if x: a`` reaches ``a`` via one arc, the ``else`` body via another) that line
+    coverage alone collapses. OFF by default and gated because it roughly doubles the per-line
+    callback work on the engine's hottest path; a caller that needs branch obligations opts in and
+    pays for a fresh trace (arc runs bypass the line cache), while ordinary profiling is untouched.
+    The arc map is empty when ``capture_arcs`` is False.
     """
     hits: dict[str, set[int]] = {}
+    arcs: dict[str, set[tuple[int, int]]] = {}
     match = _target_matcher(target_files)
+    # Per-frame last matched line, so an arc is a transition WITHIN one frame — keyed by id(frame)
+    # and cleared on that frame's return, since a returned frame's id may be reused and a stale
+    # entry would forge an arc between two unrelated executions.
+    frame_last: dict[int, int] = {}
 
     def local(frame, event, _arg):
         # Key by the caller's TARGET spelling, not co_filename: downstream lookups
@@ -322,7 +336,16 @@ def _trace_one_multi(
             filename = frame.f_code.co_filename
             matched = filename if filename in target_files else match(filename)
             if matched is not None:
-                hits.setdefault(matched, set()).add(frame.f_lineno)
+                cur = frame.f_lineno
+                hits.setdefault(matched, set()).add(cur)
+                if capture_arcs:
+                    fid = id(frame)
+                    prev = frame_last.get(fid)
+                    if prev is not None and prev != cur:
+                        arcs.setdefault(matched, set()).add((prev, cur))
+                    frame_last[fid] = cur
+        elif capture_arcs and event == "return":
+            frame_last.pop(id(frame), None)
         return local
 
     def dispatch(frame, event, _arg):
@@ -335,7 +358,7 @@ def _trace_one_multi(
         return None
 
     truncated, contained = _traced_in_thread(test_fn, dispatch, budget_s)
-    return hits, truncated, contained
+    return hits, truncated, contained, arcs
 
 
 def trace_suite(
@@ -347,6 +370,7 @@ def trace_suite(
     session_budget_s: float | None = None,
     cache: dict[str, dict[str, list[int]]] | None = None,
     uncontained: set[str] | None = None,
+    arcs_out: dict[str, dict[str, set[tuple[int, int]]]] | None = None,
 ) -> dict[str, dict[str, set[int]]]:
     """Trace the WHOLE suite ONCE: ``{test_id: {file: lines}}``.
 
@@ -432,8 +456,16 @@ def trace_suite(
             if truncated is not None:
                 truncated.update(callable_test_id(t) for t in test_functions[i:])
             break
-        fp = test_fingerprint(test_fn) if cache is not None else None
+        # An arc run bypasses the LINE cache entirely (#17): the v3 cache stores only lines, so a
+        # hit would yield no arcs — an under-counted arc ledger that reads as a false branch gap.
+        # Forcing `fp = None` means arc runs neither read nor write the line cache, so they always
+        # trace fresh AND leave the line cache pure for the ordinary (cache-warm) profiling path.
+        want_arcs = arcs_out is not None
+        fp = (
+            test_fingerprint(test_fn) if (cache is not None and not want_arcs) else None
+        )
         hit = cache.get(fp) if (cache is not None and fp is not None) else None
+        arc_file: dict[str, set[tuple[int, int]]] = {}
         if hit is not None:
             # Measured before, by this engine, on these target files, under these budgets. The
             # trace is function-independent, so re-running it cannot produce a different answer —
@@ -448,8 +480,8 @@ def trace_suite(
                 contextlib.redirect_stdout(io.StringIO()),
                 contextlib.redirect_stderr(io.StringIO()),
             ):
-                per_file, was_cut, contained = _trace_one_multi(
-                    test_fn, target_files, budget_s
+                per_file, was_cut, contained, arc_file = _trace_one_multi(
+                    test_fn, target_files, budget_s, capture_arcs=want_arcs
                 )
             # See `trace_line_coverage`: an unstoppable worker is not an ordinary cut (#19).
             if not contained and uncontained is not None:
@@ -464,6 +496,10 @@ def trace_suite(
         bucket = out.setdefault(name, {})
         for f, lines in per_file.items():
             bucket[f] = bucket.get(f, set()) | lines
+        if want_arcs:
+            abucket = arcs_out.setdefault(name, {})
+            for f, aset in arc_file.items():
+                abucket[f] = abucket.get(f, set()) | aset
         if progress is not None:
             progress(i + 1, total, (time.monotonic() - started) * 1000.0)
     return out

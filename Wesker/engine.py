@@ -515,6 +515,17 @@ class ProfilingResult:
         """
         return {ln for ev in self.trace_evidence if ev.admissible for ln in ev.lines}
 
+    @property
+    def admissible_arc_union(self) -> set[tuple[int, int]]:
+        """Every branch edge an ADMISSIBLE observation executed — arc obligations proof may rest on (#17).
+
+        Empty unless the trace was run with arc capture. Distinguishes the two sides of a
+        conditional that :attr:`admissible_union` (statements) collapses: a suite that reaches a
+        line by only ONE of its incoming edges is line-complete but arc-incomplete, and this is the
+        view that shows it.
+        """
+        return {arc for ev in self.trace_evidence if ev.admissible for arc in ev.arcs}
+
     def to_dict(self) -> dict:
         # Mutants whose outcome measured the HARNESS, not the suite (#18) — never built, never
         # installed, never entered. `total_mutants` excludes them, so EMITTING THIS IS PART OF
@@ -616,6 +627,7 @@ class ProfilingResult:
                     "contained": ev.contained,
                     "admissible": ev.admissible,
                     "reason": ev.reason,
+                    **({"arcs": [list(a) for a in ev.arcs]} if ev.arcs else {}),
                 }
                 for ev in self.trace_evidence
             ]

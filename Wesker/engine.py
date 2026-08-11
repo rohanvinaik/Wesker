@@ -2681,12 +2681,13 @@ class LazySessionBaseline:
     Whatever wraps this must therefore live in the closure, not around the site that stores it.
     """
 
-    __slots__ = ("_build", "_value", "_built", "_budgets")
+    __slots__ = ("_build", "_value", "_built", "_budgets", "_regime_digest")
 
     def __init__(
         self,
         build: Callable[..., SessionBaseline],
         budgets: tuple[float | None, float | None] | None = None,
+        regime_digest: str = "",
     ) -> None:
         # Takes an optional subset of callables: the same closure builds the whole baseline
         # (subset=None) and the partial one `refresh` splices in, so both are measured under
@@ -2695,6 +2696,10 @@ class LazySessionBaseline:
         self._value: SessionBaseline | None = None
         self._built = False
         self._budgets = budgets
+        # The pytest execution-regime digest of THIS session's collection (#63), fixed when the
+        # closure is stored — like the budgets above, readable without forcing the trace, so a cache
+        # key can bind the regime a verdict was measured under before deciding to measure at all.
+        self._regime_digest = regime_digest
 
     def get(self) -> SessionBaseline:
         """The baseline, building it on first call. Memoised — the pass runs at most once.
@@ -2731,6 +2736,18 @@ class LazySessionBaseline:
         to avoid would defeat the laziness above.
         """
         return self._budgets
+
+    @property
+    def regime_digest(self) -> str:
+        """The pytest execution-regime digest of this session's collection, or ``""`` (#63).
+
+        Readable WITHOUT forcing the build, for the same reason and the same caller as ``budgets``:
+        the regime is fixed by the session's collection (which already happened when this holder was
+        stored), so a cache key can bind it before deciding whether it needs to measure at all. Empty
+        outside a live session or when no manifest was captured — the caller must then leave its key
+        unchanged, never invent a regime.
+        """
+        return self._regime_digest
 
     def invalidate(self) -> None:
         """Discard the built baseline so the next read rebuilds it from the CURRENT suite.
@@ -2817,6 +2834,19 @@ def session_budgets() -> tuple[float | None, float | None] | None:
     """
     holder = _SESSION_BASELINE.get()
     return holder.budgets if holder is not None else None
+
+
+def session_regime_digest() -> str:
+    """The pytest execution-regime digest the live session's baseline is built under, or ``""``
+    outside a live session (#63). Does NOT force the build — mirrors :func:`session_budgets`.
+
+    The read point for "which pytest regime produced this verdict". A consumer that caches a verdict
+    must key it on this, or a warm verdict measured under one regime (plugin set / import mode /
+    rootdir / ini) is served to a run under another. Empty means no live session or no captured
+    manifest — the caller leaves its key unchanged rather than invent a regime.
+    """
+    holder = _SESSION_BASELINE.get()
+    return holder.regime_digest if holder is not None else ""
 
 
 def build_session_baseline(

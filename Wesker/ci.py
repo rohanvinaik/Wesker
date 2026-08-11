@@ -1434,8 +1434,19 @@ def run_with_live_suite(
         # Stored, not built. Whether the suite is traced at all is now the consumer's demand:
         # a run whose own cache answers the question never triggers it, and a run that needs it
         # gets it once. See `LazySessionBaseline` for why that is where the cost belongs.
+        # The pytest regime this session collected under, captured fresh HERE (#63): run_in_session
+        # set the manifest during collection, BEFORE this body runs, and later per-mutant collect-only
+        # discoveries overwrite that ContextVar — so a verdict's regime must be read at this point and
+        # carried on the holder, not re-read at cache-key time. Scope-gated: only this live session's
+        # own manifest counts (a stale collect-only one is scope 0 and yields no regime).
+        from Wesker.pytest_discovery import last_session_manifest as _last_manifest
+
+        _m = _last_manifest()
+        _regime = _m.regime_digest if (_m is not None and _m.scope > 0) else ""
         base_token = (
-            _SESSION_BASELINE.set(LazySessionBaseline(_build, budgets=effective))
+            _SESSION_BASELINE.set(
+                LazySessionBaseline(_build, budgets=effective, regime_digest=_regime)
+            )
             if resolved
             else None
         )

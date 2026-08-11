@@ -177,6 +177,32 @@ class PytestSessionManifest:
         """
         return conflicting_module_names(self.module_origins)
 
+    @property
+    def regime_digest(self) -> str:
+        """A digest of the pytest EXECUTION REGIME (#63) — the config that determines HOW collected
+        tests run, so a warm verdict measured under one regime is not served under another.
+
+        Covers the runner identity a manifest can see: pytest and python version, rootdir, ini file,
+        import mode, and the loaded plugin set (sorted — load order is not a regime change). It does
+        NOT cover conftest or fixture CONTENT: an edit leaves the paths unchanged, so catching that
+        needs hashing those files, a further increment. Excludes ``items`` / ``scope`` /
+        ``collection_errors`` / ``invocation_args`` — those vary per collection, per session, and per
+        target-path selection, so folding them in would churn the key with no regime change.
+        """
+        import hashlib
+
+        payload = "\x00".join(
+            (
+                self.pytest_version,
+                self.python_version,
+                self.rootpath,
+                self.inipath,
+                self.import_mode,
+                *sorted(self.plugins),
+            )
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
 
 def capture_manifest(
     session: Any, config: Any, items: list[Any]

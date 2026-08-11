@@ -83,7 +83,7 @@ def test_a_live_session_for_B_does_not_consume_project_As_manifest(tmp_path):
         m = last_session_manifest()
         seen["rootpath"] = os.path.realpath(m.rootpath) if m and m.rootpath else None
         seen["scope"] = getattr(m, "scope", None)
-        seen["standing"], _ = _live_collection_identity()
+        seen["standing"], _, _ = _live_collection_identity()
 
     run_with_live_suite(b_root, _reader)
 

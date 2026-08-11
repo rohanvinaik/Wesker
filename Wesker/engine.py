@@ -421,6 +421,13 @@ class ProfilingResult:
     # the measurement may be perfectly counted and still be about the wrong copy of the code,
     # so `is_gateable` is False and the reason is nameable rather than a bare refusal.
     collection_conflicts: tuple[str, ...] = ()
+    # The runner's OWN node-ID proof basis (#58): each collected item as (node_id, content digest),
+    # from the manifest THIS live session captured (admissible per `manifest_admissibility`). A
+    # certificate freezes the exact items pytest selected — addressed as pytest addresses them —
+    # instead of a file set Detective re-derives from the kill matrix (which omits a line/arc-only
+    # owner) by reading config a second way. Empty when the collection was inadmissible/unobserved
+    # (e.g. a profile run OUTSIDE a live session); non-empty when the session CONFIRMED its identity.
+    proof_basis: tuple[tuple[str, str], ...] = ()
     per_category: list[CategoryResult] = field(default_factory=list)
     kill_matrix: dict[str, list[str]] = field(default_factory=dict)
     # The PROOF view of `line_coverage` (issue #17): the same map with the entries whose owner
@@ -2539,6 +2546,9 @@ class SessionBaseline:
         "uncontained",
         "arcs",
         "replayed",
+        "identity_standing",
+        "identity_conflicts",
+        "proof_basis",
     )
 
     def __init__(
@@ -2580,6 +2590,15 @@ class SessionBaseline:
         # can go stale under a fixture/config change) while routing still uses it. Empty on a cold
         # cache or the pre-#20 path — nothing replayed means every trace is fresh and admissible.
         self.replayed = replayed or set()
+        # The live collection's OWN module-identity standing, conflicting names, and node-ID proof
+        # basis (#58), captured ONCE under the session scope by `build_session_baseline`, where the
+        # manifest is admissible. Defaulted here so a baseline built by any other path reads as
+        # `unobserved` with an empty basis — never a false frozen basis. The per-mutant collect-only
+        # discoveries overwrite `_LAST_MANIFEST`, so a read at result-assembly time finds scope 0;
+        # storing it on the once-per-session baseline is the one place it stays admissible.
+        self.identity_standing: str = "unobserved"
+        self.identity_conflicts: tuple[str, ...] = ()
+        self.proof_basis: tuple[tuple[str, str], ...] = ()
 
     def replaced(
         self,
@@ -2908,7 +2927,12 @@ def build_session_baseline(
     # `cached_inert` holds the TEST IDS in both branches — read from disk when the outcomes
     # were reused, freshly collected otherwise — so it is the one place both paths agree on
     # which tests are barred, addressed by something the traced map is also keyed by (#17).
-    return SessionBaseline(
+    # Capture the live collection's OWN identity + node-ID proof basis HERE (#58), inside the
+    # session scope where the manifest is admissible — the per-mutant collect-only discoveries run
+    # later and would leave `_LAST_MANIFEST` at scope 0 for a result-assembly read. The passes above
+    # call the test callables directly (no pytest collection), so the scoped manifest is still current.
+    _standing, _conflicts, _basis = _live_collection_identity()
+    _sb = SessionBaseline(
         traced,
         failing,
         inert,
@@ -2919,6 +2943,10 @@ def build_session_baseline(
         arcs,
         replayed,
     )
+    _sb.identity_standing = _standing
+    _sb.identity_conflicts = _conflicts
+    _sb.proof_basis = _basis
+    return _sb
 
 
 def baseline_probe_disposition(outcome: str | None) -> str:
@@ -4000,12 +4028,20 @@ def _adaptive_allowance(
     return min(base, cap_ms, remaining_ms)
 
 
-def _live_collection_identity() -> tuple[str, tuple[str, ...]]:
-    """The live session's module-identity standing and the conflicting names (#58).
+def _live_collection_identity() -> tuple[
+    str, tuple[str, ...], tuple[tuple[str, str], ...]
+]:
+    """The live session's module-identity standing, conflicting names, and node-ID proof basis (#58).
 
     Defensive throughout: this describes a measurement and must never break one. No manifest —
     an older Wesker, a direct-call path that never collected, an import that failed — yields
-    ``unobserved``, which changes no verdict.
+    ``unobserved`` with an empty basis, which changes no verdict.
+
+    The proof basis is the admissible manifest's items as ``(node_id, origin_digest)`` — the runner's
+    own address for each selected test plus its content digest, so a certificate can freeze the exact
+    items pytest collected instead of a file set re-derived from the kill matrix. Surfaced whenever the
+    manifest is admissible; a consumer freezes on it only when the standing is ``confirmed``
+    (``collection_conflicts`` empty), never when ``ambiguous``.
     """
     try:
         from .pytest_discovery import current_measurement_scope, last_session_manifest
@@ -4017,7 +4053,7 @@ def _live_collection_identity() -> tuple[str, tuple[str, ...]]:
         manifest = last_session_manifest()
         scope = current_measurement_scope() or 0
     except Exception:  # noqa: BLE001 — describing the run must not fail the run
-        return "unobserved", ()
+        return "unobserved", (), ()
     # Admit the manifest only if THIS live session captured it (#26). A prior project's collection
     # left in the ContextVar, or a collect-only manifest never stamped by a live session, is
     # inadmissible — and inadmissible reads as `unobserved`, exactly as a missing manifest does,
@@ -4025,9 +4061,15 @@ def _live_collection_identity() -> tuple[str, tuple[str, ...]]:
     # session's collection.
     manifest_scope = getattr(manifest, "scope", 0) if manifest is not None else 0
     if manifest is None or manifest_admissibility(manifest_scope, scope) != "admit":
-        return "unobserved", ()
+        return "unobserved", (), ()
     conflicts = tuple(getattr(manifest, "conflicting_modules", ()) or ())
-    return collection_identity_standing(True, conflicts), conflicts
+    # The runner's own node-ID basis: each admissible item by (node_id, content digest).
+    basis = tuple(
+        (it.node_id, it.origin_digest)
+        for it in (getattr(manifest, "items", ()) or ())
+        if it.node_id
+    )
+    return collection_identity_standing(True, conflicts), conflicts, basis
 
 
 def _measurement_gateable(
@@ -5286,7 +5328,19 @@ def run_function_profiling(
     _contained = all_contained and not _baseline_uncontained
     # Read ONCE per result, next to the gate that consumes it (#58): the live collection's
     # own answer about module identity, not a reconstruction of it.
-    _identity_standing, _identity_conflicts = _live_collection_identity()
+    # Read the collection identity the SESSION BASELINE captured under scope (#58): a live read here
+    # would find `_LAST_MANIFEST` overwritten to scope 0 by the per-mutant discoveries and report
+    # `unobserved`. Fall back to a live read only when there is no session baseline (a standalone
+    # profile outside a live session), where the direct answer is the only one available.
+    _sb_identity = session_baseline()
+    if _sb_identity is not None:
+        _identity_standing = _sb_identity.identity_standing
+        _identity_conflicts = _sb_identity.identity_conflicts
+        _identity_basis = _sb_identity.proof_basis
+    else:
+        _identity_standing, _identity_conflicts, _identity_basis = (
+            _live_collection_identity()
+        )
 
     # Fast-mode SHAPE gate (#19): the in_process mode contains a runaway only by asking a thread to
     # stop, so it is gateable only over HERMETIC covering tests; a subprocess/thread/signal/
@@ -5391,6 +5445,7 @@ def run_function_profiling(
             _determinism_ok,
         ),
         collection_conflicts=_identity_conflicts,
+        proof_basis=_identity_basis,
         # A cut is any invalid measurement — budget overrun OR an uncontained worker (#13/#14),
         # from the mutation loop OR the baseline trace (#19): the depth must not read "profiled"
         # when the run stopped short or ran against a live abandoned worker. is_gateable already
@@ -5957,7 +6012,19 @@ def run_function_converged(
 
     # Read ONCE per result, next to the gate that consumes it (#58): the live collection's
     # own answer about module identity, not a reconstruction of it.
-    _identity_standing, _identity_conflicts = _live_collection_identity()
+    # Read the collection identity the SESSION BASELINE captured under scope (#58): a live read here
+    # would find `_LAST_MANIFEST` overwritten to scope 0 by the per-mutant discoveries and report
+    # `unobserved`. Fall back to a live read only when there is no session baseline (a standalone
+    # profile outside a live session), where the direct answer is the only one available.
+    _sb_identity = session_baseline()
+    if _sb_identity is not None:
+        _identity_standing = _sb_identity.identity_standing
+        _identity_conflicts = _sb_identity.identity_conflicts
+        _identity_basis = _sb_identity.proof_basis
+    else:
+        _identity_standing, _identity_conflicts, _identity_basis = (
+            _live_collection_identity()
+        )
 
     return ProfilingResult(
         function_key=func_key,
@@ -5979,6 +6046,7 @@ def run_function_converged(
             _identity_standing != "ambiguous",
         ),
         collection_conflicts=_identity_conflicts,
+        proof_basis=_identity_basis,
         per_category=per_cat,
         kill_matrix=kill_matrix,
         survivor_records=survivor_records,

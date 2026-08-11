@@ -17,6 +17,13 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
+# Both tests here drive Wesker through Detective's `profile` (cross-repo integration). Wesker's own CI
+# is zero-dependency and does not install its consumer, so the whole module skips there and runs where
+# both are present (local dev via PYTHONPATH, or Detective's CI which installs Wesker).
+pytest.importorskip("Detective")
+
 
 def test_proof_basis_is_the_runner_node_id_basis_through_the_session_baseline(tmp_path):
     """The payoff: a profile under a live session surfaces the runner's node-ID basis — each item as

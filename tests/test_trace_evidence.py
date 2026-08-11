@@ -15,6 +15,8 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
 from Wesker.trace_evidence import build_trace_ledger, trace_admissibility
 
 
@@ -123,6 +125,9 @@ def test_ledger_keeps_a_failing_owner_marked_inadmissible():
 def test_the_failing_only_counterexample_is_not_admissibly_complete(tmp_path):
     """The #59/#17 counterexample. Line 4 (`return 0`) is reached ONLY by the failing test; the
     admissible union must leave it OUT while the observed union keeps it for routing."""
+    # Cross-repo integration (drives Wesker through Detective's `profile`); skipped in Wesker's
+    # zero-dependency CI, run where both are present. See the module note on the arcs test.
+    pytest.importorskip("Detective")
     (tmp_path / "choo.py").write_text(
         "def choose(flag):\n    if flag:\n        return 1\n    return 0\n"
     )
@@ -212,6 +217,10 @@ def test_arcs_auto_populate_a_profiling_result_through_the_session_baseline(tmp_
     """The session-baseline auto-wiring (#17): a profile run under a live session carries arcs in
     every trace_evidence entry, and `admissible_arc_union` leaves the failing test's branch edge
     OUT — the whole chain (session baseline → _build_test_scope → ledger), not just the tracer."""
+    # Cross-repo integration test: it drives Wesker through Detective's `profile`. Wesker's own CI is
+    # zero-dependency and does not install its consumer, so skip there and run where both are present
+    # (local dev via PYTHONPATH, or Detective's CI which installs Wesker).
+    pytest.importorskip("Detective")
     (tmp_path / "arcapp.py").write_text(
         "def choose(flag):\n    if flag:\n        return 1\n    return 0\n"
     )

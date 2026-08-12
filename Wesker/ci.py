@@ -230,16 +230,17 @@ def _discover_all_test_files(
     patterns: tuple[str, ...] = _DEFAULT_TEST_PATTERNS,
     testpaths: tuple[str, ...] = (),
 ) -> list[str]:
-    """Every candidate test file in the project: files matching the repo's ``python_files`` globs
-    (``patterns``) ANYWHERE under the root, PLUS any file a ``testpaths`` entry names explicitly.
-    Matching pytest's default collection, not just ``tests/`` — so a fresh install without the
-    pytest extra still discovers root-level and package-level tests through the legacy loader
-    (otherwise a user whose tests live at the repo root gets a misleading 0% kill rate).
+    """Every candidate test file pytest WOULD collect, and no others — the impact map narrows this
+    pool by reachability, so a file pytest never collects must not enter it (or one function's
+    profile scopes onto a "test" from `bench/` that needs its own deps and errors the collection).
 
-    A bare ``test.py`` matches NEITHER default pattern, exactly as under pytest — pytest collects it
-    only because ``testpaths`` names it. So a name the patterns miss enters the set when, and only
-    when, ``testpaths`` points at it: the same rule pytest applies, not a wider net. ``patterns`` and
-    ``testpaths`` come from the caller's resolved regime; the defaults keep standalone Wesker correct.
+    Mirrors pytest's own rule: WITH ``testpaths``, collect only under those paths (a named file is
+    taken as-is — the bare-``test.py`` case a pattern would miss — a dir is pattern-scanned); WITHOUT
+    ``testpaths``, recurse the whole tree from the rootdir by ``python_files`` pattern (so a fresh
+    install whose tests live at the repo root is still found, not a misleading 0%). A bare
+    ``test.py`` matches NEITHER default pattern — pytest collects it only because ``testpaths`` names
+    it, and so does this. ``patterns`` / ``testpaths`` come from the caller's resolved regime; the
+    defaults keep standalone Wesker correct.
     """
     skip = {
         ".git",
@@ -269,32 +270,37 @@ def _discover_all_test_files(
     def _outside_skip(rel: Path) -> bool:
         return not any(part in skip or part.startswith(".") for part in rel.parts[:-1])
 
-    # Every `python_files` match anywhere under the root (skip-dirs pruned) — the broad candidate
-    # pool the impact map then narrows from by reachability.
-    for py in root.rglob("*.py"):
-        rel = py.relative_to(root)
-        if _outside_skip(rel) and _is_test_filename(py.name, patterns):
-            _add(py)
+    def _scan_dir(base: Path) -> None:
+        for py in base.rglob("*.py"):
+            try:
+                rel = py.resolve().relative_to(root.resolve())
+            except (ValueError, OSError):
+                continue
+            if _outside_skip(rel) and _is_test_filename(py.name, patterns):
+                _add(py)
 
-    # Explicit `testpaths` entries: a FILE is collected as-is (the bare-`test.py` case pytest
-    # collects only because testpaths names it); a DIR is scanned with the same patterns. Resolved
-    # against the root; an entry that escapes it is ignored rather than reaching outside the repo.
-    for tp in testpaths:
-        base = Path(tp) if os.path.isabs(tp) else root / tp
-        try:
-            base.resolve().relative_to(root.resolve())
-        except (ValueError, OSError):
-            continue
-        if base.is_file() and base.suffix == ".py":
-            _add(base)
-        elif base.is_dir():
-            for py in base.rglob("*.py"):
-                try:
-                    rel = py.resolve().relative_to(root.resolve())
-                except (ValueError, OSError):
-                    continue
-                if _outside_skip(rel) and _is_test_filename(py.name, patterns):
-                    _add(py)
+    if testpaths:
+        # pytest with `testpaths` collects ONLY under those paths — NOT the whole tree. A `test_*.py`
+        # in `bench/`, `examples/`, or `docs/` that pytest never collects must not enter the impact
+        # map either, or profiling one function scopes onto a "test" that needs its own deps and
+        # errors the collection. Found dogfooding structlog: `bench/test_benchmarks.py` (needs
+        # pytest-codspeed) was pulled in for a pure log-level function under `testpaths = "tests"`.
+        # Scan WITHIN each testpaths entry — a named FILE is taken as-is (the bare-`test.py` case a
+        # pattern would miss), a DIR is pattern-scanned. This is exactly what pytest would collect.
+        for tp in testpaths:
+            base = Path(tp) if os.path.isabs(tp) else root / tp
+            try:
+                base.resolve().relative_to(root.resolve())
+            except (ValueError, OSError):
+                continue
+            if base.is_file() and base.suffix == ".py":
+                _add(base)
+            elif base.is_dir():
+                _scan_dir(base)
+    else:
+        # No `testpaths`: pytest recurses from the rootdir, so scan the whole tree by pattern — the
+        # broad candidate pool the impact map then narrows by reachability.
+        _scan_dir(root)
 
     return sorted(found)
 
@@ -1529,25 +1535,26 @@ def run_with_live_suite(
             _PROJECT_ROOT.reset(root_token)
             _LIVE_SUITE.reset(suite_token)
 
-    result = run_in_session(project_root, _body, paths=paths, diagnostic=diagnostic)
-    if result is None and paths:
-        # The SCOPED collection bound nothing. That is a statement about the scope, not about
-        # the suite — and the expensive pass is right there. `paths` is an optimisation: it
-        # narrows collection to the files that could execute the target. When it narrows to a
-        # set that will not collect (one stale import among them is enough — pytest's collection
-        # is per-invocation, not per-file), the honest move is to pay for the whole suite rather
-        # than report a suite that does not exist. Measured on TailChasingFixer: the 6 scoped
-        # files could not collect, while the full 61 collect 815 tests.
-        #
-        # SAFE TO RETRY, and only because of the guard in `_Driver.pytest_runtestloop`: `body`
-        # is the consumer's whole program — it writes test files — so a retry that could
-        # double-run it would be far worse than a wrong number. `run_in_session` returns None
-        # ONLY when body never ran, so the first attempt has no side effects to repeat. Never
-        # retry on an exception: that means body DID run and raised.
-        #
-        # Coverage, not perfection: slow and correct beats fast and false. A user who wants the
-        # cheap answer already got it when the scope collected.
-        result = run_in_session(project_root, _body, paths=None, diagnostic=diagnostic)
+    # A local diagnostic so the widen decision below can read the REASON even when the caller passed
+    # none; when the caller did pass one it IS this dict, so nothing about their view changes.
+    _diag: dict[str, Any] = diagnostic if diagnostic is not None else {}
+    result = run_in_session(project_root, _body, paths=paths, diagnostic=_diag)
+    # Widen to the whole suite ONLY when the scope found NO test to collect (`empty_collection`) —
+    # the fixture-reached case where static scoping was too narrow, which is the reason this fallback
+    # exists. NEVER on `collection_errors`: the reachable tests EXIST and could not be collected — a
+    # broken import or missing dep in exactly the tests that pin THIS function. Widening then measures
+    # the target against IRRELEVANT tests it does not reach, drags in every OTHER module's import
+    # failure, and refuses against the whole GLOBAL regime — which is the per-function isolation this
+    # tool exists for, inverted. Report the reachable tests' own error instead (the caller refuses
+    # with it). Found dogfooding structlog: a pure log-level function refused because unrelated
+    # modules needed pytest-asyncio / renderer deps its own tests never touch.
+    #
+    # SAFE TO RETRY (the empty case) because of the guard in `_Driver.pytest_runtestloop`: `body` is
+    # the consumer's whole program — it writes test files — and `run_in_session` returns None ONLY
+    # when body never ran, so the first attempt has no side effects to repeat. Never on an exception
+    # (body DID run and raised).
+    if result is None and paths and _diag.get("reason") == "empty_collection":
+        result = run_in_session(project_root, _body, paths=None, diagnostic=_diag)
     return result
 
 

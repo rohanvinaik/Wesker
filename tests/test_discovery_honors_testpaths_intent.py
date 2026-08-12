@@ -19,7 +19,10 @@ from __future__ import annotations
 from Wesker.ci import (
     _discover_all_test_files,
     _DEFAULT_TEST_PATTERNS,
+    callable_origin,
+    discover_test_callables,
     relevant_test_files,
+    run_with_live_suite,
 )
 from Wesker.pytest_runner import run_in_session
 
@@ -91,3 +94,83 @@ def test_live_session_honors_testpaths_when_unscoped(tmp_path):
         str(tmp_path), lambda calls, _session: len(calls), paths=None
     )
     assert collected == 1
+
+
+# ── isolation: pin a function against its RELEVANT tests, never the whole global regime ──
+
+
+def test_testpaths_scopes_discovery_excluding_non_testpaths_dirs(tmp_path):
+    """pytest with ``testpaths`` collects ONLY under those paths. A ``test_*.py`` in ``bench/`` /
+    ``examples/`` that pytest never collects (and that needs its own deps) must NOT enter the impact
+    map — else profiling one function scopes onto a test that errors the collection. Found dogfooding
+    structlog, whose ``bench/test_benchmarks.py`` (needs pytest-codspeed) was pulled in under
+    ``testpaths = "tests"`` for a pure log-level function."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_lib.py").write_text("def test_a():\n    assert True\n")
+    (tmp_path / "bench").mkdir()
+    (tmp_path / "bench" / "test_benchmarks.py").write_text(
+        "def test_b():\n    assert True\n"
+    )
+    scoped = _names(_discover_all_test_files(str(tmp_path), testpaths=("tests",)))
+    assert scoped == {"test_lib.py"}, (
+        scoped
+    )  # bench/ excluded — pytest wouldn't collect it
+    # With NO testpaths, pytest recurses the whole tree, so both are candidates.
+    unscoped = _names(_discover_all_test_files(str(tmp_path)))
+    assert unscoped == {"test_lib.py", "test_benchmarks.py"}
+
+
+def test_a_scoped_collection_error_does_not_widen_to_the_whole_suite(tmp_path):
+    """The isolation contract. If the tests reaching THIS function cannot collect (a broken import in
+    them), do NOT widen to the whole suite — widening measures the target against IRRELEVANT tests it
+    never reaches and drags in every other module's failure. `run_with_live_suite` returns None with
+    reason ``collection_errors`` (the caller refuses with the relevant error), never silently swapping
+    in a different suite. `test_clean.py` here is what the old whole-suite widen WOULD have run."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_broken.py").write_text(
+        "import totally_nonexistent_xyz  # noqa\n\n\ndef test_b():\n    assert True\n"
+    )
+    (tmp_path / "tests" / "test_clean.py").write_text(
+        "def test_c():\n    assert True\n"
+    )
+    diag: dict = {}
+    ran = run_with_live_suite(
+        str(tmp_path),
+        lambda: "BODY_RAN",
+        paths=[str(tmp_path / "tests" / "test_broken.py")],
+        diagnostic=diag,
+    )
+    assert ran is None  # did NOT widen to collect test_clean and run the body
+    assert diag.get("reason") == "collection_errors"
+
+
+def test_a_clean_function_profiles_despite_an_unrelated_broken_module(tmp_path):
+    """The user-facing payoff (structlog): a broken UNRELATED test module must not block profiling a
+    function whose OWN reachable tests are clean. Plain pytest aborts collection on the broken module;
+    scoped discovery finds the target's real tests and ignores the rest."""
+    import sys
+
+    (tmp_path / "lib.py").write_text("def f(x):\n    return x + 1\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_lib.py").write_text(
+        "from lib import f\n\n\ndef test_f():\n    assert f(1) == 2\n"
+    )
+    (tmp_path / "tests" / "test_broken.py").write_text(
+        "import totally_nonexistent_xyz  # noqa\n\n\ndef test_b():\n    assert True\n"
+    )
+    sys.path.insert(0, str(tmp_path))
+    try:
+
+        def body():
+            cs = discover_test_callables(
+                str(tmp_path), "lib.py", ["f"], testpaths=("tests",)
+            )
+            return [callable_origin(c) or "" for c in cs]
+
+        origins = run_with_live_suite(str(tmp_path), body, target_files=["lib.py"])
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("lib", None)
+    assert origins is not None, "the clean function's tests could not be found"
+    assert any(o.endswith("test_lib.py") for o in origins)
+    assert not any(o.endswith("test_broken.py") for o in origins)

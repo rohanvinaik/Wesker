@@ -2636,7 +2636,7 @@ class SessionBaseline:
         # test's old branch edges drop with its old line trace and the re-measured ones take over.
         arcs = {k: v for k, v in self.arcs.items() if k not in affected}
         arcs.update(partial.arcs)
-        return SessionBaseline(
+        spliced = SessionBaseline(
             traced,
             [n for n in self.failing if n not in affected] + partial.failing,
             {i for i in self.inert if i not in removed_ids} | partial.inert,
@@ -2657,6 +2657,14 @@ class SessionBaseline:
             # drops the re-measured names from the replay set, promoting them back to admissible (#20).
             {n for n in self.replayed if n not in affected} | partial.replayed,
         )
+        # The session's collection IDENTITY (#58) is a fact about WHICH tests pytest collected, not
+        # about one test's coverage — a splice re-measures coverage, it does not re-collect. Carry
+        # the node-ID proof basis and identity standing over from the whole, or a freshened (or
+        # rewritten) baseline surfaces an EMPTY basis and the certificate loses its items.
+        spliced.identity_standing = self.identity_standing
+        spliced.identity_conflicts = self.identity_conflicts
+        spliced.proof_basis = self.proof_basis
+        return spliced
 
 
 class LazySessionBaseline:
@@ -2803,6 +2811,35 @@ class LazySessionBaseline:
             return False
         return True
 
+    def freshen_proof(self, covering: list[Callable[..., None]]) -> bool:
+        """Re-observe the PROOF-facing tests FRESH this session, so their reach leaves `replayed`.
+
+        The persistent trace cache serves a test's line reach by source key, and a replayed reach is
+        inadmissible for proof (#20): it was not observed under THIS session's fixtures / conftest /
+        config, so a warm run's certificate rested on an empty admissible ledger and reported a false
+        gap. `refresh` cannot fix it — its partial `_build` consults the same cache and simply replays
+        the rows. This re-traces exactly `covering` with the cache BYPASSED (`fresh=True`), so
+        `partial.replayed` is empty and `replaced` promotes those tests back to admissible. The cache
+        stays a shortlist; execution this session is the certificate. SELECTIVE by design — only this
+        function's covering tests are re-measured, never the suite — and it DEGRADES to a no-op on any
+        failure, exactly like `refresh`: a half-spliced basis would under-report coverage, which is the
+        false survivor the live session exists to prevent.
+        """
+        from Wesker.ci import callable_test_id
+
+        if not self._built or self._value is None or not covering:
+            return False
+        try:
+            affected = {callable_test_id(t) for t in covering}
+            partial = self._build(covering, fresh=True)
+            self._value = self._value.replaced(
+                affected, set(), partial, self._value.n_tests
+            )
+        except Exception:  # noqa: BLE001 — see `refresh`: correctness over speed
+            self.invalidate()
+            return False
+        return True
+
 
 # Set only by the live-session path; None everywhere else, so every existing caller
 # (Detective included) keeps the exact per-function behaviour it has today.
@@ -2819,6 +2856,37 @@ def session_baseline() -> SessionBaseline | None:
     """
     holder = _SESSION_BASELINE.get()
     return holder.get() if holder is not None else None
+
+
+def _freshen_proof_covering(
+    test_functions: list[Callable[..., None]],
+    line_cov: dict[str, list[int]],
+    exec_lines: list[int],
+    scope_tests: bool,
+) -> None:
+    """Re-observe THIS function's covering tests FRESH before the mutation loop, so a reach the
+    trace cache replayed leaves the admissible ledger — the certificate then stops reporting a false
+    gap on a warm run (#20). The persistent cache keeps its ROUTING value (``line_cov`` here was
+    built through it), but PROOF rests on execution this session. Selective: only tests whose reach
+    touches this function's executable lines are re-measured, never the suite. A no-op without a live
+    session, without scoping, or when nothing covering was replayed — ``freshen_proof`` degrades to a
+    no-op on any failure (a full re-trace), never a wrong answer. Called from BOTH profiling entry
+    points, next to the shared ``_build_test_scope``, so the two cannot drift on this.
+    """
+    holder = _SESSION_BASELINE.get()
+    if holder is None or not scope_tests or not exec_lines:
+        return
+    from Wesker.ci import callable_test_id
+
+    exec_set = set(exec_lines)
+    covering_ids = {
+        tid for tid, lines in line_cov.items() if exec_set.intersection(lines)
+    }
+    if not covering_ids:
+        return
+    covering = [t for t in test_functions if callable_test_id(t) in covering_ids]
+    if covering:
+        holder.freshen_proof(covering)
 
 
 def session_budgets() -> tuple[float | None, float | None] | None:
@@ -5131,6 +5199,9 @@ def run_function_profiling(
         _baseline_uncontained,
         _arc_cov,
     )
+    # Before the mutation loop: re-observe this function's covering tests fresh, so a warm run's
+    # replayed reach is promoted back to admissible and the certificate rests on this session (#20).
+    _freshen_proof_covering(test_functions, line_cov, exec_lines, scope_tests)
 
     # Live baseline for the adaptive per-mutant allowance (#13): time the ORIGINAL over the tests
     # once, untraced (the mutant loop is untraced too). None → fall back to the configured cap.
@@ -5802,6 +5873,9 @@ def run_function_converged(
         trace_session_budget_s,
         _baseline_uncontained,
     )
+    # Before the mutation loop: re-observe this function's covering tests fresh (same seam as the
+    # profiling path), so a warm run's replayed reach is promoted back to admissible (#20).
+    _freshen_proof_covering(test_functions, line_cov, exec_lines, scope_tests)
 
     seen: dict[str, MutantResult] = {}
     kill_matrix: dict[str, list[str]] = {}

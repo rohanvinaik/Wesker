@@ -1472,7 +1472,7 @@ def run_with_live_suite(
         # Bound here, at the session boundary, it is restored to the enclosing value in `finally`.
         root_token = _PROJECT_ROOT.set(os.path.abspath(project_root))
 
-        def _build(subset: list[Any] | None = None) -> Any:
+        def _build(subset: list[Any] | None = None, fresh: bool = False) -> Any:
             # The guard lives INSIDE the closure because the closure decides when it runs. The
             # baseline RUNS the consumer's whole suite — arbitrary third-party code — and any of
             # it can leave `sys.stdout` replaced: by assigning it, or by being cut mid-
@@ -1503,8 +1503,10 @@ def run_with_live_suite(
                     resolved,
                     trace_progress=trace_progress if subset is None else None,
                     # The persistent cache lives under the CONSUMER's `.wesker/`, so the root has
-                    # to reach it — this closure is the only place that has both.
-                    project_root=project_root,
+                    # to reach it — this closure is the only place that has both. `fresh` bypasses
+                    # it (project_root=None): a PROOF-facing re-observation must be measured THIS
+                    # session, never replayed from cache, so the partial leaves `replayed` (#20).
+                    project_root=None if fresh else project_root,
                     **budgets,
                 )
 

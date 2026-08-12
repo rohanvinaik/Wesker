@@ -2636,7 +2636,7 @@ class SessionBaseline:
         # test's old branch edges drop with its old line trace and the re-measured ones take over.
         arcs = {k: v for k, v in self.arcs.items() if k not in affected}
         arcs.update(partial.arcs)
-        spliced = SessionBaseline(
+        return SessionBaseline(
             traced,
             [n for n in self.failing if n not in affected] + partial.failing,
             {i for i in self.inert if i not in removed_ids} | partial.inert,
@@ -2657,14 +2657,6 @@ class SessionBaseline:
             # drops the re-measured names from the replay set, promoting them back to admissible (#20).
             {n for n in self.replayed if n not in affected} | partial.replayed,
         )
-        # The session's collection IDENTITY (#58) is a fact about WHICH tests pytest collected, not
-        # about one test's coverage — a splice re-measures coverage, it does not re-collect. Carry
-        # the node-ID proof basis and identity standing over from the whole, or a freshened (or
-        # rewritten) baseline surfaces an EMPTY basis and the certificate loses its items.
-        spliced.identity_standing = self.identity_standing
-        spliced.identity_conflicts = self.identity_conflicts
-        spliced.proof_basis = self.proof_basis
-        return spliced
 
 
 class LazySessionBaseline:
@@ -2829,12 +2821,32 @@ class LazySessionBaseline:
 
         if not self._built or self._value is None or not covering:
             return False
+        # Only a test whose reach was REPLAYED needs re-observing; a freshly-traced one is already
+        # admissible and re-tracing it is a wasted double-trace on a cold run. Nothing replayed in the
+        # covering set means nothing to promote — a true no-op.
+        replayed = self._value.replayed
+        covering = [t for t in covering if callable_test_id(t) in replayed]
+        if not covering:
+            return False
         try:
             affected = {callable_test_id(t) for t in covering}
+            # Drop the affected callables' id-keyed `inert` entries too: a cache-FAILING test that
+            # PASSES fresh this session must leave `inert`, not only `inert_ids`, or a rebuilt scope
+            # keeps excluding a freshly-green test. Same objects (re-traced, not re-collected) so ids
+            # match; `partial.inert` re-adds only the ones that still fail.
+            removed = {id(t) for t in covering}
             partial = self._build(covering, fresh=True)
-            self._value = self._value.replaced(
-                affected, set(), partial, self._value.n_tests
+            spliced = self._value.replaced(
+                affected, removed, partial, self._value.n_tests
             )
+            # Collection IDENTITY (#58) is about WHICH tests were collected; freshening RE-TRACES
+            # existing items, it does not re-collect, so self's basis is authoritative. Set it HERE,
+            # not in shared `replaced`: its other caller (`refresh` after a write) DID re-collect and
+            # must not inherit a stale-confirmed basis.
+            spliced.identity_standing = self._value.identity_standing
+            spliced.identity_conflicts = self._value.identity_conflicts
+            spliced.proof_basis = self._value.proof_basis
+            self._value = spliced
         except Exception:  # noqa: BLE001 — see `refresh`: correctness over speed
             self.invalidate()
             return False
@@ -2863,19 +2875,23 @@ def _freshen_proof_covering(
     line_cov: dict[str, list[int]],
     exec_lines: list[int],
     scope_tests: bool,
-) -> None:
+) -> bool:
     """Re-observe THIS function's covering tests FRESH before the mutation loop, so a reach the
     trace cache replayed leaves the admissible ledger — the certificate then stops reporting a false
     gap on a warm run (#20). The persistent cache keeps its ROUTING value (``line_cov`` here was
     built through it), but PROOF rests on execution this session. Selective: only tests whose reach
-    touches this function's executable lines are re-measured, never the suite. A no-op without a live
-    session, without scoping, or when nothing covering was replayed — ``freshen_proof`` degrades to a
-    no-op on any failure (a full re-trace), never a wrong answer. Called from BOTH profiling entry
-    points, next to the shared ``_build_test_scope``, so the two cannot drift on this.
+    touches this function's executable lines are re-measured, never the suite. Called from BOTH
+    profiling entry points, next to the shared ``_build_test_scope``, so the two cannot drift.
+
+    Returns True iff the baseline was spliced — the caller MUST then re-derive its whole scope
+    (`_tests_for`, `line_cov`, arcs, `failing`) from the freshened basis with FRESH containers, or it
+    keeps consuming the pre-freshen local coverage and relabels those STALE cached lines admissible
+    (the very thing this exists to stop). No-op (False) without a live session, without scoping, or
+    when nothing covering was replayed.
     """
     holder = _SESSION_BASELINE.get()
     if holder is None or not scope_tests or not exec_lines:
-        return
+        return False
     from Wesker.ci import callable_test_id
 
     exec_set = set(exec_lines)
@@ -2883,10 +2899,9 @@ def _freshen_proof_covering(
         tid for tid, lines in line_cov.items() if exec_set.intersection(lines)
     }
     if not covering_ids:
-        return
+        return False
     covering = [t for t in test_functions if callable_test_id(t) in covering_ids]
-    if covering:
-        holder.freshen_proof(covering)
+    return bool(covering) and holder.freshen_proof(covering)
 
 
 def session_budgets() -> tuple[float | None, float | None] | None:
@@ -5201,7 +5216,28 @@ def run_function_profiling(
     )
     # Before the mutation loop: re-observe this function's covering tests fresh, so a warm run's
     # replayed reach is promoted back to admissible and the certificate rests on this session (#20).
-    _freshen_proof_covering(test_functions, line_cov, exec_lines, scope_tests)
+    # If it spliced, RE-DERIVE the whole scope from the freshened basis with FRESH containers — else
+    # the ledger below keeps the pre-freshen local coverage/arcs and relabels those STALE cached
+    # lines admissible, and stale truncated/uncontained flags would union back in. `None` precomputed
+    # forces the re-read off the freshened SessionBaseline, not the pre-freshen local data.
+    if _freshen_proof_covering(test_functions, line_cov, exec_lines, scope_tests):
+        _trace_truncated = set()
+        _baseline_uncontained = set()
+        _arc_cov = {}
+        _tests_for, line_cov, exec_lines, failing = _build_test_scope(
+            func_node,
+            test_functions,
+            original_func,
+            scope_tests,
+            None,
+            qualname,
+            trace_budget_s,
+            _trace_truncated,
+            trace_progress,
+            trace_session_budget_s,
+            _baseline_uncontained,
+            _arc_cov,
+        )
 
     # Live baseline for the adaptive per-mutant allowance (#13): time the ORIGINAL over the tests
     # once, untraced (the mutant loop is untraced too). None → fall back to the configured cap.
@@ -5874,8 +5910,25 @@ def run_function_converged(
         _baseline_uncontained,
     )
     # Before the mutation loop: re-observe this function's covering tests fresh (same seam as the
-    # profiling path), so a warm run's replayed reach is promoted back to admissible (#20).
-    _freshen_proof_covering(test_functions, line_cov, exec_lines, scope_tests)
+    # profiling path), so a warm run's replayed reach is promoted back to admissible (#20). If it
+    # spliced, RE-DERIVE the scope from the freshened basis with FRESH containers (see the profiling
+    # path for why the pre-freshen locals must not be reused).
+    if _freshen_proof_covering(test_functions, line_cov, exec_lines, scope_tests):
+        _trace_truncated = set()
+        _baseline_uncontained = set()
+        _tests_for, line_cov, exec_lines, failing = _build_test_scope(
+            func_node,
+            test_functions,
+            original_func,
+            scope_tests,
+            None,
+            qualname,
+            trace_budget_s,
+            _trace_truncated,
+            trace_progress,
+            trace_session_budget_s,
+            _baseline_uncontained,
+        )
 
     seen: dict[str, MutantResult] = {}
     kill_matrix: dict[str, list[str]] = {}

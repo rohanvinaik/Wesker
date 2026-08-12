@@ -438,7 +438,13 @@ def run_in_session(
         "--capture=sys",
         "--continue-on-collection-errors",
     ]
-    args += paths or ["."]
+    # When the caller SCOPES (`paths` given), collect exactly those — the #15 optimisation. When it
+    # does NOT, pass no explicit path so pytest resolves collection the way the SUITE does, honoring
+    # `testpaths`. `["."]` defeated that: an explicit path arg makes pytest IGNORE `testpaths`, so a
+    # suite pytest collects ONLY because testpaths names it — a bare `test.py` — came back EMPTY, and
+    # the caller's loud fallback (paths=None) passed `["."]` too and stayed empty. cwd is already
+    # `project_root`, so a no-path run collects from the right root. Found dogfooding python-slugify.
+    args += paths or []
     cwd = os.getcwd()
     prev_path = list(sys.path)
     # Retain pytest's exit code and captured output (#66). A conftest / config that fails to LOAD —

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import fnmatch
 import hashlib
 import importlib.util
 import json
@@ -206,11 +207,40 @@ def _impact_lookup_keys(func_name: str) -> tuple[str, ...]:
 # ── Layer 3: Full fallback ───────────────────────────────────────
 
 
-def _discover_all_test_files(project_root: str) -> list[str]:
-    """Find all ``test_*.py`` files ANYWHERE in the project — matching pytest's default
-    collection, not just ``tests/`` — so a fresh install without the pytest extra still
-    discovers root-level and package-level tests through the legacy loader (otherwise a
-    user whose tests live at the repo root gets a misleading 0% kill rate)."""
+# pytest's DEFAULT `python_files` is BOTH of these, not just `test_*.py`. Discovery matched only the
+# first, so a repo whose suite is `*_test.py` (a pytest default) — or a bare `test.py` named via
+# `testpaths` — was invisible, and every function in it read a misleading 0% kill rate. Found by
+# dogfooding python-slugify: pytest collected its 82-test `test.py`, Wesker's discovery saw zero.
+_DEFAULT_TEST_PATTERNS: tuple[str, ...] = ("test_*.py", "*_test.py")
+
+
+def _is_test_filename(basename: str, patterns: tuple[str, ...]) -> bool:
+    """Whether ``basename`` is a pytest test module under ``patterns`` (pure — pinned).
+
+    ``patterns`` are ``python_files`` globs — the repo's configured set, or
+    :data:`_DEFAULT_TEST_PATTERNS`. A file matching ANY is a test module, the same OR pytest
+    applies. Matches the BASENAME only: ``python_files`` is a filename glob, and matching a full
+    path would let a directory component satisfy ``test_*`` and pull non-test files into the suite.
+    """
+    return any(fnmatch.fnmatch(basename, pat) for pat in patterns)
+
+
+def _discover_all_test_files(
+    project_root: str,
+    patterns: tuple[str, ...] = _DEFAULT_TEST_PATTERNS,
+    testpaths: tuple[str, ...] = (),
+) -> list[str]:
+    """Every candidate test file in the project: files matching the repo's ``python_files`` globs
+    (``patterns``) ANYWHERE under the root, PLUS any file a ``testpaths`` entry names explicitly.
+    Matching pytest's default collection, not just ``tests/`` — so a fresh install without the
+    pytest extra still discovers root-level and package-level tests through the legacy loader
+    (otherwise a user whose tests live at the repo root gets a misleading 0% kill rate).
+
+    A bare ``test.py`` matches NEITHER default pattern, exactly as under pytest — pytest collects it
+    only because ``testpaths`` names it. So a name the patterns miss enters the set when, and only
+    when, ``testpaths`` points at it: the same rule pytest applies, not a wider net. ``patterns`` and
+    ``testpaths`` come from the caller's resolved regime; the defaults keep standalone Wesker correct.
+    """
     skip = {
         ".git",
         ".venv",
@@ -228,12 +258,45 @@ def _discover_all_test_files(project_root: str) -> list[str]:
     }
     root = Path(project_root)
     found: list[str] = []
-    for py in sorted(root.rglob("test_*.py")):
+    seen: set[str] = set()
+
+    def _add(py: Path) -> None:
+        key = str(py)
+        if key not in seen:
+            seen.add(key)
+            found.append(key)
+
+    def _outside_skip(rel: Path) -> bool:
+        return not any(part in skip or part.startswith(".") for part in rel.parts[:-1])
+
+    # Every `python_files` match anywhere under the root (skip-dirs pruned) — the broad candidate
+    # pool the impact map then narrows from by reachability.
+    for py in root.rglob("*.py"):
         rel = py.relative_to(root)
-        if any(part in skip or part.startswith(".") for part in rel.parts[:-1]):
+        if _outside_skip(rel) and _is_test_filename(py.name, patterns):
+            _add(py)
+
+    # Explicit `testpaths` entries: a FILE is collected as-is (the bare-`test.py` case pytest
+    # collects only because testpaths names it); a DIR is scanned with the same patterns. Resolved
+    # against the root; an entry that escapes it is ignored rather than reaching outside the repo.
+    for tp in testpaths:
+        base = Path(tp) if os.path.isabs(tp) else root / tp
+        try:
+            base.resolve().relative_to(root.resolve())
+        except (ValueError, OSError):
             continue
-        found.append(str(py))
-    return found
+        if base.is_file() and base.suffix == ".py":
+            _add(base)
+        elif base.is_dir():
+            for py in base.rglob("*.py"):
+                try:
+                    rel = py.resolve().relative_to(root.resolve())
+                except (ValueError, OSError):
+                    continue
+                if _outside_skip(rel) and _is_test_filename(py.name, patterns):
+                    _add(py)
+
+    return sorted(found)
 
 
 # ── 3-Layer discovery orchestrator ───────────────────────────────
@@ -274,7 +337,10 @@ def discover_tests(
 
 
 def relevant_test_files(
-    project_root: str, source_file: str, func_names: list[str]
+    project_root: str,
+    source_file: str,
+    func_names: list[str],
+    testpaths: tuple[str, ...] = (),
 ) -> list[str]:
     """Layers 1+2 of :func:`discover_tests` — convention and static impact, WITHOUT the
     full-tree fallback. The test files plausibly exercising ``source_file``, and no others.
@@ -303,7 +369,9 @@ def relevant_test_files(
     """
     found = _discover_by_convention(project_root, source_file)
     found_set = set(found)
-    impact_map = _build_static_impact_map(_discover_all_test_files(project_root))
+    impact_map = _build_static_impact_map(
+        _discover_all_test_files(project_root, testpaths=testpaths)
+    )
     for func_name in func_names:
         # A dotted method qualname (`Basket.tier`) is looked up under its trailing attribute too,
         # because the impact map keys on the bare `.tier` a test's call site carries, never the
@@ -817,6 +885,7 @@ def discover_test_callables(
     backend: str = "auto",
     extra_dirs: list[str] | None = None,
     conservative: bool = False,
+    testpaths: tuple[str, ...] = (),
 ) -> list[Any]:
     """Discover runnable test callables — a dial over two backends.
 
@@ -856,7 +925,9 @@ def discover_test_callables(
     # test file in the project, and each of the three backends below then paid for the
     # ~12x of them that cannot reach the target — in collection, in the traced baseline,
     # and again per mutant.
-    scoped = relevant_test_files(project_root, full_path, func_names)
+    scoped = relevant_test_files(
+        project_root, full_path, func_names, testpaths=testpaths
+    )
     extra = [os.path.abspath(d) for d in (extra_dirs or []) if os.path.isdir(d)]
 
     # A live session collected the whole suite once, WITH real fixtures/conftest/lifecycle —

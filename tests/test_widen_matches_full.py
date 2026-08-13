@@ -79,7 +79,7 @@ def test_seed_widen_matches_full_baseline():
 
     target_files = {original.__code__.co_filename}
 
-    def build(subset=None):
+    def build(subset=None, fresh=False):
         return build_session_baseline(
             tests if subset is None else list(subset), target_files
         )
@@ -121,7 +121,7 @@ def test_widen_with_no_survivors_is_a_noop():
         t.__globals__["scoreit"] = original
     target_files = {original.__code__.co_filename}
 
-    def build(subset=None):
+    def build(subset=None, fresh=False):
         return build_session_baseline(
             tests if subset is None else list(subset), target_files
         )

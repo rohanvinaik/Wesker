@@ -2880,7 +2880,12 @@ class LazySessionBaseline:
         if not self._built or self._value is None or not more:
             return False
         try:
-            partial = self._build(more)
+            # fresh=True bypasses the trace cache: a widened test's reach must be observed THIS
+            # session, never replayed. A stale cached "covers no target line" would drop the test
+            # from `_tests_for`, hiding a real kill as a false survivor (#Fix-B/#20) — the one thing
+            # the widen exists to prevent. The seed's own reach is freshened separately by
+            # `freshen_proof`; the widened tests have no such pass, so they must be fresh here.
+            partial = self._build(more, fresh=True)
             self._value = self._value.replaced(
                 set(), set(), partial, self._value.n_tests + partial.n_tests
             )

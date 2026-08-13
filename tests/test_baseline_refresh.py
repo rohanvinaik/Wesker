@@ -99,7 +99,7 @@ def test_refresh_does_not_force_a_build_that_never_happened():
 
 
 def test_refresh_splices_into_a_built_baseline():
-    def build(subset=None):
+    def build(subset=None, fresh=False):
         return (
             _bl({"test_b": {"f.py": {9}}}, n_tests=1)
             if subset
@@ -119,7 +119,7 @@ def test_refresh_degrades_to_invalidate_when_the_partial_build_raises():
     # re-trace, which is exactly what invalidation did unconditionally.
     state = {"full": 0}
 
-    def build(subset=None):
+    def build(subset=None, fresh=False):
         if subset is not None:
             raise RuntimeError("the consumer's test blew up mid-trace")
         state["full"] += 1
@@ -145,7 +145,7 @@ def test_refresh_equals_a_full_rebuild():
         "test_new": {"f.py": {3}},
     }
 
-    def build(subset=None):
+    def build(subset=None, fresh=False):
         names = subset if subset is not None else list(suite)
         return _bl({n: suite[n] for n in names if n in suite}, n_tests=len(names))
 
@@ -197,7 +197,7 @@ def test_refreshing_one_file_keeps_a_same_named_test_in_another_module(
 
     traced_with: list[list[str]] = []
 
-    def build(subset=None):
+    def build(subset=None, fresh=False):
         ids = [ci.callable_test_id(c) for c in (subset or [])]
         traced_with.append(ids)
         return _bl({i: {"f.py": {1}} for i in ids}, n_tests=len(ids))
@@ -255,7 +255,7 @@ def _suite_build(suite):
     """A build closure over a name->coverage dict, treating `subset` as a name list (mirrors the
     real closure, which traces exactly the callables it is handed)."""
 
-    def build(subset=None):
+    def build(subset=None, fresh=False):
         names = list(suite) if subset is None else list(subset)
         return _bl({n: suite[n] for n in names if n in suite}, n_tests=len(names))
 
@@ -266,7 +266,7 @@ def test_seed_measures_only_the_candidate_subset():
     suite = {"test_a": {"f.py": {1}}, "test_b": {"f.py": {2}}, "test_c": {"f.py": {3}}}
     seen: list[list[str]] = []
 
-    def build(subset=None):
+    def build(subset=None, fresh=False):
         names = list(suite) if subset is None else list(subset)
         seen.append(names)
         return _bl({n: suite[n] for n in names if n in suite}, n_tests=len(names))
@@ -322,7 +322,7 @@ def test_expand_degrades_to_invalidate_when_the_partial_build_raises():
     suite = {"test_a": {"f.py": {1}}, "test_b": {"f.py": {2}}}
     state = {"full": 0}
 
-    def build(subset=None):
+    def build(subset=None, fresh=False):
         if subset is not None and "test_b" in subset:
             raise RuntimeError("the consumer's test blew up mid-trace")
         if subset is None:
@@ -343,3 +343,21 @@ def test_expand_is_a_noop_on_an_unbuilt_or_empty_batch():
     assert holder.expand(["test_a"]) is False  # nothing seeded yet -> nothing to widen
     holder.seed(["test_a"])
     assert holder.expand([]) is False  # empty batch -> no-op
+
+
+def test_expand_traces_widened_tests_fresh_but_seed_uses_the_cache():
+    # #Fix-B/#20: a widened test's reach must be observed THIS session, never replayed from the
+    # trace cache — a stale "covers no target line" would drop it from `_tests_for`, hiding a real
+    # kill as a false survivor. The seed relies on `freshen_proof` instead, so it may use the cache.
+    suite = {"test_a": {"f.py": {1}}, "test_b": {"f.py": {2}}}
+    fresh_by_call: list[bool] = []
+
+    def build(subset=None, fresh=False):
+        fresh_by_call.append(fresh)
+        names = list(suite) if subset is None else list(subset)
+        return _bl({n: suite[n] for n in names if n in suite}, n_tests=len(names))
+
+    holder = LazySessionBaseline(build)
+    holder.seed(["test_a"])
+    holder.expand(["test_b"])
+    assert fresh_by_call == [False, True]  # seed: cache-ok; expand: fresh-required

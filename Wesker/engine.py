@@ -494,6 +494,10 @@ class ProfilingResult:
     # signal, not weak tests. -1 = not populated (older callers), so consumers can
     # tell "no tests" apart from "unknown". Prevents a silent, misleading 0%.
     tests_discovered: int = -1
+    # Per-function routing census (#15): the exact partition that decided the target-first seed.
+    # Counts only — TestIds remain in trace_evidence/proof_basis. Empty means routing was not used
+    # (standalone/unscoped/older caller), never "all buckets were zero".
+    test_routing: dict[str, int] = field(default_factory=dict)
     # The candidate-operator policy census (#22): what the policy did to EVERY category on this
     # target — generated, or withheld/not_applicable with a reason — so a reader can audit not just
     # how many mutants ran but why the absent ones are absent (a purity-suppressed STATE alternative
@@ -741,6 +745,8 @@ class ProfilingResult:
             d["executable_lines"] = self.executable_lines
         if self.failing_tests:
             d["failing_tests"] = self.failing_tests
+        if self.test_routing:
+            d["test_routing"] = dict(self.test_routing)
         return d
 
 
@@ -2861,7 +2867,10 @@ class LazySessionBaseline:
         """
         if self._built:
             return
-        self._value = self._build(candidates)
+        # A prior trace may decide ORDER, never proof. In particular, a cached negative can become
+        # positive after fixture/module context changes; measuring the small candidate basis fresh
+        # makes stale reach structurally incapable of producing a false survivor (#15/#20).
+        self._value = self._build(candidates, fresh=True)
         self._built = True
 
     def expand(self, more: list[Callable[..., None]]) -> bool:
@@ -3018,6 +3027,8 @@ def build_session_baseline(
     trace_progress: Callable[[int, int, float], None] | None = None,
     trace_session_budget_s: float | None = DEFAULT_TRACE_SESSION_BUDGET_S,
     project_root: str | None = None,
+    fresh: bool = False,
+    regime_digest: str = "",
 ) -> SessionBaseline:
     """Run the suite-global baseline passes ONCE. See :class:`SessionBaseline`.
 
@@ -3052,10 +3063,15 @@ def build_session_baseline(
     # every later one does not. Off (project_root=None) it behaves exactly as before.
     budgets = (trace_budget_s, trace_session_budget_s)
     targets_fp = trace_cache.targets_fingerprint(target_files) if project_root else ""
-    cache = (
-        trace_cache.load(project_root, targets_fp, budgets) if project_root else None
+    persisted_cache = (
+        trace_cache.load(project_root, targets_fp, budgets, regime_digest)
+        if project_root
+        else None
     )
-    before = len(cache) if cache is not None else 0
+    # A proof-facing partial bypasses every cache READ, but still writes its fresh observation back
+    # below. That is how one function's widen becomes routing evidence for a sibling in the same
+    # file without ever becoming the sibling's proof basis (#15/#20).
+    cache = {} if (fresh and project_root) else persisted_cache
 
     truncated: set[str] = set()
     uncontained: set[str] = set()
@@ -3081,43 +3097,91 @@ def build_session_baseline(
     # `inert` is keyed by id() — a fact about THIS heap — so it can never be read from disk.
     # The NAMES are what persist; the ids are rebuilt here against the live callables. Same
     # information, addressed by something that survives a process boundary.
-    cached_failing, cached_inert = (
+    prior_failing, prior_inert, prior_outcomes, prior_outcome_fps = (
         trace_cache.load_outcomes(project_root)
-        if (project_root and cache)
-        else ([], [])
+        if (project_root and persisted_cache)
+        else ([], [], [], {})
     )
-    reuse_outcomes = bool(cache) and before > 0 and len(cache) == before
-    if reuse_outcomes:
-        inert_names = set(cached_inert)
-        failing = list(cached_failing)
-        # Match by TEST ID, not ``__name__`` (issue #16). Under name matching, two tests
-        # sharing a name and one of them inert marked BOTH inert on every cache reload —
-        # and an inert test is barred from kill attribution, so the innocent one's kills
-        # silently became survivors. The bug only appeared on a WARM cache, which is why
-        # it survived: the cold path keys by `id()` of the actual callable and is exact.
-        inert = {id(t) for t in test_functions if callable_test_id(t) in inert_names}
-    else:
-        inert_names_out: list[str] = []
-        for test_fn in test_functions:
-            outcome = _run_test_with_timeout(test_fn, None, True, timeout_ms)
-            if outcome is not None:
-                inert.add(id(test_fn))
-                inert_names_out.append(callable_test_id(test_fn))
-                if outcome == "assertion":
-                    # An assertion that fails on correct code is a WRONG EXPECTATION — the
-                    # narrower thing failing_on_baseline reports to a human. Other outcomes
-                    # are ambiguous and are barred from attribution without accusation.
-                    failing.append(callable_test_id(test_fn))
-        cached_inert = inert_names_out
-    if project_root and cache is not None and not truncated:
-        # Never persist a truncated pass: what a budget cut is absent, not zero, and a cache
-        # that remembers the cut serves a false gap forever.
+    entries_out = dict(persisted_cache or {})
+    entries_out.update(cache or {})
+    if project_root and cache is not None:
+        # CHECKPOINT REACH BEFORE the second (plain outcome) pass. An interruption there must not
+        # erase the exact trace just paid for. Outcome qualification is separately keyed per TestId
+        # below, so a checkpointed item with no outcome is re-run, never assumed green (#15/#17).
         trace_cache.save(
-            project_root, targets_fp, budgets, cache, failing, list(cached_inert)
+            project_root,
+            targets_fp,
+            budgets,
+            entries_out,
+            prior_failing,
+            prior_inert,
+            regime_digest,
+            prior_outcomes,
+            prior_outcome_fps,
         )
-    # `cached_inert` holds the TEST IDS in both branches — read from disk when the outcomes
-    # were reused, freshly collected otherwise — so it is the one place both paths agree on
-    # which tests are barred, addressed by something the traced map is also keyed by (#17).
+
+    prior_failing_set = set(prior_failing)
+    prior_inert_set = set(prior_inert)
+    prior_outcome_set = set(prior_outcomes)
+    current_ids = {callable_test_id(t) for t in test_functions}
+    current_inert: list[str] = []
+    current_outcomes: set[str] = set()
+    current_outcome_fps: dict[str, str] = {}
+    for test_fn in test_functions:
+        test_id = callable_test_id(test_fn)
+        test_fp = trace_cache.test_fingerprint(test_fn)
+        # A proof-facing fresh partial re-observes outcome as well as reach. A normal warm build may
+        # reuse an exact per-TestId outcome; absence means unmeasured, not green.
+        if (
+            not fresh
+            and test_id in prior_outcome_set
+            and prior_outcome_fps.get(test_id) == test_fp
+        ):
+            outcome = (
+                "assertion"
+                if test_id in prior_failing_set
+                else ("inert" if test_id in prior_inert_set else None)
+            )
+        else:
+            outcome = _run_test_with_timeout(test_fn, None, True, timeout_ms)
+        current_outcomes.add(test_id)
+        current_outcome_fps[test_id] = test_fp
+        if outcome is not None:
+            inert.add(id(test_fn))
+            current_inert.append(test_id)
+            if outcome == "assertion":
+                # An assertion that fails on correct code is a WRONG EXPECTATION — the
+                # narrower thing failing_on_baseline reports to a human. Other outcomes
+                # are ambiguous and are barred from attribution without accusation.
+                failing.append(test_id)
+    if project_root and cache is not None:
+        # Persist the individually COMPLETE cells even when a sibling was cut. `trace_suite` never
+        # inserts a cut cell, so that TestId remains absent/UNKNOWN on the next run; discarding the
+        # other N-1 exact observations because one item timed out defeats per-TestId routing and is
+        # unnecessary. What is forbidden is persisting the CUT item, not the safe remainder (#15).
+        # Replace the current subset's outcome cells and preserve every other TestId. This is the
+        # outcome analogue of the trace splice above; exact identities make partial persistence
+        # deterministic rather than all-or-nothing.
+        failing_out = [tid for tid in prior_failing if tid not in current_ids] + failing
+        inert_out = [
+            tid for tid in prior_inert if tid not in current_ids
+        ] + current_inert
+        outcomes_out = sorted((prior_outcome_set - current_ids) | current_outcomes)
+        outcome_fps_out = {
+            tid: fp for tid, fp in prior_outcome_fps.items() if tid not in current_ids
+        }
+        outcome_fps_out.update(current_outcome_fps)
+        trace_cache.save(
+            project_root,
+            targets_fp,
+            budgets,
+            entries_out,
+            failing_out,
+            inert_out,
+            regime_digest,
+            outcomes_out,
+            outcome_fps_out,
+        )
     # Capture the live collection's OWN identity + node-ID proof basis HERE (#58), inside the
     # session scope where the manifest is admissible — the per-mutant collect-only discoveries run
     # later and would leave `_LAST_MANIFEST` at scope 0 for a result-assembly read. The passes above
@@ -3129,7 +3193,7 @@ def build_session_baseline(
         inert,
         len(test_functions),
         truncated,
-        set(cached_inert),
+        set(current_inert),
         uncontained,
         arcs,
         replayed,
@@ -5562,6 +5626,11 @@ def run_function_profiling(
         and (budget_ms is None or _elapsed(start) <= budget_ms)
     ):
         _widen_holder.expand(list(widen_tests))
+        # The widen itself runs tests and can cross the aggregate deadline even when there are NO
+        # survivors to enter the loop below (line-only closeout). Consume that elapsed signal here;
+        # a cut unknown partition is unresolved and can never remain gateable (#15 closeout #6).
+        if budget_ms is not None and _elapsed(start) > budget_ms:
+            budget_exhausted = True
         _wt: set[str] = set()
         _wu: set[str] = set()
         _wa: dict[str, list[tuple[int, int]]] = {}

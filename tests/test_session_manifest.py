@@ -70,6 +70,14 @@ def test_plugins_are_reproducible_across_sessions():
     first = _capture([("4372631232", anon_a), ("anyio", object())])
     second = _capture([("4407692992", anon_b), ("anyio", object())])
     assert first.plugins == second.plugins
+    assert first.regime_digest == "", "an unobserved plugin regime must be uncacheable"
+
+
+def test_anonymous_plugin_count_is_not_a_cross_session_identity():
+    first = _capture([("4372631232", object())])
+    second = _capture([("4407692992", object())])
+    assert first.plugins == second.plugins == ("<unnamed>:1",)
+    assert first.regime_digest == second.regime_digest == ""
 
 
 def test_an_anonymous_plugin_is_counted_even_though_it_cannot_be_named():

@@ -10,6 +10,9 @@ to handle, and the case a broken widen would report as a false survivor.
 """
 
 import ast
+import time
+
+import Wesker.engine as engine
 
 from Wesker.engine import (
     _SESSION_BASELINE,
@@ -193,3 +196,50 @@ def test_seed_widen_matches_full_baseline_on_run_function_profiling():
     assert any(
         "test_false" in k for killers in full.kill_matrix.values() for k in killers
     )
+
+
+def test_line_only_widen_that_crosses_the_budget_is_non_gateable(monkeypatch):
+    """#15 closeout: no survivors must not hide a deadline crossed inside line widening."""
+    src = "def value():\n    return 1\n"
+    node = _fn(src)
+    ns: dict = {}
+    exec(compile(ast.parse(src), "<line-only-cut>", "exec"), ns)  # noqa: S102
+    original = ns["value"]
+
+    def killer():
+        raise AssertionError("kills every mutant")
+
+    def build(subset=None, fresh=False):
+        return build_session_baseline([], set())
+
+    holder = LazySessionBaseline(build)
+    holder.seed([killer])
+
+    def scope(*args, **kwargs):
+        # One uncovered executable line with every mutant already killed: widening is line-only.
+        return (lambda mutant: [killer]), {"seed": [1]}, [1, 2], []
+
+    def slow_expand(self, more):
+        time.sleep(0.2)
+        return True
+
+    monkeypatch.setattr(engine, "_build_test_scope", scope)
+    monkeypatch.setattr(LazySessionBaseline, "expand", slow_expand)
+    token = _SESSION_BASELINE.set(holder)
+    try:
+        result = run_function_profiling(
+            node,
+            "<line-only-cut>::value",
+            {MutationCategory.VALUE},
+            [killer],
+            original,
+            budget_ms=100,
+            widen_tests=[killer],
+        )
+    finally:
+        _SESSION_BASELINE.reset(token)
+
+    assert result.total_survived == 0
+    assert result.budget_exhausted is True
+    assert result.coverage_depth == "cut"
+    assert result.is_gateable is False

@@ -345,10 +345,9 @@ def test_expand_is_a_noop_on_an_unbuilt_or_empty_batch():
     assert holder.expand([]) is False  # empty batch -> no-op
 
 
-def test_expand_traces_widened_tests_fresh_but_seed_uses_the_cache():
-    # #Fix-B/#20: a widened test's reach must be observed THIS session, never replayed from the
-    # trace cache — a stale "covers no target line" would drop it from `_tests_for`, hiding a real
-    # kill as a false survivor. The seed relies on `freshen_proof` instead, so it may use the cache.
+def test_seed_and_expand_trace_every_proof_facing_test_fresh():
+    # #15/#20: a cache may route, never prove. A stale "covers no target line" in either the seed
+    # or widen would drop a real killer from `_tests_for`, so both subsets are observed this session.
     suite = {"test_a": {"f.py": {1}}, "test_b": {"f.py": {2}}}
     fresh_by_call: list[bool] = []
 
@@ -360,7 +359,7 @@ def test_expand_traces_widened_tests_fresh_but_seed_uses_the_cache():
     holder = LazySessionBaseline(build)
     holder.seed(["test_a"])
     holder.expand(["test_b"])
-    assert fresh_by_call == [False, True]  # seed: cache-ok; expand: fresh-required
+    assert fresh_by_call == [True, True]
 
 
 def test_fork_is_an_independent_unbuilt_holder_no_sibling_corruption():

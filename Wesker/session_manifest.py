@@ -27,8 +27,10 @@ from which files. Per-item outcomes belong to the run and are not here.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import os
 import sys
+import contextlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -183,14 +185,23 @@ class PytestSessionManifest:
         tests run, so a warm verdict measured under one regime is not served under another.
 
         Covers the runner identity a manifest can see: pytest and python version, rootdir, ini file,
-        import mode, and the loaded plugin set (sorted — load order is not a regime change). It does
-        NOT cover conftest or fixture CONTENT: an edit leaves the paths unchanged, so catching that
-        needs hashing those files, a further increment. Excludes ``items`` / ``scope`` /
-        ``collection_errors`` / ``invocation_args`` — those vary per collection, per session, and per
-        target-path selection, so folding them in would churn the key with no regime change.
+        import mode, and the loaded plugin set (sorted — load order is not a regime change).
+        Distribution plugins bind their version; unversioned/local plugins (including conftests)
+        bind canonical source path + content digest. Per-item fixture definitions are additionally
+        bound by ``trace_cache.test_fingerprint``. Excludes ``items`` / ``scope`` /
+        ``collection_errors`` / ``invocation_args`` — those vary per collection, per session, and
+        per target-path selection, so folding them in would churn the key with no regime change.
         """
         import hashlib
 
+        # An unobserved/unreadable plugin has no cross-session identity. Keep the MANIFEST itself
+        # reproducible, but refuse to mint a cache key from incomplete regime evidence; consumers
+        # interpret "" as uncacheable/unknown rather than equating two unknown plugin contexts.
+        if any(
+            "@<unobserved>" in p or ":<unreadable>" in p or p.startswith("<unnamed>:")
+            for p in self.plugins
+        ):
+            return ""
         payload = "\x00".join(
             (
                 self.pytest_version,
@@ -273,8 +284,50 @@ def capture_manifest(
             entry = versioned.get(id(plugin))
             if entry:
                 named.append(entry)
-            elif name and not name.startswith("_") and not name.isdigit():
-                named.append(name)
+                continue
+
+            stable_name = bool(name and not name.startswith("_") and not name.isdigit())
+            owner_name = getattr(plugin, "__module__", "") or getattr(
+                type(plugin), "__module__", ""
+            )
+            owner_qualname = getattr(type(plugin), "__qualname__", "")
+            label = (
+                str(name)
+                if stable_name
+                else ".".join(p for p in (owner_name, owner_qualname) if p)
+            )
+
+            origin = getattr(plugin, "__file__", None)
+            if not origin and owner_name:
+                owner = sys.modules.get(owner_name)
+                origin = getattr(owner, "__file__", None)
+            if not origin and stable_name:
+                # Pytest registers several builtin plugins twice (``cacheprovider`` and
+                # ``pytest_cacheprovider``) with a sentinel rather than the module object.
+                # Resolve the loaded builtin module by its canonical namespace; this is an
+                # observation of sys.modules, not a guessed file path.
+                base = str(name).removeprefix("pytest_")
+                owner = sys.modules.get(f"_pytest.{base}")
+                origin = getattr(owner, "__file__", None)
+                if not origin:
+                    with contextlib.suppress(ImportError, AttributeError, ValueError):
+                        plugin_spec = importlib.util.find_spec(f"_pytest.{base}")
+                        origin = getattr(plugin_spec, "origin", None)
+
+            if origin and label:
+                # An unversioned plugin is commonly a local conftest/module. Its NAME stays stable
+                # across an edit while its hooks can begin reaching a target, so name-only regime
+                # identity is not enough for proof-grade cached routing (#15). Bind the canonical
+                # source path and digest when observable; unreadable still widens by changing the
+                # entry from a falsely authoritative bare name to an explicit unknown-content one.
+                canonical = os.path.realpath(str(origin))
+                digest = _digest(canonical) or "<unreadable>"
+                named.append(f"{label}@{canonical}:{digest}")
+            elif stable_name:
+                # Without an observable plugin identity there is nothing safe to compare across
+                # sessions. Make the regime deliberately uncacheable rather than treating two
+                # unknown plugins as the same execution context.
+                named.append(f"{name}@<unobserved>")
             else:
                 anonymous += 1
         # The COUNT is kept even though the identities cannot be: it is stable across runs and

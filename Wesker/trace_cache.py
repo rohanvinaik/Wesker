@@ -49,6 +49,7 @@ import hashlib
 import inspect
 import json
 import os
+import tempfile
 from collections.abc import Callable
 from typing import Any
 
@@ -66,7 +67,12 @@ _VERSION = (
     # list, a v4 cell a dict, so a v3 file loaded under v4 would raise the moment `trace_suite`
     # read `cell["lines"]` — the version bump orphans every v3 entry so it re-traces once under
     # the new shape rather than crashing on the old one.
-    4  # the on-disk shape; bump to orphan every prior entry rather than misread one
+    # 5 (issue #15): cached non-reach became routing evidence, so the key bound the whole
+    # test/fixture context and pytest regime.
+    # 7 (issue #15/#20): each observed outcome carries the same content fingerprint as its trace.
+    # Reusing by TestId alone survived an edit under the same node ID and relabelled the old outcome
+    # current even though the trace correctly missed.
+    7  # the on-disk shape; bump to orphan every prior entry rather than misread one
 )
 
 
@@ -99,19 +105,50 @@ def test_fingerprint(fn: Callable[..., Any]) -> str:
     """
     # Contract accessors, not raw attribute reads (issue #6) — local import because ci
     # imports lazily in the other direction (same pattern as engine's trace_cache import).
-    from Wesker.ci import callable_node_id, callable_source
+    from Wesker.ci import (
+        callable_fixture_origins,
+        callable_node_id,
+        callable_origin,
+        callable_source,
+    )
 
     real = callable_source(fn)
     disc = callable_node_id(fn)
     try:
-        return _sha(inspect.getsource(real) + "\x00" + disc)
+        declared = inspect.getsource(real)
     except (OSError, TypeError):
         # No readable source (a C callable, a closure built at runtime). Its NAME is not content,
         # so this cannot detect an edit — but it is stable, and the alternative is refusing to
         # cache the whole suite because one test is unreadable.
-        return _sha(
-            f"{getattr(real, '__module__', '?')}.{getattr(real, '__qualname__', repr(real))}\x00{disc}"
-        )
+        declared = f"{getattr(real, '__module__', '?')}.{getattr(real, '__qualname__', repr(real))}"
+
+    # The function body is not the whole call path. A module helper or autouse/conftest fixture can
+    # begin reaching the target while the test's own source stays byte-identical. Hash the complete
+    # origin files governing this item before a cached non-reach may become routing evidence.
+    origin = callable_origin(fn)
+    context_files = {os.path.realpath(p) for p in callable_fixture_origins(fn) if p}
+    if origin:
+        origin = os.path.realpath(origin)
+        context_files.add(origin)
+        parent = os.path.dirname(origin)
+        while parent and parent != os.path.dirname(parent):
+            conftest = os.path.join(parent, "conftest.py")
+            if os.path.isfile(conftest):
+                context_files.add(os.path.realpath(conftest))
+            parent = os.path.dirname(parent)
+
+    context: list[str] = []
+    for path in sorted(context_files):
+        try:
+            with open(path, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            # No content identity means no cross-run identity. A per-call nonce deliberately makes
+            # this item uncacheable; reusing a stable "unreadable" sentinel would let two unknown
+            # contexts compare equal and promote stale non-reach to impossible.
+            digest = f"<unreadable:{os.urandom(8).hex()}>"
+        context.append(f"{path}:{digest}")
+    return _sha("\x00".join((declared, disc, *context)))
 
 
 def targets_fingerprint(target_files: set[str]) -> str:
@@ -158,7 +195,10 @@ def _path(project_root: str) -> str:
 
 
 def load(
-    project_root: str, targets: str, budgets: tuple[float | None, float | None]
+    project_root: str,
+    targets: str,
+    budgets: tuple[float | None, float | None],
+    regime_digest: str = "",
 ) -> dict:
     """`{test_fingerprint: {file: [lines]}}` for entries still valid — {} when none are.
 
@@ -175,7 +215,11 @@ def load(
         return {}
     if blob.get("engine") != _engine_version():
         return {}
-    if blob.get("targets") != targets or blob.get("budgets") != list(budgets):
+    if (
+        blob.get("targets") != targets
+        or blob.get("budgets") != list(budgets)
+        or blob.get("regime", "") != regime_digest
+    ):
         return {}
     entries = blob.get("entries")
     return entries if isinstance(entries, dict) else {}
@@ -188,29 +232,103 @@ def save(
     entries: dict[str, dict[str, Any]],
     failing: list[str],
     inert_names: list[str],
+    regime_digest: str = "",
+    outcomes_observed: list[str] | None = None,
+    outcome_fingerprints: dict[str, str] | None = None,
 ) -> None:
     """Write the baseline. Best-effort: a cache that fails a run is worse than no cache."""
+    temp_path = ""
     try:
-        os.makedirs(os.path.join(project_root, _CACHE_DIR), exist_ok=True)
-        with open(_path(project_root), "w", encoding="utf-8") as fh:
+        cache_dir = os.path.join(project_root, _CACHE_DIR)
+        os.makedirs(cache_dir, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".trace_cache.", dir=cache_dir, text=True
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(
                 {
                     "version": _VERSION,
                     "engine": _engine_version(),
                     "targets": targets,
                     "budgets": list(budgets),
+                    "regime": regime_digest,
                     "entries": entries,
                     "failing": sorted(set(failing)),
                     "inert_names": sorted(set(inert_names)),
+                    "outcomes_observed": sorted(set(outcomes_observed or ())),
+                    "outcome_fingerprints": dict(outcome_fingerprints or {}),
                 },
                 fh,
             )
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp_path, _path(project_root))
     except (OSError, TypeError, ValueError):
         return
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
 
 
-def load_outcomes(project_root: str) -> tuple[list[str], list[str]]:
-    """`(failing, inert_names)` from the same file `load` just validated — the SECOND pass.
+def observed_function_reach(
+    project_root: str,
+    target_files: set[str],
+    budgets: tuple[float | None, float | None],
+    regime_digest: str,
+    test_functions: list[Callable[..., Any]],
+    target_file: str,
+    executable_lines: set[int],
+) -> dict[str, str]:
+    """Prior per-TestId reach for ONE function; absent means genuinely unobserved (#15).
+
+    This is routing evidence only. The admitted seed is fresh-traced before it can prove a mutant
+    disposition. A complete cell with no intersecting line becomes negative evidence only after
+    the same exact TestId also completed the baseline-outcome pass. A trace interrupted by an
+    exception records the lines reached before it stopped; without outcome qualification, absence
+    could mean "did not enter" or merely "did not finish" and must remain UNKNOWN.
+    """
+    from Wesker.ci import callable_test_id
+
+    if not regime_digest:
+        return {}
+    cache = load(
+        project_root,
+        targets_fingerprint(target_files),
+        budgets,
+        regime_digest,
+    )
+    if not cache:
+        return {}
+    _failing, _inert, outcomes_observed, outcome_fingerprints = load_outcomes(
+        project_root
+    )
+    outcomes = set(outcomes_observed)
+    target = os.path.realpath(target_file)
+    out: dict[str, str] = {}
+    for test_fn in test_functions:
+        test_id = callable_test_id(test_fn)
+        fingerprint = test_fingerprint(test_fn)
+        hit = cache.get(fingerprint)
+        if hit is None:
+            continue
+        lines: set[int] = set()
+        for path, cell in hit.items():
+            if os.path.realpath(path) == target:
+                lines.update(int(ln) for ln in cell.get("lines", ()))
+        if executable_lines.intersection(lines):
+            out[test_id] = "reached"
+        elif test_id in outcomes and outcome_fingerprints.get(test_id) == fingerprint:
+            out[test_id] = "not_reached"
+    return out
+
+
+def load_outcomes(
+    project_root: str,
+) -> tuple[list[str], list[str], list[str], dict[str, str]]:
+    """Outcome facts plus their TestId→content-fingerprint identity from the SECOND pass.
 
     `build_session_baseline` runs the suite twice: traced, then plain, for `failing`/`inert`.
     Caching only the trace would leave half the bill standing, and the plain pass is the same
@@ -220,8 +338,13 @@ def load_outcomes(project_root: str) -> tuple[list[str], list[str]]:
         with open(_path(project_root), encoding="utf-8") as fh:
             blob = json.load(fh)
     except (OSError, ValueError):
-        return [], []
-    return list(blob.get("failing") or []), list(blob.get("inert_names") or [])
+        return [], [], [], {}
+    return (
+        list(blob.get("failing") or []),
+        list(blob.get("inert_names") or []),
+        list(blob.get("outcomes_observed") or []),
+        dict(blob.get("outcome_fingerprints") or {}),
+    )
 
 
 def _engine_version() -> str:

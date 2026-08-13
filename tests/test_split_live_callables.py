@@ -9,7 +9,7 @@ so nothing eligible is dropped, which is the one-sided soundness the whole routi
 
 from __future__ import annotations
 
-from Wesker.ci import split_live_callables
+from Wesker.ci import callable_test_id, partition_live_callables, split_live_callables
 
 
 def _mk(origin, fixtures=()):
@@ -70,3 +70,31 @@ def test_an_unparseable_file_is_treated_as_naming_the_target(tmp_path):
     )
     assert _names(candidates) == {str(bad_f)}
     assert unknowns == []
+
+
+def test_exact_observed_reach_populates_all_three_routing_buckets(tmp_path):
+    """#15 intent: observed reach is consumed; absent reach stays unknown, never impossible."""
+    names_f = tmp_path / "test_names.py"
+    names_f.write_text("from mod import target\n")
+    silent_f = tmp_path / "test_silent.py"
+    silent_f.write_text("import mod\n")
+    unseen_f = tmp_path / "test_unseen.py"
+    unseen_f.write_text("import mod\n")
+    reached, missed, unseen = _mk(names_f), _mk(silent_f), _mk(unseen_f)
+    live = [reached, missed, unseen]
+    observed = {
+        callable_test_id(reached): "reached",
+        callable_test_id(missed): "not_reached",
+    }
+
+    candidates, unknowns, impossible = partition_live_callables(
+        live,
+        [str(names_f), str(silent_f), str(unseen_f)],
+        "target",
+        ["target"],
+        observed,
+    )
+
+    assert _names(candidates) == {str(names_f)}
+    assert _names(unknowns) == {str(unseen_f)}
+    assert _names(impossible) == {str(silent_f)}

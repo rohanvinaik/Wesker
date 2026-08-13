@@ -547,21 +547,50 @@ def split_live_callables(
     which the seed does not yet have. So ``candidates ∪ unknowns`` is exactly what the non-split
     router would keep — the split only orders WHICH are traced first, never which are eligible. The
     driver seeds ``candidates``, and widens with ``unknowns`` only when a mutant survives the seed."""
+    candidates, unknowns, _impossible = partition_live_callables(
+        live, scoped, target_name, func_names
+    )
+    return candidates, unknowns
+
+
+def partition_live_callables(
+    live: list[Any],
+    scoped: list[str],
+    target_name: str,
+    func_names: list[str],
+    observed_reach: dict[str, str] | None = None,
+) -> tuple[list[Any], list[Any], list[Any]]:
+    """Partition into candidate / unknown / proof-grade impossible for ONE function (#15).
+
+    Static and fixture evidence can only promote an unseen item to CANDIDATE. The third bucket is
+    populated solely from an exact per-TestId observation loaded under the same target content,
+    test/fixture context, and pytest regime. Missing evidence remains UNKNOWN. The legacy
+    :func:`split_live_callables` wrapper preserves its two-way API for callers without observations.
+    """
     naming_files = _files_referencing_target(scoped, target_name)
     fixture_ref = _fixture_files_reaching_target(live, func_names)
     candidates: list[Any] = []
     unknowns: list[Any] = []
+    impossible: list[Any] = []
+    observed_reach = observed_reach or {}
     for c in live:
         origin = os.path.realpath(callable_origin(c) or "")
         names_target = origin in naming_files
         fx = {os.path.realpath(f) for f in callable_fixture_origins(c)}
         fixture_reaches = bool(fx & fixture_ref)
-        code = route_test_item(names_target, fixture_reaches, "unseen", False)
+        code = route_test_item(
+            names_target,
+            fixture_reaches,
+            observed_reach.get(callable_test_id(c), "unseen"),
+            False,
+        )
         if code.startswith("candidate"):
             candidates.append(c)
+        elif code.startswith("impossible"):
+            impossible.append(c)
         else:
             unknowns.append(c)
-    return candidates, unknowns
+    return candidates, unknowns, impossible
 
 
 # ── Test callable loading ────────────────────────────────────────
@@ -1560,12 +1589,18 @@ def run_with_live_suite(
                 return build_session_baseline(
                     subset if subset is not None else (_LIVE_SUITE.get() or callables),
                     resolved,
-                    trace_progress=trace_progress if subset is None else None,
+                    # Every routed phase reports itself. The callback resets after each completed
+                    # batch, so a seed and a later widen are two honest progress phases rather than
+                    # a fast mutant "done" line followed by minutes of silence (#15/Fix B).
+                    trace_progress=trace_progress,
                     # The persistent cache lives under the CONSUMER's `.wesker/`, so the root has
                     # to reach it — this closure is the only place that has both. `fresh` bypasses
-                    # it (project_root=None): a PROOF-facing re-observation must be measured THIS
-                    # session, never replayed from cache, so the partial leaves `replayed` (#20).
-                    project_root=None if fresh else project_root,
+                    # it (`fresh=True`): a proof-facing re-observation is measured THIS session,
+                    # then persisted as ROUTING evidence for another function — never relabelled as
+                    # this run's admissible proof reach (#15/#20).
+                    project_root=project_root,
+                    fresh=fresh,
+                    regime_digest=_regime,
                     **budgets,
                 )
 

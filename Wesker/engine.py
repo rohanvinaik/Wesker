@@ -5584,6 +5584,10 @@ def run_function_profiling(
         _arc_cov.update(_wa)
         for _mid, _mutant in list(_survivor_mutants.items()):
             if budget_ms is not None and _elapsed(start) > budget_ms:
+                # A cut widen leaves some survivors NOT re-evaluated against the unknowns
+                # (closeout #6): a negative gap is only valid once every unknown is resolved, so
+                # mark the run exhausted — non-gateable, never a false gap or a synthesis target.
+                budget_exhausted = True
                 break
             _remaining_ms = (
                 budget_ms - _elapsed(start)

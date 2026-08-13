@@ -507,6 +507,63 @@ def _route_live_callables(
     return kept
 
 
+def _files_referencing_target(files: list[str], target_name: str) -> set[str]:
+    """Realpaths of the ``files`` whose AST statically references ``target_name`` (the target's
+    simple name).
+
+    This is what makes a SEED a strict subset: ``_route_live_callables`` keeps every reachable-file
+    test as a candidate because it routes at FILE granularity, but a test whose file names the target
+    is far likelier to enter it than one that merely imports the module. An unparseable file is
+    treated as referencing (a candidate): we never rule a test OUT on a parse failure, matching the
+    one-sided soundness of ``route_test_item`` (only observed evidence proves impossibility)."""
+    out: set[str] = set()
+    for p in files:
+        try:
+            with open(p, encoding="utf-8") as fh:
+                tree = ast.parse(fh.read(), filename=p)
+        except (OSError, SyntaxError, ValueError):
+            out.add(os.path.realpath(p))
+            continue
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Name) and n.id == target_name) or (
+                isinstance(n, ast.Attribute) and n.attr == target_name
+            ):
+                out.add(os.path.realpath(p))
+                break
+    return out
+
+
+def split_live_callables(
+    live: list[Any], scoped: list[str], target_name: str, func_names: list[str]
+) -> tuple[list[Any], list[Any]]:
+    """Partition the live suite into ``(candidates, unknowns)`` for a target-first seed (#15/Fix B).
+
+    CANDIDATES are the seed — tests whose file statically names the target (``candidate_static``) or
+    that reach it through a fixture edge (``candidate_fixture``). UNKNOWNS are every other kept item:
+    a test in a reachable file that does not name the target and has no fixture edge — it MIGHT still
+    reach the target dynamically, so it is never dropped, only deferred to the widen pass.
+
+    Nothing is classified ``impossible`` here: that requires an OBSERVED trace (``route_test_item``),
+    which the seed does not yet have. So ``candidates ∪ unknowns`` is exactly what the non-split
+    router would keep — the split only orders WHICH are traced first, never which are eligible. The
+    driver seeds ``candidates``, and widens with ``unknowns`` only when a mutant survives the seed."""
+    naming_files = _files_referencing_target(scoped, target_name)
+    fixture_ref = _fixture_files_reaching_target(live, func_names)
+    candidates: list[Any] = []
+    unknowns: list[Any] = []
+    for c in live:
+        origin = os.path.realpath(callable_origin(c) or "")
+        names_target = origin in naming_files
+        fx = {os.path.realpath(f) for f in callable_fixture_origins(c)}
+        fixture_reaches = bool(fx & fixture_ref)
+        code = route_test_item(names_target, fixture_reaches, "unseen", False)
+        if code.startswith("candidate"):
+            candidates.append(c)
+        else:
+            unknowns.append(c)
+    return candidates, unknowns
+
+
 # ── Test callable loading ────────────────────────────────────────
 
 

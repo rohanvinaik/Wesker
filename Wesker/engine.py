@@ -5847,6 +5847,7 @@ def run_function_converged(
     trace_budget_s: float | None = DEFAULT_TRACE_BUDGET_S,
     trace_progress: Callable[[int, int, float], None] | None = None,
     trace_session_budget_s: float | None = DEFAULT_TRACE_SESSION_BUDGET_S,
+    widen_tests: list[Callable[..., None]] | None = None,
 ) -> ProfilingResult:
     """Multi-pass convergence with integrated equivalence detection.
 
@@ -5971,6 +5972,9 @@ def run_function_converged(
     kill_matrix: dict[str, list[str]] = {}
     survivor_records: list[dict] = []
     killed_records: list[dict] = []
+    # The Mutant OBJECTS of the true survivors (not equivalents), for the Fix B widen pass to
+    # re-evaluate against unknowns. Keyed by id so the widen can drop one as it moves to killed.
+    _survivor_mutants: dict[str, Mutant] = {}
     uncontained_stop = (
         False  # #14: set when a worker could not be stopped — halt all remaining passes
     )
@@ -6121,8 +6125,17 @@ def run_function_converged(
             elif result.equivalent:
                 record["equivalent"] = True
                 survivor_records.append(record)
+                # A seed-declared equivalent may be a FALSE equivalent (#Fix B): `check_equivalent`
+                # ran against a mutant with an EMPTY seed covering set, so its boundary inputs never
+                # exercised a branch an unknown test reaches. The widen re-evaluates it too — a
+                # TRULY equivalent mutant stays equivalent (no test kills it), which is why this is
+                # sound; a false one is killed, matching a full run that scoped it to that test and
+                # never reached the equivalence check.
+                _survivor_mutants[mutant.mutant_id] = mutant
             else:
                 survivor_records.append(record)
+                # A true survivor: the widen may kill it with an unknown test the seed never traced.
+                _survivor_mutants[mutant.mutant_id] = mutant
 
             # #14 (reopened): an uncontained worker (abandon could not stop it) is STILL ALIVE —
             # burning a core and able to perturb every later mutant's timing. Keep THIS mutant's
@@ -6136,6 +6149,105 @@ def run_function_converged(
 
         if uncontained_stop:
             break
+
+    # ── LAZY WIDENING (Fix B) ──────────────────────────────────────────────────────────────
+    # The loop above ran against the SEEDED baseline (candidate tests only, when the caller seeded
+    # the holder). A surviving mutant may be killed by an UNKNOWN test the seed never traced, so
+    # before conceding a survivor, widen the baseline with `widen_tests` and re-evaluate ONLY the
+    # true survivors against it. `seed(A) + expand(B)` is byte-identical to a full trace over
+    # `A∪B` (LazySessionBaseline.expand), so a survivor can only move survivor->killed here, never
+    # the reverse — the final verdict equals the full-suite verdict (the differential oracle pins
+    # this). `test_functions` already contains the unknowns, so they become runnable once their
+    # coverage enters `line_cov`; equivalents are excluded (no test kills them), and a killed mutant
+    # is already resolved. If `expand` degrades (a partial build failed) it invalidates the holder,
+    # so the re-derived scope below rebuilds the FULL baseline — still a complete basis, never a
+    # seed-only false survivor.
+    _widen_holder = _SESSION_BASELINE.get()
+    if (
+        widen_tests
+        and _survivor_mutants
+        and not uncontained_stop
+        and _widen_holder is not None
+        and _elapsed(start) <= budget_ms
+    ):
+        _widen_holder.expand(list(widen_tests))
+        _wt: set[str] = set()
+        _wu: set[str] = set()
+        _tests_for, line_cov, exec_lines, failing = _build_test_scope(
+            func_node,
+            test_functions,
+            original_func,
+            scope_tests,
+            None,
+            qualname,
+            trace_budget_s,
+            _wt,
+            trace_progress,
+            trace_session_budget_s,
+            _wu,
+        )
+        _trace_truncated |= _wt
+        _baseline_uncontained |= _wu
+        for _mid, _mutant in list(_survivor_mutants.items()):
+            if _elapsed(start) > budget_ms:
+                break
+            _scoped = _tests_for(_mutant)
+            _cap_ms = (
+                max(per_mutant_timeout_ms, 50.0 * len(_scoped))
+                if full_matrix
+                else per_mutant_timeout_ms
+            )
+            _remaining_ms = budget_ms - _elapsed(start)
+            _res = evaluate_mutant(
+                _mutant,
+                _scoped,
+                original_func,  # type: ignore[arg-type]
+                timeout_ms=_adaptive_allowance(None, _cap_ms, _remaining_ms),
+                qualname=qualname,
+                record_all_killers=full_matrix,
+                source_path=source_path,
+            )
+            if not _res.killed:
+                continue  # still a survivor after widening — the honest gap
+            # Move survivor -> killed across EVERY view. `seen` drives the per-category
+            # re-derivation below, so updating it fixes the counts; the record/matrix/dims views
+            # are built inline in the main loop and must be updated to match it exactly.
+            seen[_mid] = _res
+            survivor_records[:] = [
+                r for r in survivor_records if r["mutant_id"] != _mid
+            ]
+            _record = {
+                "mutant_id": _mutant.mutant_id,
+                "mutant": _mutant.description,
+                "category": _mutant.category.value,
+                "mutated_line": _mutant.mutated_line,
+                "dimension": _mutant.dimension,
+                "change": _mutant_change(_mutant),
+                "diff_summary": _mutant_diff(_mutant),
+                "elapsed_ms": round(_res.elapsed_ms, 1),
+                "killed_by": _res.killed_by,
+                "test": _res.test_name,
+            }
+            killed_records.append(_record)
+            if full_matrix and _res.killed_by_tests:
+                kill_matrix.setdefault(_mutant.description, []).extend(
+                    _res.killed_by_tests
+                )
+            elif _res.test_name:
+                kill_matrix.setdefault(_mutant.description, []).append(_res.test_name)
+            if (
+                mutant_disposition(
+                    _res.constructed, _res.installed, _res.entered, True, _res.killed
+                )
+                in SCORED_DISPOSITIONS
+                and _mutant.dimension
+                and not _is_dead(_mutant.dimension)
+            ):
+                _dk = f"{_mutant.category.value}\x00{_mutant.dimension}"
+                dims_covered.add(_dk)
+                if _res.killed_by == "assertion":
+                    dims_pinned.add(_dk)
+            del _survivor_mutants[_mid]
 
     # Aggregate by category
     results_by_cat: dict[MutationCategory, CategoryResult] = {}

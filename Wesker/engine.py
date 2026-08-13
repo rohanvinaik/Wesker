@@ -2852,6 +2852,43 @@ class LazySessionBaseline:
             return False
         return True
 
+    def seed(self, candidates: list[Callable[..., None]]) -> None:
+        """Build the baseline over ONLY the routed candidate subset, not the whole suite (#15,
+        target-first). The first forced read measures ``candidates`` instead of ``get()``'s full
+        collection, so a function whose teaching basis is a handful of tests never traces the other
+        hundreds. A no-op once built (seeded or full), so the once-per-session guarantee holds; the
+        DRIVER widens a seeded basis with :meth:`expand` when a mutant survives the seed.
+        """
+        if self._built:
+            return
+        self._value = self._build(candidates)
+        self._built = True
+
+    def expand(self, more: list[Callable[..., None]]) -> bool:
+        """Widen a seeded baseline by measuring ``more`` and splicing them in — lazy widening.
+
+        Nothing is dropped (``affected`` is empty): the existing seeded coverage stays and the new
+        tests are added, so a mutant that survived the seed can be re-evaluated against the widened
+        basis. Returns False (a no-op) when there is nothing built to widen or nothing to add.
+
+        DEGRADES to :meth:`invalidate`, never to a wrong answer — exactly like :meth:`refresh`. A
+        partial build runs the consumer's test code and can fail; a half-spliced basis would
+        under-report coverage, and an under-covered test is one the mutation loop never runs — a
+        false survivor. So the widening can be skipped (the next read re-traces in full) but can
+        never be half-applied.
+        """
+        if not self._built or self._value is None or not more:
+            return False
+        try:
+            partial = self._build(more)
+            self._value = self._value.replaced(
+                set(), set(), partial, self._value.n_tests + partial.n_tests
+            )
+        except Exception:  # noqa: BLE001 — see `refresh`: correctness over speed
+            self.invalidate()
+            return False
+        return True
+
 
 # Set only by the live-session path; None everywhere else, so every existing caller
 # (Detective included) keeps the exact per-function behaviour it has today.

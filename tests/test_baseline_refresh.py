@@ -246,3 +246,100 @@ def test_refresh_live_suite_replaces_only_the_written_files_callables(tmp_path):
         ci._LIVE_SUITE.reset(suite_token)
 
     assert kept_test in live  # the other file's callable is untouched
+
+
+# ── LazySessionBaseline.seed / expand: target-first incremental baseline (Fix B) ──
+
+
+def _suite_build(suite):
+    """A build closure over a name->coverage dict, treating `subset` as a name list (mirrors the
+    real closure, which traces exactly the callables it is handed)."""
+
+    def build(subset=None):
+        names = list(suite) if subset is None else list(subset)
+        return _bl({n: suite[n] for n in names if n in suite}, n_tests=len(names))
+
+    return build
+
+
+def test_seed_measures_only_the_candidate_subset():
+    suite = {"test_a": {"f.py": {1}}, "test_b": {"f.py": {2}}, "test_c": {"f.py": {3}}}
+    seen: list[list[str]] = []
+
+    def build(subset=None):
+        names = list(suite) if subset is None else list(subset)
+        seen.append(names)
+        return _bl({n: suite[n] for n in names if n in suite}, n_tests=len(names))
+
+    holder = LazySessionBaseline(build)
+    holder.seed(["test_a"])
+    # Only the candidate was measured — never the whole suite.
+    assert seen == [["test_a"]]
+    assert set(holder.get().traced) == {"test_a"}
+
+
+def test_seed_is_a_noop_once_built():
+    suite = {"test_a": {"f.py": {1}}, "test_b": {"f.py": {2}}}
+    holder = LazySessionBaseline(_suite_build(suite))
+    holder.seed(["test_a"])
+    holder.seed(["test_b"])  # must not re-measure or widen — once-per-session
+    assert set(holder.get().traced) == {"test_a"}
+
+
+def test_expand_adds_the_widened_batch_without_dropping_the_seed():
+    suite = {"test_a": {"f.py": {1}}, "test_b": {"f.py": {2}}, "test_c": {"f.py": {3}}}
+    holder = LazySessionBaseline(_suite_build(suite))
+    holder.seed(["test_a"])
+    assert holder.expand(["test_b", "test_c"]) is True
+    got = holder.get().traced
+    assert set(got) == {"test_a", "test_b", "test_c"}
+    assert got["test_a"] == {"f.py": {1}}  # the seed survives the widening verbatim
+
+
+def test_seed_then_expand_equals_a_full_rebuild():
+    """THE soundness property: incrementally seeding candidates then widening to the rest yields
+    the byte-identical baseline a full trace would — so early-stop-with-widen can never diverge
+    from the full-suite verdict."""
+    suite = {
+        "test_a": {"f.py": {1}},
+        "test_b": {"f.py": {2, 3}},
+        "test_c": {"g.py": {9}},
+        "test_d": {"f.py": {1}},
+    }
+    incremental = LazySessionBaseline(_suite_build(suite))
+    incremental.seed(["test_a", "test_b"])
+    incremental.expand(["test_c", "test_d"])
+    spliced = incremental.get()
+
+    full = LazySessionBaseline(_suite_build(suite))
+    rebuilt = full.get()
+
+    assert spliced.traced == rebuilt.traced
+    assert spliced.n_tests == rebuilt.n_tests
+
+
+def test_expand_degrades_to_invalidate_when_the_partial_build_raises():
+    suite = {"test_a": {"f.py": {1}}, "test_b": {"f.py": {2}}}
+    state = {"full": 0}
+
+    def build(subset=None):
+        if subset is not None and "test_b" in subset:
+            raise RuntimeError("the consumer's test blew up mid-trace")
+        if subset is None:
+            state["full"] += 1
+        names = list(suite) if subset is None else list(subset)
+        return _bl({n: suite[n] for n in names if n in suite}, n_tests=len(names))
+
+    holder = LazySessionBaseline(build)
+    holder.seed(["test_a"])
+    assert holder.expand(["test_b"]) is False
+    assert holder.built is False  # value dropped, not left half-spliced
+    holder.get()
+    assert state["full"] == 1  # the next read re-traced in full — correct, just slower
+
+
+def test_expand_is_a_noop_on_an_unbuilt_or_empty_batch():
+    holder = LazySessionBaseline(_suite_build({"test_a": {"f.py": {1}}}))
+    assert holder.expand(["test_a"]) is False  # nothing seeded yet -> nothing to widen
+    holder.seed(["test_a"])
+    assert holder.expand([]) is False  # empty batch -> no-op

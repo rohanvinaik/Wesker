@@ -5538,15 +5538,24 @@ def run_function_profiling(
 
     # ── LAZY WIDENING (Fix B) ──────────────────────────────────────────────────────────────
     # The loop ran against the SEEDED baseline (candidate tests only). Before conceding a survivor,
-    # widen with `widen_tests` and re-evaluate ONLY the survivors against it. `seed(A)+expand(B)` is
+    # widen with `widen_tests` and re-evaluate the survivors against it. `seed(A)+expand(B)` is
     # byte-identical to a full trace over `A∪B`, so a survivor can only move survivor->killed here
     # (the differential oracle pins it). in_process only — the seed/fork model is the fast path and
     # the isolated worker is already closed. On an expand degrade the holder invalidates, so the
     # re-derived scope rebuilds the FULL baseline — never a seed-only false survivor.
+    #
+    # The widen ALSO fires when a target line is not yet covered by the seed (closeout, line axis):
+    # a mutant-less executable line reached only by an UNKNOWN test would otherwise read as a false
+    # line gap. One `expand` traces every unknown, so a single fire completes BOTH the kill matrix
+    # (survivors re-evaluated) and the line-coverage denominator, matching a full run on each axis.
+    _covered_lines = {ln for lines in line_cov.values() for ln in lines}
+    _lines_incomplete = bool(
+        scope_tests and exec_lines and not set(exec_lines).issubset(_covered_lines)
+    )
     _widen_holder = _SESSION_BASELINE.get()
     if (
         widen_tests
-        and _survivor_mutants
+        and (_survivor_mutants or _lines_incomplete)
         and not isolated
         and not budget_exhausted
         and _widen_holder is not None

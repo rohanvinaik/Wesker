@@ -43,6 +43,11 @@ def _matrix(result):
         "total_equivalent": result.total_equivalent,
         "kill_matrix": {m: sorted(k) for m, k in result.kill_matrix.items()},
         "survivors": sorted(r.get("mutant_id") for r in result.survivor_records),
+        # The COVERED-LINE SET (union), the line axis's denominator — equal to full whether or not
+        # the widen fired (the per-test map legitimately differs: full traces non-covering tests too).
+        "covered_lines": sorted(
+            {ln for lines in result.line_coverage.values() for ln in lines}
+        ),
     }
 
 

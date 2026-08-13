@@ -17,6 +17,7 @@ from Wesker.engine import (
     MutationCategory,
     build_session_baseline,
     run_function_converged,
+    run_function_profiling,
 )
 
 _CATS = {
@@ -132,3 +133,58 @@ def test_widen_with_no_survivors_is_a_noop():
     holder.seed(tests)
     seeded = _run(node, tests, original, holder, widen_tests=[])
     assert _matrix(seeded) == _matrix(full)
+
+
+def _run_profiling(node, tests, original, holder, **kw):
+    tok = _SESSION_BASELINE.set(holder)
+    try:
+        return run_function_profiling(
+            node,
+            f"{original.__code__.co_filename}::scoreit",
+            _CATS,
+            tests,
+            original,
+            max_per_category=0,
+            **kw,
+        )
+    finally:
+        _SESSION_BASELINE.reset(tok)
+
+
+def test_seed_widen_matches_full_baseline_on_run_function_profiling():
+    # The SAME oracle on run_function_profiling — Detective's ACTUAL path (it never calls converged).
+    # Profiling aggregates inline and runs no equivalence pass, so the widen updates CategoryResult
+    # counts directly; this proves those updates reach the byte-identical matrix a full run produces.
+    node = _fn(_SRC)
+    ns: dict = {}
+    exec(compile(ast.parse(_SRC), "<swp>", "exec"), ns)  # noqa: S102 — test fixture source
+    original = ns["scoreit"]
+
+    def test_true():
+        assert scoreit(1, 2, True) == 4  # noqa: F821
+
+    def test_false():
+        assert scoreit(5, 3, False) == 2  # noqa: F821
+
+    tests = [test_true, test_false]
+    for t in tests:
+        t.__globals__["scoreit"] = original
+    target_files = {original.__code__.co_filename}
+
+    def build(subset=None, fresh=False):
+        return build_session_baseline(
+            tests if subset is None else list(subset), target_files
+        )
+
+    full = _run_profiling(node, tests, original, LazySessionBaseline(build))
+    holder = LazySessionBaseline(build)
+    holder.seed([test_true])
+    seeded = _run_profiling(node, tests, original, holder, widen_tests=[test_false])
+
+    assert _matrix(seeded) == _matrix(full), (
+        "seed+widen diverged from full on run_function_profiling — the inline-aggregation widen is "
+        "not disposition-exact"
+    )
+    assert any(
+        "test_false" in k for killers in full.kill_matrix.values() for k in killers
+    )

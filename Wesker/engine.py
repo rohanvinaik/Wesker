@@ -5214,6 +5214,7 @@ def run_function_profiling(
     check_determinism: bool = False,
     worker_mem_limit_mb: int | None = None,
     is_pure: bool = False,
+    widen_tests: list[Callable[..., None]] | None = None,
 ) -> ProfilingResult:
     """Profiling mode — generate mutants (exhaustive by default), evaluate with budget.
 
@@ -5319,8 +5320,19 @@ def run_function_profiling(
 
     # Live baseline for the adaptive per-mutant allowance (#13): time the ORIGINAL over the tests
     # once, untraced (the mutant loop is untraced too). None → fall back to the configured cap.
+    # Time only the COVERING tests (closeout #3): those are the ones the mutant loop actually runs.
+    # Sizing over the whole collection re-runs the unknowns a target-first seed deliberately deferred
+    # — the fixture-execution cost that dominated ARC — and over-sizes the allowance. Under scope
+    # the covering set is exactly `line_cov`'s keys; unscoped (the A/B path) keeps the full set.
+    from Wesker.ci import callable_test_id as _ctid_for_sizing
+
+    _sizing_tests = (
+        [t for t in test_functions if _ctid_for_sizing(t) in line_cov]
+        if scope_tests and line_cov
+        else test_functions
+    )
     baseline_ms, _sizing_uncontained = _measure_scoped_baseline(
-        test_functions, original_func, per_mutant_timeout_ms
+        _sizing_tests, original_func, per_mutant_timeout_ms
     )
     if _sizing_uncontained:
         _baseline_uncontained.add("baseline_sizing")
@@ -5329,6 +5341,8 @@ def run_function_profiling(
     kill_matrix: dict[str, list[str]] = {}
     survivor_records: list[dict] = []
     killed_records: list[dict] = []
+    # The Mutant objects of survivors, for the Fix B widen pass to re-evaluate against unknowns.
+    _survivor_mutants: dict[str, Mutant] = {}
     budget_exhausted = False
     all_contained = True  # #14: cleared if any timed-out worker could not be stopped
     mem_budget = _resolve_budget(mem_budget_mb)
@@ -5498,6 +5512,10 @@ def run_function_profiling(
                     "elapsed_ms": round(result.elapsed_ms, 1),
                 }
             )
+            # A survivor of the seed: the Fix B widen pass may kill it with an unknown test the seed
+            # never traced. (Profiling runs no equivalence check, so every else-branch mutant is a
+            # plain survivor eligible for the widen.)
+            _survivor_mutants[mutant.mutant_id] = mutant
 
         # #14 (reopened): an uncontained worker (abandon could not stop it) is STILL ALIVE — burning
         # a core and able to perturb every later mutant's timing. This mutant's result is kept
@@ -5517,6 +5535,100 @@ def run_function_profiling(
         _iso_worker.close()
     if progress is not None:
         progress(total_m, total_m, _elapsed(start))
+
+    # ── LAZY WIDENING (Fix B) ──────────────────────────────────────────────────────────────
+    # The loop ran against the SEEDED baseline (candidate tests only). Before conceding a survivor,
+    # widen with `widen_tests` and re-evaluate ONLY the survivors against it. `seed(A)+expand(B)` is
+    # byte-identical to a full trace over `A∪B`, so a survivor can only move survivor->killed here
+    # (the differential oracle pins it). in_process only — the seed/fork model is the fast path and
+    # the isolated worker is already closed. On an expand degrade the holder invalidates, so the
+    # re-derived scope rebuilds the FULL baseline — never a seed-only false survivor.
+    _widen_holder = _SESSION_BASELINE.get()
+    if (
+        widen_tests
+        and _survivor_mutants
+        and not isolated
+        and not budget_exhausted
+        and _widen_holder is not None
+        and (budget_ms is None or _elapsed(start) <= budget_ms)
+    ):
+        _widen_holder.expand(list(widen_tests))
+        _wt: set[str] = set()
+        _wu: set[str] = set()
+        _wa: dict[str, list[tuple[int, int]]] = {}
+        _tests_for, line_cov, exec_lines, failing = _build_test_scope(
+            func_node,
+            test_functions,
+            original_func,
+            scope_tests,
+            None,
+            qualname,
+            trace_budget_s,
+            _wt,
+            trace_progress,
+            trace_session_budget_s,
+            _wu,
+            _wa,
+        )
+        _trace_truncated |= _wt
+        _baseline_uncontained |= _wu
+        _arc_cov.update(_wa)
+        for _mid, _mutant in list(_survivor_mutants.items()):
+            if budget_ms is not None and _elapsed(start) > budget_ms:
+                break
+            _remaining_ms = (
+                budget_ms - _elapsed(start)
+                if budget_ms is not None
+                else per_mutant_timeout_ms
+            )
+            _res = evaluate_mutant(
+                _mutant,
+                _tests_for(_mutant),
+                original_func,
+                timeout_ms=_adaptive_allowance(
+                    baseline_ms, per_mutant_timeout_ms, _remaining_ms
+                ),
+                qualname=qualname,
+                source_path=source_path,
+            )
+            if not _res.killed:
+                continue
+            # Move survivor -> killed on its category (inline aggregation): `total` stays, survived--,
+            # killed++, and the kill-reason counter `value_killed`/the report read. Then move the
+            # record and credit the killer.
+            _cr = results_by_cat.setdefault(
+                _mutant.category, CategoryResult(category=_mutant.category)
+            )
+            _cr.survived -= 1
+            _cr.killed += 1
+            if _res.killed_by == "assertion":
+                _cr.killed_by_assertion += 1
+            elif _res.killed_by == "exception":
+                _cr.killed_by_exception += 1
+            elif _res.killed_by == "crash":
+                _cr.killed_by_crash += 1
+            elif _res.killed_by == "timeout":
+                _cr.timed_out += 1
+            survivor_records[:] = [
+                r for r in survivor_records if r["mutant_id"] != _mid
+            ]
+            if _res.test_name:
+                kill_matrix.setdefault(_mutant.description, []).append(_res.test_name)
+            killed_records.append(
+                {
+                    "mutant_id": _mutant.mutant_id,
+                    "mutant": _mutant.description,
+                    "category": _mutant.category.value,
+                    "mutated_line": _mutant.mutated_line,
+                    "dimension": _mutant.dimension,
+                    "change": _mutant_change(_mutant),
+                    "killed_by": _res.killed_by,
+                    "test": _res.test_name,
+                    "diff_summary": _mutant_diff(_mutant),
+                    "elapsed_ms": round(_res.elapsed_ms, 1),
+                }
+            )
+
     per_cat = list(results_by_cat.values())
     total = sum(cr.total for cr in per_cat)
     killed = sum(cr.killed for cr in per_cat)

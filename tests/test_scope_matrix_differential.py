@@ -73,9 +73,7 @@ def _assert_scoping_is_matrix_exact(node, key, tests, original):
     return scoped, unscoped
 
 
-_SCORE_SRC = (
-    'def scoreit(a, b, flag):\n    """doc"""\n    if flag:\n        return a * 2 + b\n    return a - b\n'
-)
+_SCORE_SRC = 'def scoreit(a, b, flag):\n    """doc"""\n    if flag:\n        return a * 2 + b\n    return a - b\n'
 
 
 def _bind(tests, original, name):
@@ -128,7 +126,11 @@ def test_matrix_exact_with_a_baseline_failing_test_present():
     _bind(tests, original, "scoreit")
     scoped, _ = _assert_scoping_is_matrix_exact(node, "<m2>::scoreit", tests, original)
     # And the broken test never appears as a killer of anything.
-    assert not any("test_broken_on_original" in k for killers in scoped.kill_matrix.values() for k in killers)
+    assert not any(
+        "test_broken_on_original" in k
+        for killers in scoped.kill_matrix.values()
+        for k in killers
+    )
 
 
 _BRANCHY_SRC = (

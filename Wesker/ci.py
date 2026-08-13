@@ -1490,9 +1490,11 @@ def run_with_live_suite(
     """
     from Wesker.engine import (
         _SESSION_BASELINE,
+        _SESSION_IDENTITY,
         DEFAULT_TRACE_BUDGET_S,
         DEFAULT_TRACE_SESSION_BUDGET_S,
         LazySessionBaseline,
+        _live_collection_identity,
         build_session_baseline,
     )
     from Wesker.pytest_runner import run_in_session
@@ -1579,6 +1581,11 @@ def run_with_live_suite(
 
         _m = _last_manifest()
         _regime = _m.regime_digest if (_m is not None and _m.scope > 0) else ""
+        # Session module-identity captured HERE (#5), at the same admissible point as the regime: it
+        # is a SESSION fact (about the collection), so it is published on a session ContextVar where a
+        # per-function fork or a widen splice cannot drop it — never on a mutable per-function
+        # baseline. Reads the same manifest `_live_collection_identity` already keys on.
+        ident_token = _SESSION_IDENTITY.set(_live_collection_identity())
         base_token = (
             _SESSION_BASELINE.set(
                 LazySessionBaseline(_build, budgets=effective, regime_digest=_regime)
@@ -1591,6 +1598,7 @@ def run_with_live_suite(
         finally:
             if base_token is not None:
                 _SESSION_BASELINE.reset(base_token)
+            _SESSION_IDENTITY.reset(ident_token)
             _PROJECT_ROOT.reset(root_token)
             _LIVE_SUITE.reset(suite_token)
 

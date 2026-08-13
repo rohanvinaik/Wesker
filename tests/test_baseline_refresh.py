@@ -361,3 +361,17 @@ def test_expand_traces_widened_tests_fresh_but_seed_uses_the_cache():
     holder.seed(["test_a"])
     holder.expand(["test_b"])
     assert fresh_by_call == [False, True]  # seed: cache-ok; expand: fresh-required
+
+
+def test_fork_is_an_independent_unbuilt_holder_no_sibling_corruption():
+    # Fix B #1: seeding one function's holder must not contaminate a sibling's. A fork is a fresh,
+    # unbuilt holder over the SAME build closure; seeding it leaves the original untouched — the
+    # reproduced `baseline seeded for alpha killed 0/3 of beta` failure, closed structurally.
+    suite = {"test_a": {"f.py": {1}}, "test_b": {"f.py": {2}}}
+    orig = LazySessionBaseline(_suite_build(suite))
+    orig.seed(["test_a"])  # `alpha` seeds its candidate
+    fork = orig.fork()
+    assert fork.built is False  # a fork is fresh, never carrying the original's seed
+    fork.seed(["test_b"])  # `beta` seeds its own candidate on its own holder
+    assert set(orig.get().traced) == {"test_a"}  # alpha's baseline is untouched
+    assert set(fork.get().traced) == {"test_b"}  # beta measured only its own

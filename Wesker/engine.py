@@ -2894,6 +2894,23 @@ class LazySessionBaseline:
             return False
         return True
 
+    def fork(self) -> "LazySessionBaseline":
+        """A fresh, UNBUILT holder over the same build closure, budgets, and regime — for a
+        per-function seeded baseline that must not contaminate the session's shared holder (Fix B #1).
+
+        The session baseline is shared across every function profiled in a session; seeding it with
+        ONE function's candidates leaves a truthy trace map whose entries intersect a SIBLING's lines
+        to empty sets, so ``_tests_for`` selects nothing and the sibling reports false survivors
+        (reproduced: a baseline seeded for `alpha` killed 0/3 of `beta`'s mutants). A target-first
+        driver therefore forks its OWN holder, seeds its candidates, and installs it for the duration
+        of that one function's profiling — the shared holder and every other function's are untouched.
+        Session identity is read from :func:`session_identity`, not from the baseline, so a fork
+        carries no per-function identity to lose.
+        """
+        return LazySessionBaseline(
+            self._build, budgets=self._budgets, regime_digest=self._regime_digest
+        )
+
 
 # Set only by the live-session path; None everywhere else, so every existing caller
 # (Detective included) keeps the exact per-function behaviour it has today.
@@ -2910,6 +2927,25 @@ def session_baseline() -> SessionBaseline | None:
     """
     holder = _SESSION_BASELINE.get()
     return holder.get() if holder is not None else None
+
+
+# Session-level module identity (#5/#58), captured ONCE at session setup where the collection manifest
+# is admissible. It lives HERE, not on any function's baseline: a per-function fork or a widen splice
+# mutates the baseline, and identity is a SESSION fact (about the collection), so an exact kill matrix
+# must never ship with a discarded certificate basis (`identity=unobserved, proof_basis=()`).
+_SESSION_IDENTITY: ContextVar[
+    tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]] | None
+] = ContextVar("wesker_session_identity", default=None)
+
+
+def session_identity() -> (
+    tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]] | None
+):
+    """The live collection's ``(standing, conflicts, proof_basis)`` for THIS session, or None outside
+    one. Read from the session ContextVar, never from a (mutable) baseline — see ``_SESSION_IDENTITY``.
+    A standalone profile has no session identity here and does its own ``_live_collection_identity``.
+    """
+    return _SESSION_IDENTITY.get()
 
 
 def _freshen_proof_covering(
@@ -5511,15 +5547,13 @@ def run_function_profiling(
     # would find `_LAST_MANIFEST` overwritten to scope 0 by the per-mutant discoveries and report
     # `unobserved`. Fall back to a live read only when there is no session baseline (a standalone
     # profile outside a live session), where the direct answer is the only one available.
-    _sb_identity = session_baseline()
-    if _sb_identity is not None:
-        _identity_standing = _sb_identity.identity_standing
-        _identity_conflicts = _sb_identity.identity_conflicts
-        _identity_basis = _sb_identity.proof_basis
-    else:
-        _identity_standing, _identity_conflicts, _identity_basis = (
-            _live_collection_identity()
-        )
+    # Read session identity from the session ContextVar (#5), never from the (mutable) baseline — a
+    # per-function fork or a widen splice would drop a baseline copy. Fall back to a direct live read
+    # ONLY for a standalone profile outside a live session (where no session identity was captured).
+    _ident = session_identity()
+    if _ident is None:
+        _ident = _live_collection_identity()
+    _identity_standing, _identity_conflicts, _identity_basis = _ident
 
     # Fast-mode SHAPE gate (#19): the in_process mode contains a runaway only by asking a thread to
     # stop, so it is gateable only over HERMETIC covering tests; a subprocess/thread/signal/
@@ -6327,15 +6361,13 @@ def run_function_converged(
     # would find `_LAST_MANIFEST` overwritten to scope 0 by the per-mutant discoveries and report
     # `unobserved`. Fall back to a live read only when there is no session baseline (a standalone
     # profile outside a live session), where the direct answer is the only one available.
-    _sb_identity = session_baseline()
-    if _sb_identity is not None:
-        _identity_standing = _sb_identity.identity_standing
-        _identity_conflicts = _sb_identity.identity_conflicts
-        _identity_basis = _sb_identity.proof_basis
-    else:
-        _identity_standing, _identity_conflicts, _identity_basis = (
-            _live_collection_identity()
-        )
+    # Read session identity from the session ContextVar (#5), never from the (mutable) baseline — a
+    # per-function fork or a widen splice would drop a baseline copy. Fall back to a direct live read
+    # ONLY for a standalone profile outside a live session (where no session identity was captured).
+    _ident = session_identity()
+    if _ident is None:
+        _ident = _live_collection_identity()
+    _identity_standing, _identity_conflicts, _identity_basis = _ident
 
     return ProfilingResult(
         function_key=func_key,

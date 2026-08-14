@@ -16,9 +16,11 @@ import contextlib
 import fnmatch
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import sys
+import textwrap
 import time
 from contextvars import ContextVar
 import unittest
@@ -391,7 +393,7 @@ def relevant_test_files(
 
 
 def route_test_item(
-    names_target: bool,
+    static_reach: str,
     fixture_reaches: bool,
     observed_reach: str,
     dynamic_uncertain: bool,
@@ -401,8 +403,8 @@ def route_test_item(
     The selector is one-sided by design. Dropping a genuinely relevant test removes kills and
     covered lines, so it OVERSTATES a specification gap; it can never manufacture a kill. So the
     only item skipped is one with POSITIVE evidence it cannot reach the target; everything else
-    stays in the candidate pool. The code names BOTH the verdict and its reason, because "ruled
-    out", "plausibly reaches", and "could not tell" are different facts a report must keep apart —
+    stays in the pool. The code names BOTH the verdict and its reason, because "ruled out",
+    "plausibly reaches", and "could not tell" are different facts a report must keep apart —
     collapsing `unknown` into `impossible` is the exact false-negative this closes (a
     fixture-reached test, dropped, read as `no test reaches this target` → needless synthesis).
 
@@ -413,11 +415,17 @@ def route_test_item(
       * ``unseen``      — no trace has watched this node; a static miss cannot be promoted to
                           impossibility, only widened to unknown.
 
-    Static evidence only ever makes an item a CANDIDATE (a positive prior), never impossible:
-      * ``names_target``    — the item's own file statically references the target (static_import);
-      * ``fixture_reaches`` — a fixture in the item's closure is defined in a file that references
-                              the target (fixture_edge) — the autouse/conftest path a name scan
-                              cannot see, and the concrete bug this issue reproduced.
+    `static_reach` is a per-TESTID lattice, NOT a file bit — a sibling test naming the target is no
+    evidence THIS item reaches it, so the granularity is the item's own body (#15, per-item — the
+    residual that dragged a file's every integration sibling into the eager seed):
+      * ``"item"`` — the item's OWN function body statically references the target: a ``candidate_static``
+                     seed (the direct-item stratum, the strongest static positive).
+      * ``"file"`` — only the item's FILE references the target, not the item itself: a ``file_peer`` —
+                     KEPT (widened, never dropped) but NOT a seed candidate. A weak routing reason, so
+                     one real test naming the target no longer promotes its file-siblings into the seed.
+      * ``"none"`` — the item's file does not reference the target at all.
+    ``fixture_reaches`` (a fixture in the item's closure defined in a file that names the target — the
+    autouse/conftest reach a body scan cannot see) outranks ``"file"`` but sits below an own-body name.
 
     ``dynamic_uncertain`` widens to unknown rather than excluding: plugins or dynamic imports mean
     the static picture is incomplete, and incomplete is not proof of irrelevance.
@@ -426,10 +434,12 @@ def route_test_item(
         return "candidate_observed"
     if observed_reach == "not_reached":
         return "impossible_observed"
-    if names_target:
+    if static_reach == "item":
         return "candidate_static"
     if fixture_reaches:
         return "candidate_fixture"
+    if static_reach == "file":
+        return "file_peer"
     if dynamic_uncertain:
         return "unknown_dynamic"
     return "unknown_no_path"
@@ -501,7 +511,13 @@ def _route_live_callables(
         names_target = os.path.realpath(callable_origin(c) or "") in keep_files
         fx = {os.path.realpath(f) for f in callable_fixture_origins(c)}
         fixture_reaches = bool(fx & fixture_ref)
-        code = route_test_item(names_target, fixture_reaches, "unseen", False)
+        # The default keep-all router routes at FILE scope (`in keep_files`) and carries `func_names`
+        # — a whole module's targets, not one — so there is no single target to attribute a per-item
+        # body reference to, and its `unknown` is KEPT regardless. Preserve that exactly by mapping
+        # the in-scope bit onto the static lattice; the per-item precision (#15) belongs to the SEED
+        # router `partition_live_callables`, where a file-peer was wrongly entering the seed.
+        static_reach = "item" if names_target else "none"
+        code = route_test_item(static_reach, fixture_reaches, "unseen", False)
         if route_admits(code, conservative):
             kept.append(c)
     return kept
@@ -531,6 +547,35 @@ def _files_referencing_target(files: list[str], target_name: str) -> set[str]:
                 out.add(os.path.realpath(p))
                 break
     return out
+
+
+def _item_body_references_target(call: Any, target_name: str) -> bool:
+    """Whether the item's OWN function body statically references ``target_name`` (#15, per-item).
+
+    Read through :func:`callable_source` — the contract accessor for the user's underlying test — so
+    live, recollected, and legacy backends resolve to the real test function, never Wesker's wrapper
+    body (identical for every item, which would make every test look like it names the target). This
+    is the per-TESTID signal that ``_files_referencing_target`` (FILE granularity) cannot give: a
+    sibling test in the same file naming the target does not make THIS item a seed candidate. That
+    conflation is residual-1 — one real test dragged its file's every integration sibling into the
+    eager seed. One-sided and best-effort: any failure to read or parse the source returns False,
+    which degrades the item to a ``file_peer`` (kept, widened), never a false drop.
+    """
+    fn = callable_source(call)
+    try:
+        src = inspect.getsource(fn)
+    except (OSError, TypeError):
+        return False
+    try:
+        tree = ast.parse(textwrap.dedent(src))
+    except (SyntaxError, ValueError):
+        return False
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Name) and n.id == target_name) or (
+            isinstance(n, ast.Attribute) and n.attr == target_name
+        ):
+            return True
+    return False
 
 
 def split_live_callables(
@@ -575,11 +620,20 @@ def partition_live_callables(
     observed_reach = observed_reach or {}
     for c in live:
         origin = os.path.realpath(callable_origin(c) or "")
-        names_target = origin in naming_files
+        # Per-TESTID (#15): the item's OWN body naming the target is a `candidate_static` seed; only
+        # its FILE naming it (a sibling test does, not this item) is a `file_peer` — kept and widened,
+        # never seeded. This is the residual that dragged a file's every integration sibling into the
+        # eager seed. Falls back to the file bit whenever the body cannot be read (one-sided, kept).
+        if _item_body_references_target(c, target_name):
+            static_reach = "item"
+        elif origin in naming_files:
+            static_reach = "file"
+        else:
+            static_reach = "none"
         fx = {os.path.realpath(f) for f in callable_fixture_origins(c)}
         fixture_reaches = bool(fx & fixture_ref)
         code = route_test_item(
-            names_target,
+            static_reach,
             fixture_reaches,
             observed_reach.get(callable_test_id(c), "unseen"),
             False,

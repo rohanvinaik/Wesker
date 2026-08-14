@@ -1,10 +1,13 @@
-"""split_live_callables: the target-first seed is a STRICT subset (Fix B routing).
+"""split_live_callables / partition_live_callables: the target-first seed is a STRICT subset, routed
+per TESTID (Fix B routing, #15).
 
 `_route_live_callables` keeps every reachable-file test as a candidate because it routes at FILE
-granularity. `split_live_callables` refines that: a test whose file statically NAMES the target is
-a seed candidate; a test in a reachable file that does not name it (and has no fixture edge) is an
-unknown, deferred to the widen pass. The union is unchanged — the split only decides trace ORDER —
-so nothing eligible is dropped, which is the one-sided soundness the whole routing rests on.
+granularity. The seed router refines that PER ITEM: a test whose OWN body statically names the target
+is a seed candidate; a file-PEER — the same file names the target but this item's body does not — is
+KEPT (widened) as an unknown, never dragged into the seed. That per-item distinction is residual-1:
+one real test naming the target used to promote its every file-sibling into the eager seed. The union
+is unchanged — the split only decides trace ORDER — so nothing eligible is dropped, which is the
+one-sided soundness the whole routing rests on.
 """
 
 from __future__ import annotations
@@ -13,6 +16,8 @@ from Wesker.ci import callable_test_id, partition_live_callables, split_live_cal
 
 
 def _mk(origin, fixtures=()):
+    """A mock whose own body does NOT name the target — its only association is its origin file."""
+
     def t():
         pass
 
@@ -22,54 +27,87 @@ def _mk(origin, fixtures=()):
     return t
 
 
+def _mk_naming(origin):
+    """A mock whose OWN body statically references `target` (a bare Name). The per-item router reads
+    its source through `callable_source` and seeds it as a candidate, not merely its file."""
+
+    def t():
+        return target  # noqa: F821 — a static Name ref in the item's OWN body; never executed
+
+    t.__wesker_origin__ = str(origin)
+    return t
+
+
+def _mk_attr_naming(origin):
+    """A mock whose OWN body references the target as an ATTRIBUTE (`mod.target`), not a bare Name."""
+
+    def t():
+        return mod.target  # noqa: F821 — a static Attribute ref in the item's OWN body; never run
+
+    t.__wesker_origin__ = str(origin)
+    return t
+
+
 def _names(items):
     return {getattr(c, "__wesker_origin__", "?") for c in items}
 
 
-def test_a_test_naming_the_target_is_a_candidate_the_rest_are_unknown(tmp_path):
+def test_only_the_item_naming_the_target_is_a_candidate_a_file_peer_is_unknown(
+    tmp_path,
+):
+    """residual-1 (#15, per-item): a test whose OWN body names the target is a seed candidate; a
+    file-PEER — same file references the target but this item's body does not — is KEPT (widened) as
+    an unknown, never seeded. The union is the whole kept suite; only the seed shrinks."""
     (tmp_path / "mod.py").write_text("def target(x):\n    return x + 1\n")
-    names_f = tmp_path / "test_names.py"
-    names_f.write_text(
+    peer_f = tmp_path / "test_peer.py"
+    # The FILE references the target, but a given item's body need not — a file-peer.
+    peer_f.write_text(
         "from mod import target\n\ndef test_it():\n    assert target(1) == 2\n"
     )
     silent_f = tmp_path / "test_silent.py"
-    # imports the module but never references `target` — reaches the file, not (statically) the fn.
     silent_f.write_text("import mod\n\ndef test_other():\n    assert mod is not None\n")
 
-    live = [_mk(names_f), _mk(silent_f)]
-    scoped = [str(names_f), str(silent_f)]
-    candidates, unknowns = split_live_callables(live, scoped, "target", ["target"])
+    naming = _mk_naming(peer_f)  # its OWN body names target -> candidate
+    peer = _mk(peer_f)  # same file names target, body does not -> file_peer -> unknown
+    silent = _mk(silent_f)  # file does not name target -> unknown
+    candidates, unknowns = split_live_callables(
+        [naming, peer, silent], [str(peer_f), str(silent_f)], "target", ["target"]
+    )
 
-    assert _names(candidates) == {str(names_f)}
-    assert _names(unknowns) == {str(silent_f)}
-    # The union is exactly the kept suite — nothing eligible dropped.
-    assert _names(candidates) | _names(unknowns) == {str(names_f), str(silent_f)}
+    assert candidates == [naming]
+    assert set(unknowns) == {peer, silent}
+    # The union is exactly the kept suite — nothing eligible dropped, only the seed narrowed.
+    assert set(candidates) | set(unknowns) == {naming, peer, silent}
 
 
-def test_an_attribute_reference_also_names_the_target(tmp_path):
+def test_an_attribute_reference_in_the_item_body_also_names_the_target(tmp_path):
+    """The per-item scan counts an Attribute reference (`mod.target`) in the item's OWN body, not
+    only a bare Name — the same two-form match `_files_referencing_target` uses."""
     (tmp_path / "mod.py").write_text("def target(x):\n    return x\n")
     attr_f = tmp_path / "test_attr.py"
-    # `mod.target(...)` — an Attribute reference, not a bare Name import.
     attr_f.write_text("import mod\n\ndef test_it():\n    assert mod.target(3) == 3\n")
 
-    live = [_mk(attr_f)]
+    naming = _mk_attr_naming(attr_f)
     candidates, unknowns = split_live_callables(
-        live, [str(attr_f)], "target", ["target"]
+        [naming], [str(attr_f)], "target", ["target"]
     )
-    assert _names(candidates) == {str(attr_f)}
+    assert candidates == [naming]
     assert unknowns == []
 
 
-def test_an_unparseable_file_is_treated_as_naming_the_target(tmp_path):
-    # Never rule a test OUT on a parse failure — one-sided soundness.
+def test_an_unparseable_file_is_kept_as_a_file_peer_never_dropped(tmp_path):
+    """One-sided soundness on a parse failure: an unparseable file MIGHT reference the target, so its
+    test is never ruled OUT. But a parse failure cannot prove the ITEM's body names the target, so it
+    is a file_peer — KEPT (widened as unknown), not a seed candidate. Kept-not-dropped is the
+    invariant; seeding is only an ordering optimization."""
     bad_f = tmp_path / "test_bad.py"
     bad_f.write_text("def test_it(:\n    syntax error here\n")
     live = [_mk(bad_f)]
     candidates, unknowns = split_live_callables(
         live, [str(bad_f)], "target", ["target"]
     )
-    assert _names(candidates) == {str(bad_f)}
-    assert unknowns == []
+    assert candidates == []  # body unprovable -> not a seed candidate
+    assert _names(unknowns) == {str(bad_f)}  # but KEPT (widened), never dropped
 
 
 def test_exact_observed_reach_populates_all_three_routing_buckets(tmp_path):

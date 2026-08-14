@@ -119,6 +119,11 @@ def test_scoped_and_unscoped_verdicts_agree():
 
     Profiles a real function against a suite that kills every mutant, both scoped
     and unscoped. Any divergence means scoping invented survivors.
+
+    DISPOSITION-EXACT (A0, #40): equal totals do not prove agreement — killing mutant
+    A instead of B leaves ``total_killed`` unchanged yet is a scoping soundness bug
+    (the kind ``c8ee1c0`` records as "caught by the oracle, not by inspection"). So this
+    also compares the per-mutant OUTCOME map, not just the counts.
     """
     from Wesker.engine import MutationCategory, run_function_profiling
 
@@ -175,6 +180,21 @@ def test_scoped_and_unscoped_verdicts_agree():
     assert scoped.total_killed == unscoped.total_killed, (
         f"scoping changed the verdict: {unscoped.total_killed} killed unscoped vs "
         f"{scoped.total_killed} scoped — scoping is not verdict-exact"
+    )
+
+    # Disposition-exact: every mutant's IDENTITY must map to the same OUTCOME under both
+    # scopes. Keyed on mutant_id; the outcome is `killed_by` (assertion / exception / crash /
+    # timeout) for a kill, "survived" otherwise. WHICH tests killed a mutant (the kill_matrix
+    # values) legitimately shrinks under scoping and is NOT part of the disposition.
+    def _disposition(r) -> dict:
+        d = {rec["mutant_id"]: rec.get("killed_by") for rec in r.killed_records}
+        d.update({rec["mutant_id"]: "survived" for rec in r.survivor_records})
+        return d
+
+    assert _disposition(scoped) == _disposition(unscoped), (
+        "scoping changed WHICH mutants died, not just how many:\n"
+        f"  unscoped: {_disposition(unscoped)}\n"
+        f"  scoped:   {_disposition(scoped)}"
     )
 
 

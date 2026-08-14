@@ -26,7 +26,6 @@ from Wesker.ci import (
     _load_cached_state,
     _name_matches_convention,
     _pct_color,
-    discover_tests,
     walk_functions,
 )
 
@@ -175,23 +174,6 @@ def test_build_static_impact_map_skips_unparseable(tmp_path):
     bad = tmp_path / "test_bad.py"
     bad.write_text("def (( this is not python\n")
     assert _build_static_impact_map([str(bad)]) == {}
-
-
-# ── 3-layer discovery: convention hit is ordered first ───────────
-
-
-def test_discover_tests_layers(tmp_path):
-    src = _make_project(tmp_path, "query.py", ["test_query.py", "test_misc.py"])
-    # test_misc references function 'f' via impact, test_query via convention.
-    (tmp_path / "tests" / "test_misc.py").write_text("def test_m():\n    f()\n")
-    found = [
-        p.rsplit("/", 1)[-1] for p in discover_tests(str(tmp_path), str(src), ["f"])
-    ]
-    assert found[0] == "test_query.py"  # convention first
-    assert set(found) == {
-        "test_query.py",
-        "test_misc.py",
-    }  # impact/fallback add the rest
 
 
 # ── walk_functions: qualnames incl. nested + methods ─────────────

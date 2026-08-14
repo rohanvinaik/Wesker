@@ -307,43 +307,6 @@ def _discover_all_test_files(
     return sorted(found)
 
 
-# ── 3-Layer discovery orchestrator ───────────────────────────────
-
-
-def discover_tests(
-    project_root: str, source_file: str, func_names: list[str]
-) -> list[str]:
-    """3-layer test discovery: convention -> static impact -> full fallback.
-
-    Layer 1: Convention matching (fast, filename-based)
-    Layer 2: Static impact (AST scan for function name references)
-    Layer 3: Full fallback (all test files)
-
-    Each layer adds files not already found by previous layers.
-    """
-    # Layer 1: Convention
-    found = _discover_by_convention(project_root, source_file)
-
-    # Layer 2: Static impact — find additional test files that reference
-    # any of the function names in this source file
-    all_test_files = _discover_all_test_files(project_root)
-    impact_map = _build_static_impact_map(all_test_files)
-    found_set = set(found)
-    for func_name in func_names:
-        for tf in impact_map.get(func_name, []):
-            if tf not in found_set:
-                found.append(tf)
-                found_set.add(tf)
-
-    # Layer 3: Full fallback — add remaining test files
-    for tf in all_test_files:
-        if tf not in found_set:
-            found.append(tf)
-            found_set.add(tf)
-
-    return found
-
-
 def relevant_test_files(
     project_root: str,
     source_file: str,
@@ -590,26 +553,6 @@ def _item_body_names(call: Any) -> frozenset[str]:
         elif isinstance(n, ast.Attribute):
             names.add(n.attr)
     return frozenset(names)
-
-
-def split_live_callables(
-    live: list[Any], scoped: list[str], target_name: str, func_names: list[str]
-) -> tuple[list[Any], list[Any]]:
-    """Partition the live suite into ``(candidates, unknowns)`` for a target-first seed (#15/Fix B).
-
-    CANDIDATES are the seed — tests whose file statically names the target (``candidate_static``) or
-    that reach it through a fixture edge (``candidate_fixture``). UNKNOWNS are every other kept item:
-    a test in a reachable file that does not name the target and has no fixture edge — it MIGHT still
-    reach the target dynamically, so it is never dropped, only deferred to the widen pass.
-
-    Nothing is classified ``impossible`` here: that requires an OBSERVED trace (``route_test_item``),
-    which the seed does not yet have. So ``candidates ∪ unknowns`` is exactly what the non-split
-    router would keep — the split only orders WHICH are traced first, never which are eligible. The
-    driver seeds ``candidates``, and widens with ``unknowns`` only when a mutant survives the seed."""
-    candidates, unknowns, _impossible = partition_live_callables(
-        live, scoped, target_name, func_names
-    )
-    return candidates, unknowns
 
 
 def _unknown_stratum_rank(code: str) -> int:
@@ -1436,23 +1379,6 @@ def profile_function(
 
 
 # ── Codebase profiling with formatted output ─────────────────────
-
-
-def live_suite_active() -> bool:
-    """True when a LIVE pytest session is currently supplying the test suite.
-
-    Consumers need this to decide whether work can leave the process. The live suite is
-    a set of closures over LIVE pytest items — bound to this interpreter's session, its
-    fixtures and its conftest — so it cannot cross a ``spawn`` boundary. A worker
-    started from inside a live session re-discovers with the collect-only backend, which
-    silently drops every fixture-taking test; the shard then reports those mutants as
-    survivors and the parent merges the lie into an otherwise-correct result.
-
-    ``Detective.engine.profile`` already refuses to fan out when the caller passed
-    explicit callables, for exactly this reason ("workers re-discover; callables can't
-    cross spawn"). This predicate extends that same rule to the live suite.
-    """
-    return _LIVE_SUITE.get() is not None
 
 
 def refresh_live_suite(project_root: str, path: str) -> int:

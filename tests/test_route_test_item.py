@@ -42,24 +42,29 @@ def _evict(*mods: str) -> None:
 def test_a_static_miss_is_unknown_not_impossible():
     """The crux. No name, no fixture edge, no observation → `unknown`, which is KEPT. Classifying
     this as impossible is the false exclusion #15 exists to end."""
-    assert route_test_item("none", False, "unseen", False) == "unknown_no_path"
+    assert route_test_item("none", False, False, "unseen", False) == "unknown_no_path"
 
 
 def test_only_an_observed_non_reach_is_impossible():
     """Impossibility requires POSITIVE evidence — a prior trace that ran the node and did not touch
     the target. Nothing static can prove a negative here."""
-    assert route_test_item("none", False, "not_reached", False) == "impossible_observed"
-    assert route_test_item("item", True, "reached", False) == "candidate_observed"
+    assert (
+        route_test_item("none", False, False, "not_reached", False)
+        == "impossible_observed"
+    )
+    assert (
+        route_test_item("item", True, False, "reached", False) == "candidate_observed"
+    )
 
 
 def test_a_fixture_edge_is_a_candidate():
     """The autouse/conftest reach: the item names nothing but a fixture in its closure does."""
-    assert route_test_item("none", True, "unseen", False) == "candidate_fixture"
+    assert route_test_item("none", True, False, "unseen", False) == "candidate_fixture"
 
 
 def test_a_static_name_is_a_candidate():
     """The item's OWN body names the target — the direct-item stratum, a seed candidate."""
-    assert route_test_item("item", False, "unseen", False) == "candidate_static"
+    assert route_test_item("item", False, False, "unseen", False) == "candidate_static"
 
 
 def test_a_file_only_reference_is_a_file_peer_not_a_seed_candidate():
@@ -67,13 +72,29 @@ def test_a_file_only_reference_is_a_file_peer_not_a_seed_candidate():
     item's own body does not. That is a `file_peer`: KEPT (widened, never dropped) but NOT a seed
     candidate, so one real test naming the target no longer drags its file-siblings into the eager
     seed. The distinction file-vs-item is the whole point — a file bit conflated them."""
-    assert route_test_item("file", False, "unseen", False) == "file_peer"
+    assert route_test_item("file", False, False, "unseen", False) == "file_peer"
+
+
+def test_a_caller_reach_is_a_widen_stratum_below_fixture_above_file_peer():
+    """#15 B: the item names a production caller that reaches the target (a test of `resolve_roles`
+    that calls `_compute_sets`) — a positive TRANSITIVE reach. It routes as `caller_reaches`: a widen
+    stratum, below a fixture edge, above a file-peer, never a false drop and never eagerly seeded."""
+    assert route_test_item("none", False, True, "unseen", False) == "caller_reaches"
+    # A stronger own-body or fixture signal outranks it; an observed non-reach still dominates.
+    assert route_test_item("item", False, True, "unseen", False) == "candidate_static"
+    assert route_test_item("none", True, True, "unseen", False) == "candidate_fixture"
+    assert (
+        route_test_item("none", False, True, "not_reached", False)
+        == "impossible_observed"
+    )
+    # It outranks a mere file-peer — a real call path beats a same-file coincidence.
+    assert route_test_item("file", False, True, "unseen", False) == "caller_reaches"
 
 
 def test_dynamic_uncertainty_widens_to_unknown_not_impossible():
     """Plugins / dynamic imports mean the static picture is incomplete — incomplete is not proof of
     irrelevance, so it widens rather than excludes."""
-    assert route_test_item("none", False, "unseen", True) == "unknown_dynamic"
+    assert route_test_item("none", False, False, "unseen", True) == "unknown_dynamic"
 
 
 def test_admits_keeps_unknown_by_default_and_drops_it_when_conservative():

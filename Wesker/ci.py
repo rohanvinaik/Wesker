@@ -395,6 +395,7 @@ def relevant_test_files(
 def route_test_item(
     static_reach: str,
     fixture_reaches: bool,
+    caller_reaches: bool,
     observed_reach: str,
     dynamic_uncertain: bool,
 ) -> str:
@@ -427,6 +428,13 @@ def route_test_item(
     ``fixture_reaches`` (a fixture in the item's closure defined in a file that names the target — the
     autouse/conftest reach a body scan cannot see) outranks ``"file"`` but sits below an own-body name.
 
+    ``caller_reaches`` is a positive TRANSITIVE-caller signal (#15 B): the item's body names a
+    production function that itself reaches the target, so a test of a public API reaches a private
+    helper it never names (``test_resolve_roles`` → ``resolve_roles`` → ``_compute_sets``). It is a
+    widen stratum (``caller_reaches``), ranked below a fixture edge and above a ``file_peer`` — traced
+    FIRST among the unknowns (`_unknown_stratum_rank`), never eagerly seeded. Positive-only: it can
+    only promote an item toward the front of the widen, never rule one out.
+
     ``dynamic_uncertain`` widens to unknown rather than excluding: plugins or dynamic imports mean
     the static picture is incomplete, and incomplete is not proof of irrelevance.
     """
@@ -438,6 +446,8 @@ def route_test_item(
         return "candidate_static"
     if fixture_reaches:
         return "candidate_fixture"
+    if caller_reaches:
+        return "caller_reaches"
     if static_reach == "file":
         return "file_peer"
     if dynamic_uncertain:
@@ -517,7 +527,8 @@ def _route_live_callables(
         # the in-scope bit onto the static lattice; the per-item precision (#15) belongs to the SEED
         # router `partition_live_callables`, where a file-peer was wrongly entering the seed.
         static_reach = "item" if names_target else "none"
-        code = route_test_item(static_reach, fixture_reaches, "unseen", False)
+        # The default keep-all router has no single target for a per-item caller slice — pass False.
+        code = route_test_item(static_reach, fixture_reaches, False, "unseen", False)
         if route_admits(code, conservative):
             kept.append(c)
     return kept
@@ -549,33 +560,36 @@ def _files_referencing_target(files: list[str], target_name: str) -> set[str]:
     return out
 
 
-def _item_body_references_target(call: Any, target_name: str) -> bool:
-    """Whether the item's OWN function body statically references ``target_name`` (#15, per-item).
+def _item_body_names(call: Any) -> frozenset[str]:
+    """The simple names the item's OWN function body statically references (#15, per-item).
 
     Read through :func:`callable_source` — the contract accessor for the user's underlying test — so
     live, recollected, and legacy backends resolve to the real test function, never Wesker's wrapper
-    body (identical for every item, which would make every test look like it names the target). This
-    is the per-TESTID signal that ``_files_referencing_target`` (FILE granularity) cannot give: a
-    sibling test in the same file naming the target does not make THIS item a seed candidate. That
-    conflation is residual-1 — one real test dragged its file's every integration sibling into the
-    eager seed. One-sided and best-effort: any failure to read or parse the source returns False,
-    which degrades the item to a ``file_peer`` (kept, widened), never a false drop.
+    body (identical for every item, which would make every test look like it names the target).
+    Collects bare-``Name`` ids AND ``Attribute`` attrs (so ``obj.target`` names ``target``), the same
+    two-form match ``_files_referencing_target`` uses. This is the per-TESTID signal a FILE scan
+    cannot give: a sibling test in the same file naming the target does not put that name in THIS
+    item's set (residual-1). One parse serves both axes — the static-reach axis (``target_name`` in
+    the set) and the transitive-caller axis (#15 B, a caller name in the set). One-sided and
+    best-effort: any failure to read or parse the source returns the EMPTY set, degrading the item to
+    a file/unknown stratum (kept, widened), never a false drop.
     """
     fn = callable_source(call)
     try:
         src = inspect.getsource(fn)
     except (OSError, TypeError):
-        return False
+        return frozenset()
     try:
         tree = ast.parse(textwrap.dedent(src))
     except (SyntaxError, ValueError):
-        return False
+        return frozenset()
+    names: set[str] = set()
     for n in ast.walk(tree):
-        if (isinstance(n, ast.Name) and n.id == target_name) or (
-            isinstance(n, ast.Attribute) and n.attr == target_name
-        ):
-            return True
-    return False
+        if isinstance(n, ast.Name):
+            names.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            names.add(n.attr)
+    return frozenset(names)
 
 
 def split_live_callables(
@@ -599,12 +613,18 @@ def split_live_callables(
 
 
 def _unknown_stratum_rank(code: str) -> int:
-    """Order the widen (unknown) stratum most-likely-reacher first (#15 C), so an item-incremental
-    widen discharges its obligations before paying for the weaker signals. ``file_peer`` (the item's
-    FILE names the target) outranks ``unknown_dynamic`` (a plugin / dynamic import MIGHT reach it)
-    outranks ``unknown_no_path`` (no static signal at all). An unrecognised code sorts last. This is
-    the seam B extends: a transitive-caller stratum slots in ABOVE ``file_peer`` here."""
-    return {"file_peer": 0, "unknown_dynamic": 1, "unknown_no_path": 2}.get(code, 3)
+    """Order the widen (unknown) stratum most-likely-reacher first (#15 C/B), so an item-incremental
+    widen discharges its obligations before paying for the weaker signals. ``caller_reaches`` (the
+    item names a production caller that reaches the target — #15 B) is the strongest widen signal,
+    then ``file_peer`` (its FILE names the target), then ``unknown_dynamic`` (a plugin / dynamic
+    import MIGHT reach it), then ``unknown_no_path`` (no static signal at all). An unrecognised code
+    sorts last."""
+    return {
+        "caller_reaches": 0,
+        "file_peer": 1,
+        "unknown_dynamic": 2,
+        "unknown_no_path": 3,
+    }.get(code, 4)
 
 
 def partition_live_callables(
@@ -613,16 +633,20 @@ def partition_live_callables(
     target_name: str,
     func_names: list[str],
     observed_reach: dict[str, str] | None = None,
+    caller_names: set[str] | None = None,
 ) -> tuple[list[Any], list[Any], list[Any]]:
     """Partition into candidate / unknown / proof-grade impossible for ONE function (#15).
 
     Static and fixture evidence can only promote an unseen item to CANDIDATE. The third bucket is
     populated solely from an exact per-TestId observation loaded under the same target content,
-    test/fixture context, and pytest regime. Missing evidence remains UNKNOWN. The legacy
+    test/fixture context, and pytest regime. Missing evidence remains UNKNOWN. ``caller_names`` are
+    production functions that reach the target (#15 B, a one-hop backward slice): an item naming one
+    is a ``caller_reaches`` widen stratum — it reaches the target though it never names it. The legacy
     :func:`split_live_callables` wrapper preserves its two-way API for callers without observations.
     """
     naming_files = _files_referencing_target(scoped, target_name)
     fixture_ref = _fixture_files_reaching_target(live, func_names)
+    _caller_names = frozenset(caller_names or ())
     candidates: list[Any] = []
     _unknown_rows: list[tuple[str, Any]] = []
     impossible: list[Any] = []
@@ -630,20 +654,25 @@ def partition_live_callables(
     for c in live:
         origin = os.path.realpath(callable_origin(c) or "")
         # Per-TESTID (#15): the item's OWN body naming the target is a `candidate_static` seed; only
-        # its FILE naming it (a sibling test does, not this item) is a `file_peer` — kept and widened,
-        # never seeded. This is the residual that dragged a file's every integration sibling into the
-        # eager seed. Falls back to the file bit whenever the body cannot be read (one-sided, kept).
-        if _item_body_references_target(c, target_name):
+        # its FILE naming it (a sibling test does, not this item) is a `file_peer` — kept, widened,
+        # never seeded. `_caller_names` are production functions that reach the target (#15 B): an
+        # item naming one reaches the target though it never names it (a `caller_reaches` widen
+        # stratum). One body parse serves both axes; falls back to the file bit / no caller signal
+        # when the body cannot be read (one-sided, kept).
+        body_names = _item_body_names(c)
+        if target_name in body_names:
             static_reach = "item"
         elif origin in naming_files:
             static_reach = "file"
         else:
             static_reach = "none"
+        caller_reaches = bool(_caller_names & body_names)
         fx = {os.path.realpath(f) for f in callable_fixture_origins(c)}
         fixture_reaches = bool(fx & fixture_ref)
         code = route_test_item(
             static_reach,
             fixture_reaches,
+            caller_reaches,
             observed_reach.get(callable_test_id(c), "unseen"),
             False,
         )
@@ -656,7 +685,9 @@ def partition_live_callables(
     # Order the widen (unknown) stratum most-likely-reacher first (#15 C), so the item-incremental
     # widen discharges its obligations before tracing the weaker signals. Stable — discovery order is
     # kept within a rank; `candidates`/`impossible` keep discovery order (the seed is traced whole).
-    unknowns = [c for _, c in sorted(_unknown_rows, key=lambda r: _unknown_stratum_rank(r[0]))]
+    unknowns = [
+        c for _, c in sorted(_unknown_rows, key=lambda r: _unknown_stratum_rank(r[0]))
+    ]
     return candidates, unknowns, impossible
 
 

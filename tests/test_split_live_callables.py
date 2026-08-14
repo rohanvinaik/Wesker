@@ -48,6 +48,17 @@ def _mk_attr_naming(origin):
     return t
 
 
+def _mk_caller(origin):
+    """A mock whose OWN body names `resolve` — a production CALLER of the target, not the target
+    itself (#15 B). Reaches the target transitively when `resolve` is passed in `caller_names`."""
+
+    def t():
+        return resolve  # noqa: F821 — names a caller of the target, never executed
+
+    t.__wesker_origin__ = str(origin)
+    return t
+
+
 def _names(items):
     return {getattr(c, "__wesker_origin__", "?") for c in items}
 
@@ -161,3 +172,40 @@ def test_unknowns_are_ordered_file_peer_before_no_path(tmp_path):
         file_peer,
         no_path,
     ]  # file_peer sorted ahead despite input order
+
+
+def test_a_caller_reaching_test_is_a_widen_stratum_ahead_of_a_file_peer(tmp_path):
+    """#15 B: a test whose body names a PRODUCTION CALLER of the target (never the target itself)
+    reaches it transitively — a `caller_reaches` widen stratum, ordered AHEAD of a file_peer. The
+    caller set is passed as `caller_names={"resolve"}`, mirroring Detective's one-hop backward slice
+    (`resolve` is a production function that calls the private `target`)."""
+    (tmp_path / "mod.py").write_text("def target(x):\n    return x + 1\n")
+    peer_f = tmp_path / "test_peer.py"
+    peer_f.write_text(
+        "from mod import target\n\ndef test_it():\n    assert target(1) == 2\n"
+    )
+    caller_f = tmp_path / "test_caller.py"
+    caller_f.write_text(
+        "from mod import resolve\n\ndef test_it():\n    assert resolve(1) == 2\n"
+    )
+
+    file_peer = _mk(peer_f)  # file names target, body does not -> file_peer
+    caller = _mk_caller(
+        caller_f
+    )  # body names `resolve`, a caller of target -> caller_reaches
+    # Pass file_peer FIRST so only the stratum sort can put the caller-reaching item ahead of it.
+    candidates, unknowns, _imp = partition_live_callables(
+        [file_peer, caller],
+        [str(peer_f), str(caller_f)],
+        "target",
+        ["target"],
+        None,
+        {"resolve"},
+    )
+    assert (
+        candidates == []
+    )  # neither names the target in its own body — both are widen strata
+    assert unknowns == [
+        caller,
+        file_peer,
+    ]  # caller_reaches (rank 0) sorts ahead of file_peer

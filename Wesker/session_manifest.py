@@ -155,6 +155,9 @@ class PytestSessionManifest:
     python_version: str = ""
     rootpath: str = ""
     inipath: str = ""
+    # The config file's CONTENT digest (§2.2 a-1), captured at build. `inipath` alone keys the
+    # PATH; an in-place edit to a config at the same path is a different regime this binds.
+    inicontent_digest: str = ""
     import_mode: str = ""
     invocation_args: tuple[str, ...] = ()
     plugins: tuple[str, ...] = ()
@@ -184,8 +187,9 @@ class PytestSessionManifest:
         """A digest of the pytest EXECUTION REGIME (#63) — the config that determines HOW collected
         tests run, so a warm verdict measured under one regime is not served under another.
 
-        Covers the runner identity a manifest can see: pytest and python version, rootdir, ini file,
-        import mode, and the loaded plugin set (sorted — load order is not a regime change).
+        Covers the runner identity a manifest can see: pytest and python version, rootdir, ini file
+        (path AND content, §2.2 a-1), import mode, and the loaded plugin set (sorted — load order is
+        not a regime change).
         Distribution plugins bind their version; unversioned/local plugins (including conftests)
         bind canonical source path + content digest. Per-item fixture definitions are additionally
         bound by ``trace_cache.test_fingerprint``. Excludes ``items`` / ``scope`` /
@@ -208,6 +212,11 @@ class PytestSessionManifest:
                 self.python_version,
                 self.rootpath,
                 self.inipath,
+                # §2.2 a-1: bind the config CONTENT, not just its path — an in-place edit to
+                # addopts / markers / options at the same path is a different regime. Captured at
+                # build by `capture_manifest` (via `_digest`), so this stays a PURE hash of the
+                # frozen snapshot rather than reading the filesystem from a property.
+                self.inicontent_digest,
                 self.import_mode,
                 *sorted(self.plugins),
             )
@@ -366,11 +375,13 @@ def capture_manifest(
     # back-edge would be a cycle.
     from .pytest_discovery import current_measurement_scope
 
+    _inipath = str(getattr(config, "inipath", "") or "")
     return PytestSessionManifest(
         pytest_version=pytest_version,
         python_version=sys.version.split()[0],
         rootpath=str(getattr(config, "rootpath", "") or ""),
-        inipath=str(getattr(config, "inipath", "") or ""),
+        inipath=_inipath,
+        inicontent_digest=_digest(_inipath) if _inipath else "",
         import_mode=_opt("importmode"),
         invocation_args=_invocation_args,
         plugins=plugins,

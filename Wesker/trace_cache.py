@@ -273,6 +273,47 @@ def save(
                 pass
 
 
+def _is_property_test(fn: Any) -> bool:
+    """Is this a Hypothesis (``@given``) test — whose covered lines vary with the example seed?
+
+    A cached non-reach for such a test is not safely replayable (§2.2 a-2): the same source and
+    context can cover different lines on a re-run, so its cached negative must degrade to
+    ``unknown`` and be re-traced. Hypothesis marks the wrapped test ``is_hypothesis_test`` /
+    ``.hypothesis``; walk the ``__wrapped__`` chain because Wesker's own discovery wrapper may sit
+    OUTSIDE the Hypothesis wrapper, and ``callable_source`` only unwraps one level.
+    """
+    seen: set[int] = set()
+    cur: Any = fn
+    while cur is not None and id(cur) not in seen:
+        if getattr(cur, "is_hypothesis_test", False) or hasattr(cur, "hypothesis"):
+            return True
+        seen.add(id(cur))
+        cur = getattr(cur, "__wrapped__", None)
+    return False
+
+
+def replayed_negative_admission(
+    has_outcome: bool, fingerprint_matches: bool, is_property_test: bool
+) -> str:
+    """May a CACHED non-reach be replayed as evidence a test does not reach the target?
+    (§2.2 option a, pure — pinned).
+
+    A replayed negative is the only cached value that can SHRINK the search — the only one that
+    could manufacture a false COMPLETE — so it is admitted under the strictest precondition and
+    named, never a bool:
+
+      "not_reached"  admissible — a COMPLETED baseline outcome exists at the SAME content+context
+                     fingerprint, and the test's coverage is not example-dependent
+      "unknown"      degrade and re-trace — no completed outcome, OR the fingerprint drifted, OR a
+                     property (Hypothesis) test whose covered lines vary with the example seed
+    """
+    if not has_outcome or not fingerprint_matches:
+        return "unknown"
+    if is_property_test:
+        return "unknown"
+    return "not_reached"
+
+
 def observed_function_reach(
     project_root: str,
     target_files: set[str],
@@ -320,7 +361,14 @@ def observed_function_reach(
                 lines.update(int(ln) for ln in cell.get("lines", ()))
         if executable_lines.intersection(lines):
             out[test_id] = "reached"
-        elif test_id in outcomes and outcome_fingerprints.get(test_id) == fingerprint:
+        elif (
+            replayed_negative_admission(
+                test_id in outcomes,
+                outcome_fingerprints.get(test_id) == fingerprint,
+                _is_property_test(test_fn),
+            )
+            == "not_reached"
+        ):
             out[test_id] = "not_reached"
     return out
 

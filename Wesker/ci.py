@@ -1054,13 +1054,6 @@ def discover_test_callables(
         if not os.path.isabs(source_file)
         else source_file
     )
-    # SCOPE FIRST, on every backend. Profiling ONE function was previously handed every
-    # test file in the project, and each of the three backends below then paid for the
-    # ~12x of them that cannot reach the target — in collection, in the traced baseline,
-    # and again per mutant.
-    scoped = relevant_test_files(
-        project_root, full_path, func_names, testpaths=testpaths
-    )
     extra = [os.path.abspath(d) for d in (extra_dirs or []) if os.path.isdir(d)]
 
     # A live session collected the whole suite once, WITH real fixtures/conftest/lifecycle —
@@ -1074,6 +1067,24 @@ def discover_test_callables(
     # caller's spelling, so on any symlinked root the two must be normalised or the filter silently
     # empties the suite.
     live = _LIVE_SUITE.get()
+    # PROVEN-IDENTITY SHORT-CIRCUIT (exhaustive [R-exec] probe, #15 C2). At the default
+    # `conservative=False`, `_route_live_callables` admits EVERY per-item route it can produce —
+    # static_reach×fixture over {item,none}×{T,F}, with caller/observed/dynamic fixed as it passes
+    # them, yields only candidate_static / candidate_fixture / unknown_no_path, all kept — so its
+    # result is exactly `live`. Return it WITHOUT computing the impact map: `relevant_test_files`
+    # was built on every live profiling call and then discarded by that identity (the "computed
+    # every live call, discarded" waste, §4.5). The `conservative=True` narrowing (which DOES drop
+    # `unknown_no_path`) still runs the router below, where `scoped` is the file bound it needs.
+    if live is not None and not conservative:
+        return live
+
+    # SCOPE FIRST for every path that actually consumes it — the non-live backends below and the
+    # conservative live router. Profiling ONE function was previously handed every test file, and
+    # each backend then paid for the ~12x that cannot reach the target: collection, baseline, and
+    # again per mutant.
+    scoped = relevant_test_files(
+        project_root, full_path, func_names, testpaths=testpaths
+    )
     if live is not None:
         return _route_live_callables(live, scoped, func_names, conservative)
 

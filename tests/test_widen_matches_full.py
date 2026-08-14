@@ -243,3 +243,51 @@ def test_line_only_widen_that_crosses_the_budget_is_non_gateable(monkeypatch):
     assert result.budget_exhausted is True
     assert result.coverage_depth == "cut"
     assert result.is_gateable is False
+
+
+def test_early_stop_skips_an_unneeded_widen_test():
+    """The efficiency win, behaviorally (#15 C): when the FIRST widen test discharges every
+    obligation, a LATER unneeded widen test is NEVER traced — yet the disposition still equals the
+    full baseline. The low-stratum unknowns cost nothing once the survivor is killed. (scoreit under
+    test_true+test_false is complete — 5/5 killed, 0 survivors — so batch 1 discharges everything.)"""
+    node = _fn(_SRC)
+    ns: dict = {}
+    exec(compile(ast.parse(_SRC), "<early>", "exec"), ns)  # noqa: S102 — test fixture source
+    original = ns["scoreit"]
+
+    ran = {"extra": False}
+
+    def test_true():
+        assert scoreit(1, 2, True) == 4  # noqa: F821 — flag=True branch only
+
+    def test_false():
+        assert scoreit(5, 3, False) == 2  # noqa: F821 — kills the flag=False mutants (the needed widen)
+
+    def extra_unused():
+        ran["extra"] = True
+        assert scoreit(9, 9, True) == 27  # noqa: F821 — covers ONLY the already-covered flag=True branch
+
+    tests = [test_true, test_false, extra_unused]
+    for t in tests:
+        t.__globals__["scoreit"] = original
+    target_files = {original.__code__.co_filename}
+
+    def build(subset=None, fresh=False):
+        return build_session_baseline(
+            tests if subset is None else list(subset), target_files
+        )
+
+    full = _run_profiling(node, tests, original, LazySessionBaseline(build))
+
+    # Only the SEEDED run's tracing is under test; the full run legitimately executed `extra_unused`.
+    ran["extra"] = False
+    holder = LazySessionBaseline(build)
+    holder.seed([test_true])
+    seeded = _run_profiling(
+        node, tests, original, holder, widen_tests=[test_false, extra_unused]
+    )
+
+    assert _matrix(seeded) == _matrix(full), "early-stop changed the disposition"
+    assert ran["extra"] is False, (
+        "an unneeded widen test was traced after every obligation had discharged — early-stop failed"
+    )

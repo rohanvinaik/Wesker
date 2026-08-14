@@ -5252,6 +5252,42 @@ def _evaluate_isolated(
     return _isolated_result(mutant, run, _elapsed(t0)), worker, run
 
 
+def next_routing_action(
+    has_open_obligations: bool,
+    has_remaining_items: bool,
+    containment_lost: bool,
+) -> str:
+    """Decide the next step of an item-incremental widen — the stop/continue rule (#15, pure — pinned).
+
+    The widen traces routed tests in stratum order to discharge a seed's remaining PROOF OBLIGATIONS,
+    and must trace only as far as it needs to. "Open obligation" is the NORMALIZED proof fact, never
+    `bool(surviving_mutants)`: a surviving mutant, a provisionally-equivalent mutant the seed's partial
+    basis could not disprove (the converged path widens these deliberately — an empty/partial seed can
+    misclassify a mutant equivalent), OR an uncovered executable target line all count.
+
+    * ``not has_open_obligations`` — every mutation/equivalence AND line obligation is discharged.
+      ``"complete"``: stop now. Tracing the remaining eligible items cannot change a settled verdict —
+      a killed mutant stays killed, a covered line stays covered — so the low-stratum unknowns are
+      never traced. This is the efficiency win, and it is checked FIRST: a fully-discharged run is
+      complete even if containment was later lost, because nothing negative rests on the trace.
+    * ``containment_lost`` — a budget cut, a truncation, or an uncontained worker crossed the run
+      mid-widen, so an obligation could not be resolved. A negative conclusion is valid only once
+      every unknown is resolved, so an unfinished widen yields ``"unresolved"`` — a typed non-gateable
+      result, never a false gap.
+    * ``has_remaining_items`` — an eligible test remains that MIGHT discharge an obligation:
+      ``"trace_next"``, widen one more stratum/micro-batch and re-evaluate.
+    * otherwise every eligible unknown was traced and an obligation still stands — ``"gap"``: the
+      honest specification gap, sound precisely because the unknown set is now exhausted.
+    """
+    if not has_open_obligations:
+        return "complete"
+    if containment_lost:
+        return "unresolved"
+    if has_remaining_items:
+        return "trace_next"
+    return "gap"
+
+
 def run_function_profiling(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     func_key: str,
@@ -5617,18 +5653,47 @@ def run_function_profiling(
         scope_tests and exec_lines and not set(exec_lines).issubset(_covered_lines)
     )
     _widen_holder = _SESSION_BASELINE.get()
-    if (
-        widen_tests
-        and (_survivor_mutants or _lines_incomplete)
-        and not isolated
-        and not budget_exhausted
-        and _widen_holder is not None
-        and (budget_ms is None or _elapsed(start) <= budget_ms)
+    # ── ITEM-INCREMENTAL WIDEN (Fix B / #15 C) ──────────────────────────────────────────────────
+    # Trace the routed unknowns ONE micro-batch at a time in the order the caller handed them (a
+    # stratum order — most-likely reacher first), re-evaluating the open obligations after each and
+    # STOPPING the instant they discharge. `next_routing_action` is the pinned stop rule: the
+    # low-stratum unknowns are never traced once every survivor is killed and every line is covered.
+    # `seed(A)+expand(b1)+expand(b2)…` composes to a full trace over A∪(traced b) — expand splices
+    # additively — so the DISPOSITION equals the full-baseline disposition over whatever was traced
+    # (the differential oracle pins it); early-stop only skips UNNEEDED tests, never a verdict. A
+    # budget cut mid-widen is `unresolved` (non-gateable via `budget_exhausted`), never a false gap;
+    # a true gap is declared only once the unknown list is exhausted. Batch of 1 gives the tightest
+    # early-stop and the least exposure to a single hanging integration test (#19-adjacent).
+    _remaining_widen = (
+        list(widen_tests)
+        if (
+            widen_tests
+            and not isolated
+            and not budget_exhausted
+            and _widen_holder is not None
+            and (budget_ms is None or _elapsed(start) <= budget_ms)
+        )
+        else []
+    )
+    while (
+        next_routing_action(
+            has_open_obligations=bool(_survivor_mutants) or _lines_incomplete,
+            has_remaining_items=bool(_remaining_widen),
+            containment_lost=budget_exhausted,
+        )
+        == "trace_next"
     ):
-        _widen_holder.expand(list(widen_tests))
-        # The widen itself runs tests and can cross the aggregate deadline even when there are NO
-        # survivors to enter the loop below (line-only closeout). Consume that elapsed signal here;
-        # a cut unknown partition is unresolved and can never remain gateable (#15 closeout #6).
+        if budget_ms is not None and _elapsed(start) > budget_ms:
+            budget_exhausted = True
+            break
+        _batch, _remaining_widen = _remaining_widen[:1], _remaining_widen[1:]
+        # `_remaining_widen` is non-empty only when the holder is non-None (they are set together
+        # above), so this narrowing always holds; the assert states the invariant for reader and ty.
+        assert _widen_holder is not None
+        _widen_holder.expand(_batch)
+        # The widen runs tests and can cross the aggregate deadline even with NO survivors to enter
+        # the loop below (line-only closeout). Consume that elapsed signal here; a cut unknown
+        # partition is unresolved and can never remain gateable (#15 closeout #6).
         if budget_ms is not None and _elapsed(start) > budget_ms:
             budget_exhausted = True
         _wt: set[str] = set()
@@ -5651,6 +5716,12 @@ def run_function_profiling(
         _trace_truncated |= _wt
         _baseline_uncontained |= _wu
         _arc_cov.update(_wa)
+        # Recompute the line obligation against the widened basis, so the next `next_routing_action`
+        # sees this batch's coverage — a line-only widen ends the moment every executable line is hit.
+        _covered_lines = {ln for lines in line_cov.values() for ln in lines}
+        _lines_incomplete = bool(
+            scope_tests and exec_lines and not set(exec_lines).issubset(_covered_lines)
+        )
         for _mid, _mutant in list(_survivor_mutants.items()):
             if budget_ms is not None and _elapsed(start) > budget_ms:
                 # A cut widen leaves some survivors NOT re-evaluated against the unknowns
@@ -5675,6 +5746,10 @@ def run_function_profiling(
             )
             if not _res.killed:
                 continue
+            # Prune the now-killed mutant so the incremental obligation check and the next micro-batch
+            # no longer see it as open — the run-once widen never needed to, as it re-evaluated the
+            # whole survivor set exactly once.
+            del _survivor_mutants[_mid]
             # Move survivor -> killed on its category (inline aggregation): `total` stays, survived--,
             # killed++, and the kill-reason counter `value_killed`/the report read. Then move the
             # record and credit the killer.
@@ -6396,14 +6471,41 @@ def run_function_converged(
     # so the re-derived scope below rebuilds the FULL baseline — still a complete basis, never a
     # seed-only false survivor.
     _widen_holder = _SESSION_BASELINE.get()
-    if (
-        widen_tests
-        and _survivor_mutants
-        and not uncontained_stop
-        and _widen_holder is not None
-        and _elapsed(start) <= budget_ms
+    # ── ITEM-INCREMENTAL WIDEN (Fix B / #15 C) — see run_function_profiling for the full rationale.
+    # Converged's obligation is `_survivor_mutants`, which already carries the PROVISIONALLY-EQUIVALENT
+    # mutants re-added above: an empty/partial seed can misclassify a mutant equivalent, so the widen
+    # must re-observe them too — a truly-equivalent one keeps the obligation open (forcing the full
+    # traversal that CONFIRMS equivalence), a false one is killed and pruned early. Trace the unknowns
+    # one micro-batch at a time in stratum order, stopping the instant every obligation discharges. A
+    # containment loss or a budget cut mid-widen ends it as `unresolved` (loop control only —
+    # converged's own gateability path is unchanged), never a false gap; a true gap only once the
+    # unknowns are exhausted.
+    _remaining_widen = (
+        list(widen_tests)
+        if (
+            widen_tests
+            and not uncontained_stop
+            and _widen_holder is not None
+            and _elapsed(start) <= budget_ms
+        )
+        else []
+    )
+    _widen_cut = False
+    while (
+        next_routing_action(
+            has_open_obligations=bool(_survivor_mutants),
+            has_remaining_items=bool(_remaining_widen),
+            containment_lost=uncontained_stop or _widen_cut,
+        )
+        == "trace_next"
     ):
-        _widen_holder.expand(list(widen_tests))
+        if _elapsed(start) > budget_ms:
+            _widen_cut = True
+            break
+        _batch, _remaining_widen = _remaining_widen[:1], _remaining_widen[1:]
+        # `_remaining_widen` is non-empty only when the holder is non-None (set together above).
+        assert _widen_holder is not None
+        _widen_holder.expand(_batch)
         _wt: set[str] = set()
         _wu: set[str] = set()
         _tests_for, line_cov, exec_lines, failing = _build_test_scope(
@@ -6423,6 +6525,7 @@ def run_function_converged(
         _baseline_uncontained |= _wu
         for _mid, _mutant in list(_survivor_mutants.items()):
             if _elapsed(start) > budget_ms:
+                _widen_cut = True
                 break
             _scoped = _tests_for(_mutant)
             _cap_ms = (

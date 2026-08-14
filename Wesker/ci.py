@@ -598,6 +598,15 @@ def split_live_callables(
     return candidates, unknowns
 
 
+def _unknown_stratum_rank(code: str) -> int:
+    """Order the widen (unknown) stratum most-likely-reacher first (#15 C), so an item-incremental
+    widen discharges its obligations before paying for the weaker signals. ``file_peer`` (the item's
+    FILE names the target) outranks ``unknown_dynamic`` (a plugin / dynamic import MIGHT reach it)
+    outranks ``unknown_no_path`` (no static signal at all). An unrecognised code sorts last. This is
+    the seam B extends: a transitive-caller stratum slots in ABOVE ``file_peer`` here."""
+    return {"file_peer": 0, "unknown_dynamic": 1, "unknown_no_path": 2}.get(code, 3)
+
+
 def partition_live_callables(
     live: list[Any],
     scoped: list[str],
@@ -615,7 +624,7 @@ def partition_live_callables(
     naming_files = _files_referencing_target(scoped, target_name)
     fixture_ref = _fixture_files_reaching_target(live, func_names)
     candidates: list[Any] = []
-    unknowns: list[Any] = []
+    _unknown_rows: list[tuple[str, Any]] = []
     impossible: list[Any] = []
     observed_reach = observed_reach or {}
     for c in live:
@@ -643,7 +652,11 @@ def partition_live_callables(
         elif code.startswith("impossible"):
             impossible.append(c)
         else:
-            unknowns.append(c)
+            _unknown_rows.append((code, c))
+    # Order the widen (unknown) stratum most-likely-reacher first (#15 C), so the item-incremental
+    # widen discharges its obligations before tracing the weaker signals. Stable — discovery order is
+    # kept within a rank; `candidates`/`impossible` keep discovery order (the seed is traced whole).
+    unknowns = [c for _, c in sorted(_unknown_rows, key=lambda r: _unknown_stratum_rank(r[0]))]
     return candidates, unknowns, impossible
 
 

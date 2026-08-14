@@ -136,3 +136,28 @@ def test_exact_observed_reach_populates_all_three_routing_buckets(tmp_path):
     assert _names(candidates) == {str(names_f)}
     assert _names(unknowns) == {str(unseen_f)}
     assert _names(impossible) == {str(silent_f)}
+
+
+def test_unknowns_are_ordered_file_peer_before_no_path(tmp_path):
+    """#15 C: the widen stratum is ordered most-likely-reacher first — a file_peer (its file names
+    the target) is traced before an item whose file has no signal, so the item-incremental widen
+    tries the stronger candidate first and can stop earlier."""
+    (tmp_path / "mod.py").write_text("def target(x):\n    return x + 1\n")
+    peer_f = tmp_path / "test_peer.py"
+    peer_f.write_text(
+        "from mod import target\n\ndef test_it():\n    assert target(1) == 2\n"
+    )
+    blank_f = tmp_path / "test_blank.py"
+    blank_f.write_text("def test_it():\n    assert 1 == 1\n")
+
+    no_path = _mk(blank_f)  # file names nothing -> unknown_no_path
+    file_peer = _mk(peer_f)  # file names target, body does not -> file_peer
+    # Pass no_path FIRST so only the stratum sort can put file_peer ahead of it.
+    candidates, unknowns, _imp = partition_live_callables(
+        [no_path, file_peer], [str(peer_f), str(blank_f)], "target", ["target"]
+    )
+    assert candidates == []
+    assert unknowns == [
+        file_peer,
+        no_path,
+    ]  # file_peer sorted ahead despite input order

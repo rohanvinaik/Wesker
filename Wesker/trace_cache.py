@@ -293,45 +293,12 @@ def save(
                 pass
 
 
-def _is_property_test(fn: Any) -> bool:
-    """Is this a Hypothesis (``@given``) test — whose covered lines vary with the example seed?
-
-    A cached non-reach for such a test is not safely replayable (§2.2 a-2): the same source and
-    context can cover different lines on a re-run, so its cached negative must degrade to
-    ``unknown`` and be re-traced. Hypothesis marks the wrapped test ``is_hypothesis_test`` /
-    ``.hypothesis``; walk the ``__wrapped__`` chain because Wesker's own discovery wrapper may sit
-    OUTSIDE the Hypothesis wrapper, and ``callable_source`` only unwraps one level.
-    """
-    seen: set[int] = set()
-    cur: Any = fn
-    while cur is not None and id(cur) not in seen:
-        if getattr(cur, "is_hypothesis_test", False) or hasattr(cur, "hypothesis"):
-            return True
-        seen.add(id(cur))
-        cur = getattr(cur, "__wrapped__", None)
-    return False
-
-
-def replayed_negative_admission(
-    has_outcome: bool, fingerprint_matches: bool, is_property_test: bool
-) -> str:
-    """May a CACHED non-reach be replayed as evidence a test does not reach the target?
-    (§2.2 option a, pure — pinned).
-
-    A replayed negative is the only cached value that can SHRINK the search — the only one that
-    could manufacture a false COMPLETE — so it is admitted under the strictest precondition and
-    named, never a bool:
-
-      "not_reached"  admissible — a COMPLETED baseline outcome exists at the SAME content+context
-                     fingerprint, and the test's coverage is not example-dependent
-      "unknown"      degrade and re-trace — no completed outcome, OR the fingerprint drifted, OR a
-                     property (Hypothesis) test whose covered lines vary with the example seed
-    """
-    if not has_outcome or not fingerprint_matches:
-        return "unknown"
-    if is_property_test:
-        return "unknown"
-    return "not_reached"
+# RETIRED (X1/G1, §16): `_is_property_test` + `replayed_negative_admission` gated whether a CACHED
+# non-reach could be replayed as an exclusion (B3, §2.2 option a). The ruling demoted that path:
+# `test_fingerprint` cannot certify the test's imported-helper closure is unchanged (G1, reproduced),
+# so a replayed negative may be stale and must NEVER exclude — `observed_function_reach` is now
+# positive-only. With no consumer, the admit decision and its Hypothesis-seed guard are gone; the
+# git history keeps them if a complete-fingerprint regime ever revives the capability.
 
 
 def observed_function_reach(
@@ -345,11 +312,17 @@ def observed_function_reach(
 ) -> dict[str, str]:
     """Prior per-TestId reach for ONE function; absent means genuinely unobserved (#15).
 
-    This is routing evidence only. The admitted seed is fresh-traced before it can prove a mutant
-    disposition. A complete cell with no intersecting line becomes negative evidence only after
-    the same exact TestId also completed the baseline-outcome pass. A trace interrupted by an
-    exception records the lines reached before it stopped; without outcome qualification, absence
-    could mean "did not enter" or merely "did not finish" and must remain UNKNOWN.
+    POSITIVE-ONLY routing evidence (X1/G1, §16). A cached hit whose lines intersect the target is
+    "reached" — a fresh-traced seed hint (it is re-traced before it can prove a mutant disposition,
+    so a stale positive costs a wasted trace, never a wrong verdict). A cached MISS is NOT emitted:
+    `test_fingerprint` omits the test's imported-helper closure (G1, reproduced), so a
+    non-intersecting hit may be STALE — a helper edit could open a new path to the target while the
+    fingerprint stays byte-identical. Promoting that miss to "not_reached" would EXCLUDE a
+    now-reaching test and manufacture a false COMPLETE. Leaving it absent degrades it to UNKNOWN, so
+    routing re-traces it fresh. This is exactly the already-pinned `basis_membership` rule: a
+    replayed non-reach is "pending", never "disjoint". The one sound negative — a FRESH
+    outcome-qualified non-reach — is produced during the live session, not replayed from this disk
+    cache, so no exclusion is lost.
     """
     from Wesker.ci import callable_test_id
 
@@ -363,10 +336,6 @@ def observed_function_reach(
     )
     if not cache:
         return {}
-    _failing, _inert, outcomes_observed, outcome_fingerprints = load_outcomes(
-        project_root, targets_fingerprint(target_files), budgets, regime_digest
-    )
-    outcomes = set(outcomes_observed)
     target = os.path.realpath(target_file)
     out: dict[str, str] = {}
     for test_fn in test_functions:
@@ -381,15 +350,6 @@ def observed_function_reach(
                 lines.update(int(ln) for ln in cell.get("lines", ()))
         if executable_lines.intersection(lines):
             out[test_id] = "reached"
-        elif (
-            replayed_negative_admission(
-                test_id in outcomes,
-                outcome_fingerprints.get(test_id) == fingerprint,
-                _is_property_test(test_fn),
-            )
-            == "not_reached"
-        ):
-            out[test_id] = "not_reached"
     return out
 
 

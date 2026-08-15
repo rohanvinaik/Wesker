@@ -65,7 +65,9 @@ def test_exact_observed_reach_populates_all_three_routing_buckets(tmp_path):
     )
 
     assert _names(candidates) == {str(names_f)}
-    assert _names(unknowns) == {str(unseen_f)}
+    assert _names([c for c, _ in unknowns]) == {
+        str(unseen_f)
+    }  # unknowns are tagged (callable, code)
     assert _names(impossible) == {str(silent_f)}
 
 
@@ -88,10 +90,8 @@ def test_unknowns_are_ordered_file_peer_before_no_path(tmp_path):
         [no_path, file_peer], [str(peer_f), str(blank_f)], "target", ["target"]
     )
     assert candidates == []
-    assert unknowns == [
-        file_peer,
-        no_path,
-    ]  # file_peer sorted ahead despite input order
+    # Tagged (callable, code): file_peer sorted ahead of no_path despite input order (#D3, §8.3).
+    assert unknowns == [(file_peer, "file_peer"), (no_path, "unknown_no_path")]
 
 
 def test_a_caller_reaching_test_is_a_widen_stratum_ahead_of_a_file_peer(tmp_path):
@@ -125,7 +125,5 @@ def test_a_caller_reaching_test_is_a_widen_stratum_ahead_of_a_file_peer(tmp_path
     assert (
         candidates == []
     )  # neither names the target in its own body — both are widen strata
-    assert unknowns == [
-        caller,
-        file_peer,
-    ]  # caller_reaches (rank 0) sorts ahead of file_peer
+    # Tagged (callable, code): caller_reaches (rank 0) sorts ahead of file_peer (#D3, §8.3).
+    assert unknowns == [(caller, "caller_reaches"), (file_peer, "file_peer")]

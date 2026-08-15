@@ -577,8 +577,15 @@ def partition_live_callables(
     func_names: list[str],
     observed_reach: dict[str, str] | None = None,
     caller_names: set[str] | None = None,
-) -> tuple[list[Any], list[Any], list[Any]]:
-    """Partition into candidate / unknown / proof-grade impossible for ONE function (#15).
+) -> tuple[list[Any], list[tuple[Any, str]], list[Any]]:
+    """Partition into candidate / TAGGED-unknown / proof-grade impossible for ONE function (#15).
+
+    Each unknown is returned as ``(callable, route_code)`` (#D3, §8.3): the widen stratum's code —
+    ``caller_reaches`` / ``file_peer`` / ``unknown_dynamic`` / ``unknown_no_path`` — travels WITH its
+    item, so the driver reads a caller-reacher off the tag instead of RE-PARSING every unknown's body
+    (`_item_body_names`) a second time to recover a bit computed here and discarded. Candidates and
+    impossibles stay plain callable lists — the seed is traced whole and the impossibles are dropped,
+    so neither consumes a code.
 
     Static and fixture evidence can only promote an unseen item to CANDIDATE. The third bucket is
     populated solely from an exact per-TestId observation loaded under the same target content,
@@ -629,7 +636,8 @@ def partition_live_callables(
     # widen discharges its obligations before tracing the weaker signals. Stable — discovery order is
     # kept within a rank; `candidates`/`impossible` keep discovery order (the seed is traced whole).
     unknowns = [
-        c for _, c in sorted(_unknown_rows, key=lambda r: _unknown_stratum_rank(r[0]))
+        (c, code)
+        for code, c in sorted(_unknown_rows, key=lambda r: _unknown_stratum_rank(r[0]))
     ]
     return candidates, unknowns, impossible
 

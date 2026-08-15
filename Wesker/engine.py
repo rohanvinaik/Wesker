@@ -5796,8 +5796,15 @@ def run_function_profiling(
     # they are meant to. Without a live session the per-function pass computed `failing` and
     # `_trace_truncated` directly and those are the whole story.
     _sb = session_baseline()
+    # `uncontained` belongs here too (#D4 repair 4, §4.6): an unstoppable worker's trace may still be
+    # running and mutating state, so its coverage cannot discharge a line obligation — the same
+    # exclusion `admissible_line_coverage` already applies. It is TEST IDS (`trace_suite` adds
+    # `callable_test_id(t)` on a containment failure), the same space as `inert_ids`/`truncated`/
+    # `replayed`. Disposition-exact: an uncontained result is non-gateable anyway, so this only makes
+    # the coverage view honest BEFORE the refuse. The per-function fallback has no per-test containment
+    # set, so it stays as it was.
     _barred = sorted(
-        (_sb.inert_ids | _sb.truncated | _sb.replayed)
+        (_sb.inert_ids | _sb.truncated | _sb.replayed | _sb.uncontained)
         if _sb is not None
         else (set(failing) | set(_trace_truncated))
     )

@@ -194,6 +194,38 @@ def _path(project_root: str) -> str:
     return os.path.join(project_root, _CACHE_DIR, _CACHE_FILE)
 
 
+def _load_valid_blob(
+    project_root: str,
+    targets: str,
+    budgets: tuple[float | None, float | None],
+    regime_digest: str,
+) -> dict | None:
+    """Read the trace cache and return its blob ONLY if version / engine / targets / budgets / regime
+    all match — else None (D4 repair 5, §4.6).
+
+    The SINGLE validation both `load` (reach entries) and `load_outcomes` (the second-pass outcome
+    facts) share. They read the SAME file, so a check in one and none in the other let the two views
+    disagree on whether that file is fresh — the reach half refused while the outcome half served a
+    stale-regime row. Validating in one place makes the two structurally incapable of drifting.
+    """
+    try:
+        with open(_path(project_root), encoding="utf-8") as fh:
+            blob = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(blob, dict) or blob.get("version") != _VERSION:
+        return None
+    if blob.get("engine") != _engine_version():
+        return None
+    if (
+        blob.get("targets") != targets
+        or blob.get("budgets") != list(budgets)
+        or blob.get("regime", "") != regime_digest
+    ):
+        return None
+    return blob
+
+
 def load(
     project_root: str,
     targets: str,
@@ -206,20 +238,8 @@ def load(
     a run is a liability. Any doubt returns {} and the caller measures, which is what it would
     have done anyway.
     """
-    try:
-        with open(_path(project_root), encoding="utf-8") as fh:
-            blob = json.load(fh)
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(blob, dict) or blob.get("version") != _VERSION:
-        return {}
-    if blob.get("engine") != _engine_version():
-        return {}
-    if (
-        blob.get("targets") != targets
-        or blob.get("budgets") != list(budgets)
-        or blob.get("regime", "") != regime_digest
-    ):
+    blob = _load_valid_blob(project_root, targets, budgets, regime_digest)
+    if blob is None:
         return {}
     entries = blob.get("entries")
     return entries if isinstance(entries, dict) else {}
@@ -344,7 +364,7 @@ def observed_function_reach(
     if not cache:
         return {}
     _failing, _inert, outcomes_observed, outcome_fingerprints = load_outcomes(
-        project_root
+        project_root, targets_fingerprint(target_files), budgets, regime_digest
     )
     outcomes = set(outcomes_observed)
     target = os.path.realpath(target_file)
@@ -375,17 +395,24 @@ def observed_function_reach(
 
 def load_outcomes(
     project_root: str,
+    targets: str,
+    budgets: tuple[float | None, float | None],
+    regime_digest: str = "",
 ) -> tuple[list[str], list[str], list[str], dict[str, str]]:
     """Outcome facts plus their TestId→content-fingerprint identity from the SECOND pass.
 
     `build_session_baseline` runs the suite twice: traced, then plain, for `failing`/`inert`.
     Caching only the trace would leave half the bill standing, and the plain pass is the same
     constant measured the same redundant way.
+
+    VALIDATED BY CONSTRUCTION (D4 repair 5, §4.6): shares `load`'s exact freshness check via
+    `_load_valid_blob`, so this outcome view of the file can never serve a stale / wrong-regime row
+    that `load`'s reach view refused. Any doubt returns empties and the caller re-measures — which is
+    what it would have done anyway. Previously the invariant held by caller discipline (each caller
+    ran `load` first), not by construction; now a caller that forgets cannot be served a stale row.
     """
-    try:
-        with open(_path(project_root), encoding="utf-8") as fh:
-            blob = json.load(fh)
-    except (OSError, ValueError):
+    blob = _load_valid_blob(project_root, targets, budgets, regime_digest)
+    if blob is None:
         return [], [], [], {}
     return (
         list(blob.get("failing") or []),

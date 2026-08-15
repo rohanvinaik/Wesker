@@ -3098,7 +3098,7 @@ def build_session_baseline(
     # The NAMES are what persist; the ids are rebuilt here against the live callables. Same
     # information, addressed by something that survives a process boundary.
     prior_failing, prior_inert, prior_outcomes, prior_outcome_fps = (
-        trace_cache.load_outcomes(project_root)
+        trace_cache.load_outcomes(project_root, targets_fp, budgets, regime_digest)
         if (project_root and persisted_cache)
         else ([], [], [], {})
     )

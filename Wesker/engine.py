@@ -3029,6 +3029,7 @@ def build_session_baseline(
     project_root: str | None = None,
     fresh: bool = False,
     regime_digest: str = "",
+    within_run: dict | None = None,
 ) -> SessionBaseline:
     """Run the suite-global baseline passes ONCE. See :class:`SessionBaseline`.
 
@@ -3091,6 +3092,7 @@ def build_session_baseline(
         uncontained,
         arcs,
         replayed,
+        within_run=within_run,
     )
     failing: list[str] = []
     inert: set[int] = set()

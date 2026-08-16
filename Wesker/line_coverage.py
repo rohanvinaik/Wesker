@@ -372,6 +372,7 @@ def trace_suite(
     uncontained: set[str] | None = None,
     arcs_out: dict[str, dict[str, set[tuple[int, int]]]] | None = None,
     replayed: set[str] | None = None,
+    within_run: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, set[int]]]:
     """Trace the WHOLE suite ONCE: ``{test_id: {file: lines}}``.
 
@@ -430,6 +431,16 @@ def trace_suite(
     Passed dict is MUTATED with the misses, so the caller persists the union without a second
     walk. A CUT trace is never stored: it is under-counted by construction, and a cache that
     remembers a truncation makes a timing accident permanent.
+
+    ``within_run`` is a WITHIN-SESSION trace memo — same ``{fingerprint: cell}`` shape as ``cache``,
+    but holding ONLY traces measured in THIS live session (a prior seed/widen pass). It is checked
+    BEFORE ``cache`` and, on a hit, the reuse is ADMISSIBLE — the test is NOT marked ``replayed``,
+    because it WAS measured this session; only the source-keyed DISK ``cache`` earns ``replayed``
+    (#20, which guards against a cross-run helper edit the fingerprint cannot see). This is what lets
+    a converge run — many profile passes over ONE unchanging target — trace each slow covering test
+    ONCE instead of re-tracing it every pass, with no loss of proof admissibility. It must be created
+    fresh per session (never a module global), or it degrades to exactly the stale cross-run cache
+    the ``fresh`` bypass exists to refuse. Like ``cache``, a CUT trace is never stored in it.
     """
     # Local imports: `ci` and `trace_cache` both import lazily in the other direction, and
     # the identity accessor must be the CONTRACT one — a raw attribute read here is exactly
@@ -462,8 +473,22 @@ def trace_suite(
         # cache to obtain arcs would re-trace the whole suite every session, the 11-minute cost
         # this cache exists to remove. Arcs are only EXPOSED when a caller passes `arcs_out`; the
         # cost of carrying them in the cell is the branch obligations #17 owns.
-        fp = test_fingerprint(test_fn) if cache is not None else None
-        hit = cache.get(fp) if (cache is not None and fp is not None) else None
+        fp = (
+            test_fingerprint(test_fn)
+            if (cache is not None or within_run is not None)
+            else None
+        )
+        # WITHIN-SESSION memo first: a hit here was measured THIS session (a prior pass), so its reuse
+        # is admissible. The source-keyed DISK cache is only consulted on a within-run miss, and only
+        # IT earns `replayed` (#20).
+        wr_hit = (
+            within_run.get(fp) if (within_run is not None and fp is not None) else None
+        )
+        hit = (
+            wr_hit
+            if wr_hit is not None
+            else (cache.get(fp) if (cache is not None and fp is not None) else None)
+        )
         arc_file: dict[str, set[tuple[int, int]]] = {}
         if hit is not None:
             # Measured before, by this engine, on these target files, under these budgets. The
@@ -475,10 +500,10 @@ def trace_suite(
                 f: {tuple(a) for a in cell.get("arcs", ())} for f, cell in hit.items()
             }
             was_cut = False
-            # REPLAYED, not measured this session (#20): this reach came from the cache, keyed by
-            # source only. Named here so the proof view can refuse it while routing still uses it —
-            # cache reuse must be structurally incapable of becoming fresh admissible coverage.
-            if replayed is not None:
+            # REPLAYED, not measured this session (#20): a DISK-cache hit came from a prior run, keyed
+            # by source only, so the proof view must refuse it while routing still uses it. A
+            # within-run hit is NOT replayed — it was measured this session and stays admissible.
+            if wr_hit is None and replayed is not None:
                 replayed.add(name)
         else:
             # The redirect isolates the TEST's own stdout/stderr and must wrap the test ONLY —
@@ -495,17 +520,22 @@ def trace_suite(
             # See `trace_line_coverage`: an unstoppable worker is not an ordinary cut (#19).
             if not contained and uncontained is not None:
                 uncontained.add(name)
-            if cache is not None and fp is not None and not was_cut:
+            if fp is not None and not was_cut:
                 # NOT when cut: a truncated trace is under-counted, and downstream that is
                 # indistinguishable from "no test reaches this line". Storing it would make one
-                # slow afternoon a permanent false gap.
-                cache[fp] = {
+                # slow afternoon a permanent false gap. One cell serves both stores: the disk cache
+                # (cross-run routing evidence) and the within-session memo (this run's later passes).
+                cell = {
                     f: {
                         "lines": sorted(per_file[f]),
                         "arcs": sorted(list(a) for a in arc_file.get(f, ())),
                     }
                     for f in per_file
                 }
+                if within_run is not None:
+                    within_run[fp] = cell
+                if cache is not None:
+                    cache[fp] = cell
         if was_cut and truncated is not None:
             truncated.add(name)
         bucket = out.setdefault(name, {})

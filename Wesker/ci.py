@@ -1603,6 +1603,15 @@ def run_with_live_suite(
         # Bound here, at the session boundary, it is restored to the enclosing value in `finally`.
         root_token = _PROJECT_ROOT.set(os.path.abspath(project_root))
 
+        # WITHIN-SESSION trace memo (#seam-events perf): a converge run makes MANY seed/widen passes
+        # over ONE unchanging target, each `fresh=True` (bypassing the cross-run disk cache for
+        # admissibility). Without this, every pass re-traces the same slow covering tests — measured:
+        # seam_events re-traced its ~50s live-game tests 11× in one converge. This dict holds ONLY
+        # this session's completed traces, keyed by test fingerprint; a hit is admissible (measured
+        # this session, not replayed). Created HERE so it lives for the whole session and dies with
+        # it — never a module global, or it becomes the stale cross-run cache `fresh` refuses.
+        _within_run: dict = {}
+
         def _build(subset: list[Any] | None = None, fresh: bool = False) -> Any:
             # The guard lives INSIDE the closure because the closure decides when it runs. The
             # baseline RUNS the consumer's whole suite — arbitrary third-party code — and any of
@@ -1644,6 +1653,7 @@ def run_with_live_suite(
                     project_root=project_root,
                     fresh=fresh,
                     regime_digest=_regime,
+                    within_run=_within_run,
                     **budgets,
                 )
 

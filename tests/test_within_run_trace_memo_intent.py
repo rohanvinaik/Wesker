@@ -36,7 +36,9 @@ def _repo(tmp_path):
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
-    (pkg / "mod.py").write_text("def target(x):\n    if x > 0:\n        return x * 2\n    return -x\n")
+    (pkg / "mod.py").write_text(
+        "def target(x):\n    if x > 0:\n        return x * 2\n    return -x\n"
+    )
     tests = tmp_path / "tests"
     tests.mkdir()
     (tests / "test_t.py").write_text(
@@ -47,7 +49,9 @@ def _repo(tmp_path):
     return str(tmp_path)
 
 
-def test_second_pass_reuses_the_first_passes_traces_within_one_session(tmp_path, monkeypatch):
+def test_second_pass_reuses_the_first_passes_traces_within_one_session(
+    tmp_path, monkeypatch
+):
     root = _repo(tmp_path)
     calls = {"n": 0}
     real = lc._trace_one_multi
@@ -63,7 +67,9 @@ def test_second_pass_reuses_the_first_passes_traces_within_one_session(tmp_path,
     def body():
         deng.profile("pkg/mod.py", "target", root, scope_tests=True, use_cache=False)
         seen["after_pass1"] = calls["n"]
-        r2 = deng.profile("pkg/mod.py", "target", root, scope_tests=True, use_cache=False)
+        r2 = deng.profile(
+            "pkg/mod.py", "target", root, scope_tests=True, use_cache=False
+        )
         seen["after_pass2"] = calls["n"]
         seen["gateable2"] = bool(getattr(r2, "is_gateable", True))
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import inspect
 import json
 import os
 import select
@@ -505,6 +506,29 @@ def callable_shape_hazards(call: Any) -> dict[str, bool]:
     if not isinstance(stamped, dict):
         return dict.fromkeys(_SHAPE_KEYS, False)
     return {k: bool(stamped.get(k, False)) for k in _SHAPE_KEYS}
+
+
+def callable_is_hermetic(call: Any) -> bool:
+    """Whether a test callable is in_process-safe (hermetic), RESILIENT to the live-session path.
+
+    :func:`callable_shape_hazards` reads the ``__wesker_shape__`` stamp ``pytest_discovery`` sets at
+    NON-live collection. A LIVE-session callable carries NO stamp, so a stamped read defaults it
+    hermetic and any shape-aware ordering/gating over live tests would be a silent no-op. So when the
+    stamp is absent, RE-DERIVE the source-detectable hazards (:func:`scan_source_hazards`) from the
+    callable's own source, which the live path exposes via ``__wrapped__``. Unreadable source →
+    hermetic (conservative: never deprioritise a test we cannot classify). ``custom_collector`` /
+    ``stateful_fixture`` are only caught via the stamp — an accepted live-path gap; subprocess /
+    thread / signal (the isolation-FORCING hazards, which are the SLOW ones) are recovered either way.
+    """
+    stamped = getattr(call, "__wesker_shape__", None)
+    if isinstance(stamped, dict):
+        return fast_mode_standing(**callable_shape_hazards(call)) == "hermetic"
+    real = getattr(call, "__wrapped__", call)
+    try:
+        src = inspect.getsource(real)
+    except (OSError, TypeError):
+        return True
+    return not scan_source_hazards(src)
 
 
 def scope_fast_mode_standing(standings: list[str]) -> str:

@@ -3456,6 +3456,27 @@ def _build_test_scope(
             for ln in lines:
                 covering_by_line.setdefault(ln, []).extend(fns)
 
+    # HERMETIC-FIRST ordering for the kill loop (perf, VERDICT-INDEPENDENT). `evaluate_mutant`
+    # short-circuits on the first assertion/exception kill, so a fast HERMETIC test that kills a
+    # mutant should run BEFORE a shape-hazardous one (subprocess / thread / signal — typically SLOW,
+    # e.g. a 50s live-game system test), sparing that slow test on every mutant a cheap test already
+    # kills; only genuine survivors — and lines ONLY the slow test covers — then pay it. The kill
+    # VERDICT is order-independent (any assertion kill wins regardless of order, see `evaluate_mutant`),
+    # so this reorders and never changes `killed`/`killed_by`. A STABLE sort keeps discovery order
+    # within each group. Hermeticity is computed ONCE over `usable` (the resilient check re-derives
+    # shape from source on the live path, where the `__wesker_shape__` stamp is absent) and reused.
+    from Wesker.isolation import callable_is_hermetic
+
+    _herm = {id(t): callable_is_hermetic(t) for t in usable}
+
+    def _hermetic_first(fns: list[Callable[..., None]]) -> list[Callable[..., None]]:
+        return sorted(fns, key=lambda t: not _herm.get(id(t), True))
+
+    usable = _hermetic_first(usable)
+    covering_by_line = {
+        ln: _hermetic_first(fns) for ln, fns in covering_by_line.items()
+    }
+
     exec_line_set = set(exec_lines)
 
     def _tests_for(mutant: Mutant) -> list[Callable[..., None]]:

@@ -1444,7 +1444,13 @@ class _OutputMutator(_BaseMutator):
 
     def _perturbed(self, value: ast.expr) -> ast.expr | None:
         """The replacement return-value node for this sub-mode, or None when the
-        perturbation is a no-op on this value (a guaranteed-equivalent, not a target)."""
+        perturbation is a no-op on this value (a guaranteed-equivalent, not a target).
+
+        The always-applicable sub-modes (return_none/const/identity, Fork 1) are total on any
+        value. The type-conditional sub-modes (Fork 2) are emitted only for an OBSERVED codomain
+        type (:func:`_output_sub_modes`), so each is applied only where it cannot raise:
+        ``-(x)``/``abs(x)`` on a numeric return, ``type(x)()`` on a sized return (its empty),
+        ``x[::-1]`` on a sequence, ``float('nan')`` on a float."""
         if self.mode == "return_none":
             repl: ast.expr = ast.Constant(value=None)
         elif self.mode == "return_const":
@@ -1453,6 +1459,39 @@ class _OutputMutator(_BaseMutator):
             if not self._params:
                 return None
             repl = ast.Name(id=self._params[0], ctx=ast.Load())
+        elif self.mode == "return_negate":
+            repl = ast.UnaryOp(op=ast.USub(), operand=value)
+        elif self.mode == "return_abs":
+            repl = ast.Call(
+                func=ast.Name(id="abs", ctx=ast.Load()), args=[value], keywords=[]
+            )
+        elif self.mode == "return_nan":
+            repl = ast.Call(
+                func=ast.Name(id="float", ctx=ast.Load()),
+                args=[ast.Constant(value="nan")],
+                keywords=[],
+            )
+        elif self.mode == "return_empty":
+            # type(x)() — the observed type's empty inhabitant; safe because the sub-mode is
+            # emitted only for an observed sized type (str/bytes/list/tuple/dict/set).
+            repl = ast.Call(
+                func=ast.Call(
+                    func=ast.Name(id="type", ctx=ast.Load()), args=[value], keywords=[]
+                ),
+                args=[],
+                keywords=[],
+            )
+        elif self.mode == "return_reorder":
+            # x[::-1] — reversal; emitted only for an observed sequence (list/tuple).
+            repl = ast.Subscript(
+                value=value,
+                slice=ast.Slice(
+                    lower=None,
+                    upper=None,
+                    step=ast.UnaryOp(op=ast.USub(), operand=ast.Constant(value=1)),
+                ),
+                ctx=ast.Load(),
+            )
         else:
             return None
         if ast.dump(repl) == ast.dump(value):
@@ -2170,7 +2209,9 @@ def _docstring_positions(
 
 
 def _count_targets(
-    func_node: ast.FunctionDef | ast.AsyncFunctionDef, category: MutationCategory
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    category: MutationCategory,
+    observed: frozenset[str] | None = None,
 ) -> int:
     """Count how many mutation targets exist for a category in a function.
 
@@ -2220,7 +2261,8 @@ def _count_targets(
     # OUTPUT (μ⁻ Form A): independent sub-modes over return sites, same shape as EXCEPTION.
     if category == MutationCategory.OUTPUT:
         return sum(
-            _count_output_targets(func_node, mode) for mode, _desc in _OUTPUT_SUB_MODES
+            _count_output_targets(func_node, mode)
+            for mode, _desc in _output_sub_modes(observed)
         )
     # Single-transformer categories: run the mutator in record mode and count
     # its notes. VALUE additionally needs docstring positions so documentation
@@ -2548,6 +2590,59 @@ _OUTPUT_SUB_MODES = (
     ),
 )
 
+# μ⁻ Fork 2 — the type-conditional output perturbations, keyed by observed codomain type name.
+# Emitted ONLY for an OBSERVED return type, so each is applied only where it cannot raise (the
+# type-directed AST in _OutputMutator._perturbed). The certificate then names the observed codomain
+# as its observing set; the two-sign policy id and the static census stay Fork-1, so Fork 2's reach
+# is a per-run observing-set extension, not a policy change.
+_OUTPUT_TYPE_CONDITIONAL = (
+    (
+        "return_negate",
+        "return value -> its negation (is the sign load-bearing?)",
+        frozenset({"int", "float"}),
+    ),
+    (
+        "return_abs",
+        "return value -> its absolute value (can the output be negative?)",
+        frozenset({"int", "float"}),
+    ),
+    (
+        "return_nan",
+        "return value -> NaN (must the output be a finite number?)",
+        frozenset({"float"}),
+    ),
+    (
+        "return_empty",
+        "return value -> the type's empty (is length/content load-bearing?)",
+        frozenset({"str", "bytes", "list", "tuple", "dict", "set", "frozenset"}),
+    ),
+    (
+        "return_reorder",
+        "return value -> reversed (is order load-bearing?)",
+        frozenset({"list", "tuple"}),
+    ),
+)
+
+
+def _output_sub_modes(
+    observed: frozenset[str] | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """The OUTPUT sub-mode list — the SINGLE SOURCE for both counting and generation, so
+    count == generation by construction (the issue-#9 invariant) whatever ``observed`` is.
+
+    ``observed`` is the set of return-type names harvested from a baseline run (μ⁻ Fork 2). With it,
+    the type-conditional perturbations whose type is present are appended; without it (the static
+    census, or an unobservable return) only the always-applicable Fork-1 set is returned.
+    """
+    modes = list(_OUTPUT_SUB_MODES)
+    if observed:
+        modes.extend(
+            (name, desc)
+            for name, desc, types in _OUTPUT_TYPE_CONDITIONAL
+            if observed & types
+        )
+    return tuple(modes)
+
 
 def _record_output_dimensions(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
@@ -2574,6 +2669,7 @@ def _generate_output_perturbations(
     max_per_category: int | None,
     greedy: bool = True,
     pass_index: int = 0,
+    observed: frozenset[str] | None = None,
 ) -> list[Mutant]:
     """Generate OUTPUT (μ⁻ Form A) perturbations across all sub-modes.
 
@@ -2586,7 +2682,7 @@ def _generate_output_perturbations(
     mutants: list[Mutant] = []
     cat = MutationCategory.OUTPUT
 
-    for mode, desc in _OUTPUT_SUB_MODES:
+    for mode, desc in _output_sub_modes(observed):
         keys = _record_output_dimensions(func_node, mode) if greedy else []
         target_count = len(keys) if greedy else _count_output_targets(func_node, mode)
         budget = (
@@ -3795,6 +3891,7 @@ def generate_mutants(
     category_order: list[MutationCategory] | None = None,
     greedy: bool = True,
     pass_index: int = 0,
+    observed_return_types: frozenset[str] | None = None,
 ) -> list[Mutant]:
     """Generate mutants for a function across specified categories.
 
@@ -3866,7 +3963,11 @@ def generate_mutants(
         if cat == MutationCategory.OUTPUT:
             mutants.extend(
                 _generate_output_perturbations(
-                    func_node, max_per_category, greedy=greedy, pass_index=pass_index
+                    func_node,
+                    max_per_category,
+                    greedy=greedy,
+                    pass_index=pass_index,
+                    observed=observed_return_types,
                 )
             )
             continue
@@ -5527,6 +5628,7 @@ def run_function_profiling(
     worker_mem_limit_mb: int | None = None,
     is_pure: bool = False,
     widen_tests: list[Callable[..., None]] | None = None,
+    observed_return_types: frozenset[str] | None = None,
 ) -> ProfilingResult:
     """Profiling mode — generate mutants (exhaustive by default), evaluate with budget.
 
@@ -5566,6 +5668,7 @@ def run_function_profiling(
             categories,
             max_per_category=max_per_category,
             pass_index=pass_index,
+            observed_return_types=observed_return_types,
         )
     )
     # Shard for parallel evaluation: generation is deterministic, so mutants[a:b] here is
@@ -6184,13 +6287,18 @@ def run_function_profiling(
 def estimate_universe_size(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     categories: set[MutationCategory],
+    observed: frozenset[str] | None = None,
 ) -> int:
     """Count total possible mutation targets without generating mutants.
 
     Cheap (AST walk only, no compilation or test execution). Used to
     report sampling coverage: tested/killed out of universe_size.
+
+    ``observed`` (μ⁻ Fork 2) threads the observed codomain type into the OUTPUT count, so the
+    reported universe matches the type-conditional perturbations generation will produce; None
+    (the static census default) counts only the always-applicable Fork-1 OUTPUT sub-modes.
     """
-    return sum(_count_targets(func_node, cat) for cat in categories)
+    return sum(_count_targets(func_node, cat, observed) for cat in categories)
 
 
 def coverage_floor(

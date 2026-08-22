@@ -92,6 +92,7 @@ def _census_row(
 def filter_categories(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     is_pure: bool = False,
+    two_sign: bool = False,
 ) -> set[MutationCategory]:
     """Layer 1: Exclusionary filtering (§6.1).
 
@@ -118,13 +119,15 @@ def filter_categories(
     """
     return {
         cat
-        for cat, row in category_census(func_node, is_pure).items()
+        for cat, row in category_census(func_node, is_pure, two_sign).items()
         if row["disposition"] == "generated"
     }
 
 
 def category_census(
-    func_node: ast.FunctionDef | ast.AsyncFunctionDef, is_pure: bool = False
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    is_pure: bool = False,
+    two_sign: bool = False,
 ) -> dict[MutationCategory, dict]:
     """What the policy did to EVERY candidate operator on this target (issue #22).
 
@@ -167,6 +170,11 @@ def category_census(
                     "withheld_by": "purity_overlay" if (suppressed and targets) else "",
                 }
             row = _census_row(generated, withheld, sub_modes)
+        elif cat is MutationCategory.OUTPUT and not two_sign:
+            # μ⁻ is off under the one-sign default policy: candidate return sites may exist,
+            # but the policy withholds them. Shown as withheld (issue #22 auditability) — the
+            # reader sees the negative operator is available and disabled, not absent.
+            row = _census_row(0, estimate_universe_size(func_node, {cat}))
         else:
             generated, withheld = estimate_universe_size(func_node, {cat}), 0
             row = _census_row(generated, withheld)

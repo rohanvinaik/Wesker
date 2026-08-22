@@ -135,6 +135,15 @@ class MutationCategory(str, Enum):
     # control-flow shape, and the signature fault family of extraction
     # refactors (wrong helper input, wrong live-out).
     DATAFLOW = "DATAFLOW"
+    # Output-space perturbation — μ⁻, negative specification (σ(P, μ ∪ μ⁻)). Perturbs the
+    # RETURN VALUE and re-runs the covering tests: all-green means that output dimension is
+    # unpinned (a NEGATIVE degree of freedom), the polarity of a surviving mutant. Form A
+    # (return-site rewrite, _OutputMutator) carries three ALWAYS-APPLICABLE sub-modes — the
+    # independence pair (→const, →identity) plus →none — that cannot mis-apply on any value;
+    # the type-conditional family (→negate/→empty/→NaN/…) and its UNDEFINED disposition are
+    # Fork 2 / Form B. NOT in the DEFAULT one-sign policy: enabled only under the two-sign
+    # policy, see policy.mutation_policy(two_sign=True) and filter_categories(two_sign=True).
+    OUTPUT = "OUTPUT"
 
 
 @dataclass
@@ -1386,6 +1395,85 @@ class _ExceptionMutator(_BaseMutator):
         return self.generic_visit(node)
 
 
+class _OutputMutator(_BaseMutator):
+    """Output-space (codomain) perturbation — μ⁻ Form A (return-site rewrite).
+
+    Rewrites ``return <expr>`` to ``return <perturbation>`` for one of three
+    ALWAYS-APPLICABLE sub-modes, so each perturbation is an ordinary AST mutant that rides
+    ``evaluate_mutant`` / ``check_equivalent`` / the greedy cover with no new machinery.
+    All-green covering tests under the perturbation means that output dimension is UNPINNED
+    — the negative-DOF polarity (a surviving mutant): ``unpinned(p) ⇔ ∀t: t(f ⊕ p) passes``.
+
+    The three sub-modes are the independence pair plus existence — the value-space analogues
+    of the MC/DC independence conditions, caught by no positive operator:
+
+      * ``return_none``     — ``return None``: does any test pin that the output EXISTS?
+      * ``return_const``    — ``return 0`` (a fixed, input-independent value): does the output
+        DEPEND ON THE INPUT, or would a constant pass every covering test?
+      * ``return_identity`` — ``return <first param>``: is the output a NON-TRIVIAL TRANSFORM
+        of its input, or would returning an argument unchanged pass?
+
+    All three are total on any value — they never raise on application — so no perturbation
+    here can be mis-typed to the codomain. The type-conditional family (→negate/→empty/→NaN/…)
+    and the UNDEFINED disposition it needs are Fork 2 / Form B, not this skeleton. A
+    perturbation syntactically identical to the original return value is a guaranteed-equivalent
+    and is NOT a target (mirrors _ExceptionMutator's no-op skip), so the universe carries no
+    built-in survivor. Only the TARGET function's own returns are its codomain: a return inside
+    a nested def is that helper's codomain and is skipped.
+    """
+
+    def __init__(self, target: int, mode: str = "return_none", *a, **k) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(target, *a, **k)
+        self.mode = mode
+        self._entered = False
+        self._params: list[str] = []
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        if self._entered:
+            # A nested function: its returns are its own codomain, not the target's.
+            return node
+        self._entered = True
+        self._params = [
+            a.arg
+            for a in (node.args.posonlyargs + node.args.args)
+            if a.arg not in ("self", "cls")
+        ]
+        return self.generic_visit(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+
+    def _perturbed(self, value: ast.expr) -> ast.expr | None:
+        """The replacement return-value node for this sub-mode, or None when the
+        perturbation is a no-op on this value (a guaranteed-equivalent, not a target)."""
+        if self.mode == "return_none":
+            repl: ast.expr = ast.Constant(value=None)
+        elif self.mode == "return_const":
+            repl = ast.Constant(value=0)
+        elif self.mode == "return_identity":
+            if not self._params:
+                return None
+            repl = ast.Name(id=self._params[0], ctx=ast.Load())
+        else:
+            return None
+        if ast.dump(repl) == ast.dump(value):
+            return None  # no-op: the return already IS this value
+        return repl
+
+    def visit_Return(self, node: ast.Return) -> ast.AST:
+        if self.applied or node.value is None:
+            return self.generic_visit(node)
+        repl = self._perturbed(node.value)
+        if repl is None:
+            return self.generic_visit(node)  # not an eligible target for this sub-mode
+        if self.current == self.target:
+            node.value = repl
+            self._mark_applied(node)
+            return node
+        self._note(f"OUTPUT:{self.mode}:{node.lineno}")
+        self.current += 1
+        return self.generic_visit(node)
+
+
 def _handler_is_noop(node: ast.ExceptHandler) -> bool:
     """True when a handler's body is already a no-op, so swallowing it changes nothing."""
     return len(node.body) == 1 and isinstance(node.body[0], ast.Pass)
@@ -2129,6 +2217,11 @@ def _count_targets(
             _count_dataflow_targets(func_node, mode)
             for mode, _desc in _DATAFLOW_SUB_MODES
         )
+    # OUTPUT (μ⁻ Form A): independent sub-modes over return sites, same shape as EXCEPTION.
+    if category == MutationCategory.OUTPUT:
+        return sum(
+            _count_output_targets(func_node, mode) for mode, _desc in _OUTPUT_SUB_MODES
+        )
     # Single-transformer categories: run the mutator in record mode and count
     # its notes. VALUE additionally needs docstring positions so documentation
     # constants stay out of the universe.
@@ -2444,6 +2537,93 @@ _EXCEPTION_SUB_MODES = (
     ("handler_swallow", "swallow exception handler body"),
     ("handler_broaden", "widen caught exception type"),
 )
+
+# μ⁻ Form A — the always-applicable output perturbations (the independence pair + existence).
+_OUTPUT_SUB_MODES = (
+    ("return_none", "return value -> None (does any test pin that the output exists?)"),
+    ("return_const", "return value -> 0 (does the output depend on the input?)"),
+    (
+        "return_identity",
+        "return value -> first argument (is the output a non-trivial transform?)",
+    ),
+)
+
+
+def _record_output_dimensions(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> list[str]:
+    """Dimension keys for one OUTPUT (μ⁻) sub-mode, in transformer-visit order."""
+    tree = copy.deepcopy(func_node)
+    mutator = _OutputMutator(-1, mode)
+    mutator.keys = []
+    mutator.visit(tree)
+    return mutator.keys
+
+
+def _count_output_targets(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> int:
+    """Targets for one OUTPUT sub-mode. Counted by RUNNING the mutator in record mode, so the
+    counter and the transformer cannot drift — the no-op and eligibility skips live in exactly
+    one place (``_OutputMutator._perturbed``)."""
+    return len(_record_output_dimensions(func_node, mode))
+
+
+def _generate_output_perturbations(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    max_per_category: int | None,
+    greedy: bool = True,
+    pass_index: int = 0,
+) -> list[Mutant]:
+    """Generate OUTPUT (μ⁻ Form A) perturbations across all sub-modes.
+
+    Same shape as :func:`_generate_exception_mutants`: each sub-mode has its own target index
+    space and budget, so a function with no eligible identity target spends nothing on
+    ``return_identity``. Each perturbation is an ordinary :class:`Mutant` carrying a real
+    ``mutated_node`` (a rewritten return), so it flows through the shared evaluate/score/cover
+    pipeline unchanged.
+    """
+    mutants: list[Mutant] = []
+    cat = MutationCategory.OUTPUT
+
+    for mode, desc in _OUTPUT_SUB_MODES:
+        keys = _record_output_dimensions(func_node, mode) if greedy else []
+        target_count = len(keys) if greedy else _count_output_targets(func_node, mode)
+        budget = (
+            _live_dimension_count(keys)
+            if max_per_category is None
+            else max_per_category
+        )
+        limit = min(target_count, budget) if budget > 0 else target_count
+
+        if greedy and budget > 0 and target_count > limit:
+            selected = _select_greedy(keys, target_count, limit, pass_index)
+        else:
+            selected = list(range(limit))
+
+        for i in selected:
+            mutated_tree = copy.deepcopy(func_node)
+            transformer = _OutputMutator(i, mode)
+            mutated_node = transformer.visit(mutated_tree)
+            ast.fix_missing_locations(mutated_node)
+
+            if transformer.applied:
+                mid = _content_mutant_id(cat, mutated_node)
+                mutants.append(
+                    Mutant(
+                        category=cat,
+                        original_node=func_node,
+                        mutated_node=mutated_node,
+                        description=f"{mid}: {desc}",
+                        location=getattr(func_node, "lineno", 0),
+                        mutant_id=mid,
+                        target_index=i,
+                        mutated_line=transformer.mutated_lineno,
+                        dimension=keys[i] if i < len(keys) else "",
+                    )
+                )
+
+    return mutants
 
 
 def _generate_exception_mutants(
@@ -3677,6 +3857,15 @@ def generate_mutants(
         if cat == MutationCategory.DATAFLOW:
             mutants.extend(
                 _generate_dataflow_mutants(
+                    func_node, max_per_category, greedy=greedy, pass_index=pass_index
+                )
+            )
+            continue
+        # OUTPUT (μ⁻ Form A): independent sub-modes over return sites; each perturbation is
+        # an ordinary Mutant with a rewritten return, so it rejoins the shared pipeline.
+        if cat == MutationCategory.OUTPUT:
+            mutants.extend(
+                _generate_output_perturbations(
                     func_node, max_per_category, greedy=greedy, pass_index=pass_index
                 )
             )

@@ -39,6 +39,7 @@ from typing import Any
 from .engine import (
     _DATAFLOW_SUB_MODES,
     _EXCEPTION_SUB_MODES,
+    _OUTPUT_SUB_MODES,
     _STATE_SUB_MODES,
     MutationCategory,
     _ArithmeticMutator,
@@ -175,11 +176,12 @@ def _boundary_alternative_labels() -> dict[str, list[str]]:
     }
 
 
-def _categories() -> dict[str, dict[str, Any]]:
+def _categories(two_sign: bool = False) -> dict[str, dict[str, Any]]:
     """Per-category declared surface, derived from engine tables wherever a
     table exists; prose only where the rule is an analysis, with a pointer to
-    the function that owns it."""
-    return {
+    the function that owns it. OUTPUT (μ⁻) is declared only under the two-sign
+    policy, so the default one-sign manifest — and its id — is unchanged."""
+    cats: dict[str, dict[str, Any]] = {
         MutationCategory.VALUE.value: {
             "question": "is this constant's exact value pinned?",
             "mutable_types": [t.__name__ for t in _ValueMutator._MUTABLE_TYPES],
@@ -258,27 +260,53 @@ def _categories() -> dict[str, dict[str, Any]]:
             ),
         },
     }
+    if two_sign:
+        cats[MutationCategory.OUTPUT.value] = {
+            "question": (
+                "is the output's existence and input-dependence pinned? (μ⁻ Form A)"
+            ),
+            "sub_modes": {mode: desc for mode, desc in _OUTPUT_SUB_MODES},
+            "form": (
+                "A — return-site rewrite; always-applicable perturbations only "
+                "(the independence pair + existence). Type-conditional perturbations "
+                "and Form B are out of this policy."
+            ),
+        }
+    return cats
 
 
-def _fingerprint_counts() -> dict[str, dict[str, int]]:
+def _policy_category_set(two_sign: bool) -> list[MutationCategory]:
+    """The categories the policy covers. The DEFAULT one-sign policy excludes OUTPUT (μ⁻);
+    the two-sign policy σ(P, μ ∪ μ⁻) adds it. Iterating this rather than the raw enum is what
+    keeps the default id byte-identical when the OUTPUT member is present but withheld."""
+    cats = [c for c in MutationCategory if c is not MutationCategory.OUTPUT]
+    if two_sign:
+        cats.append(MutationCategory.OUTPUT)
+    return cats
+
+
+def _fingerprint_counts(two_sign: bool = False) -> dict[str, dict[str, int]]:
     """The engine's target counts over the fingerprint corpus — the behavioral
     half of the policy id. Runs the same record-mode counting every consumer
     runs; no generation, no execution."""
     counts: dict[str, dict[str, int]] = {}
+    cats = _policy_category_set(two_sign)
     for src in _FINGERPRINT_CORPUS:
         node = ast.parse(src).body[0]
         assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         counts[node.name] = {
-            cat.value: estimate_universe_size(node, {cat}) for cat in MutationCategory
+            cat.value: estimate_universe_size(node, {cat}) for cat in cats
         }
     return counts
 
 
 @cache
-def mutation_policy() -> MutationPolicy:
-    """The current mutation policy, id included. Cached — the policy is a
-    constant of the installed engine."""
-    fingerprint = _fingerprint_counts()
+def mutation_policy(two_sign: bool = False) -> MutationPolicy:
+    """The mutation policy, id included. Cached — the policy is a constant of the
+    installed engine. ``two_sign=False`` is the default one-sign policy σ(P, μ), byte-identical
+    to before the OUTPUT member existed; ``two_sign=True`` is σ(P, μ ∪ μ⁻) — a DISTINCT policy
+    with its own id (``<version>+neg.<digest>``) that declares the μ⁻ OUTPUT operator."""
+    fingerprint = _fingerprint_counts(two_sign)
     manifest: dict[str, Any] = {
         "policy_version": POLICY_VERSION,
         "order": 1,
@@ -303,7 +331,7 @@ def mutation_policy() -> MutationPolicy:
             "sub-mode's contribution to STATE eligibility; nothing else is "
             "purity-gated"
         ),
-        "categories": _categories(),
+        "categories": _categories(two_sign),
         "exclusions": [
             "first-order only: mutants are generated one at a time from the "
             "original AST; kills do not certify compositions of operators "
@@ -328,11 +356,18 @@ def mutation_policy() -> MutationPolicy:
         "fingerprint_corpus": list(_FINGERPRINT_CORPUS),
         "fingerprint_counts": fingerprint,
     }
+    if two_sign:
+        # Only the two-sign manifest carries this key, so the default digest is unchanged.
+        manifest["negative_policy"] = {
+            "operator": "mu-minus",
+            "form": "A",
+            "sub_modes": [mode for mode, _desc in _OUTPUT_SUB_MODES],
+        }
     canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
     return MutationPolicy(
         policy_version=POLICY_VERSION,
-        policy_id=f"{POLICY_VERSION}.{digest}",
+        policy_id=f"{POLICY_VERSION}{'+neg' if two_sign else ''}.{digest}",
         order=1,
         generation="original-ast",
         eligibility=manifest["eligibility"],

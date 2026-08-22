@@ -36,7 +36,12 @@ def test_filter_eligibility_is_the_target_count():
     """The one contract: cat ∈ filter_categories(f) ⇔ the engine counts ≥ 1
     target for cat. Checked over EVERY category on a function that exercises
     several (VALUE, BOUNDARY, ARITHMETIC, STATE) and misses the rest, so a
-    filter branch that drifted from the engine's count fails by name."""
+    filter branch that drifted from the engine's count fails by name.
+
+    OUTPUT (μ⁻) is the one policy-gated exception, exactly as remove_assign is under the
+    ``is_pure`` overlay: it has live targets but the DEFAULT one-sign policy withholds it, so
+    its count↔eligibility contract is checked under the two-sign policy that enables it.
+    """
     fn = _fn(
         """
         def f(a, b):
@@ -46,8 +51,17 @@ def test_filter_eligibility_is_the_target_count():
         """
     )
     cats = filter_categories(fn)
+    two_sign = filter_categories(fn, two_sign=True)
     for cat in MutationCategory:
-        assert (cat in cats) == (estimate_universe_size(fn, {cat}) > 0), cat.value
+        if cat is MutationCategory.OUTPUT:
+            assert (
+                cat not in cats
+            )  # withheld under the one-sign default despite live targets
+            assert (cat in two_sign) == (estimate_universe_size(fn, {cat}) > 0), (
+                cat.value
+            )
+        else:
+            assert (cat in cats) == (estimate_universe_size(fn, {cat}) > 0), cat.value
 
 
 def test_filter_value_follows_constants():

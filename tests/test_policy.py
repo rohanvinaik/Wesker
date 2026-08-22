@@ -17,6 +17,7 @@ from dataclasses import asdict
 
 from Wesker.engine import (
     _EXCEPTION_SUB_MODES,
+    _OUTPUT_SUB_MODES,
     _STATE_SUB_MODES,
     MutationCategory,
     _SwapMutator,
@@ -96,8 +97,15 @@ def test_policy_id_is_the_golden():
 
 def test_fingerprint_counts_are_the_goldens():
     got = mutation_policy().fingerprint_counts
+    # The DEFAULT policy's fingerprint covers the one-sign categories only — OUTPUT (μ⁻) is
+    # withheld, which is exactly what keeps the default id byte-identical. Build `want` over the
+    # same set, so this golden pins the one-sign fingerprint and not a spurious OUTPUT:0 column.
     want = {
-        fn: {cat.value: by_cat.get(cat.value, 0) for cat in MutationCategory}
+        fn: {
+            cat.value: by_cat.get(cat.value, 0)
+            for cat in MutationCategory
+            if cat is not MutationCategory.OUTPUT
+        }
         for fn, by_cat in GOLDEN_FINGERPRINT.items()
     }
     assert got == want
@@ -113,13 +121,34 @@ def test_policy_id_embeds_the_version():
 
 
 def test_manifest_covers_exactly_the_enum():
-    assert set(mutation_policy().categories) == {c.value for c in MutationCategory}
+    # The DEFAULT one-sign policy covers every category EXCEPT OUTPUT (μ⁻), which is withheld
+    # unless the two-sign policy is requested; the two-sign policy covers the full enum.
+    assert set(mutation_policy().categories) == {
+        c.value for c in MutationCategory if c is not MutationCategory.OUTPUT
+    }
+    assert set(mutation_policy(two_sign=True).categories) == {
+        c.value for c in MutationCategory
+    }
+
+
+def test_two_sign_policy_is_a_distinct_declared_policy():
+    # σ(P, μ ∪ μ⁻) is a genuinely different universe, so it earns its own id — while the
+    # DEFAULT one-sign id stays byte-identical (the OUTPUT enum member is present but withheld).
+    one = mutation_policy()
+    two = mutation_policy(two_sign=True)
+    assert one.policy_id == GOLDEN_POLICY_ID
+    assert two.policy_id != one.policy_id
+    assert two.policy_id.startswith(f"{POLICY_VERSION}+neg.")
+    assert "OUTPUT" in two.categories and "OUTPUT" not in one.categories
 
 
 def test_manifest_sub_modes_are_the_engine_tuples():
     cats = mutation_policy().categories
     assert cats["STATE"]["sub_modes"] == dict(_STATE_SUB_MODES)
     assert cats["EXCEPTION"]["sub_modes"] == dict(_EXCEPTION_SUB_MODES)
+    assert mutation_policy(two_sign=True).categories["OUTPUT"]["sub_modes"] == dict(
+        _OUTPUT_SUB_MODES
+    )
 
 
 def test_manifest_duals_are_the_engine_table():

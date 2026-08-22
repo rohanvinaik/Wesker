@@ -14,6 +14,7 @@ import copy
 import difflib
 import functools
 import hashlib
+import itertools
 import math
 import threading
 import time
@@ -169,6 +170,15 @@ class Mutant:
     # report DOF coverage exactly (distinct dimensions reached / this function's DOF)
     # instead of inferring it from the selection. "" when unrecorded (greedy=False).
     dimension: str = ""
+    # μ⁻ Form B (the non-return codomain): a RUNTIME wrapper of the original —
+    # ``original -> perturbed callable`` — instead of a compiled AST mutant. When set,
+    # ``evaluate_mutant`` builds the mutant object by CALLING this on the original rather than
+    # compiling ``mutated_node`` (which is a per-mode synthetic marker here, carried only so the
+    # content-addressed id stays distinct). Excluded from eq/repr: engine-internal state, never part
+    # of the mutant's identity or its serialized shape.
+    wrapper_factory: Callable[..., Any] | None = field(
+        default=None, compare=False, repr=False
+    )
 
 
 @dataclass
@@ -2260,9 +2270,14 @@ def _count_targets(
         )
     # OUTPUT (μ⁻ Form A): independent sub-modes over return sites, same shape as EXCEPTION.
     if category == MutationCategory.OUTPUT:
-        return sum(
-            _count_output_targets(func_node, mode)
-            for mode, _desc in _output_sub_modes(observed)
+        return (
+            sum(
+                _count_output_targets(func_node, mode)
+                for mode, _desc in _output_sub_modes(observed)
+            )
+            + _count_output_wrapper_targets(
+                func_node
+            )  # Form B: generator yield perturbations
         )
     # Single-transformer categories: run the mutator in record mode and count
     # its notes. VALUE additionally needs docstring positions so documentation
@@ -2642,6 +2657,122 @@ def _output_sub_modes(
             if observed & types
         )
     return tuple(modes)
+
+
+# μ⁻ Form B — runtime-wrapper perturbations of the NON-RETURN codomain. First sibling: generators,
+# whose codomain is the yielded SEQUENCE (the return-site rewrite of Form A cannot reach it). One
+# wrapper mutant per sub-mode; the perturbation is a pure iterator transform, so it never raises.
+_OUTPUT_YIELD_SUB_MODES = (
+    (
+        "yield_truncate",
+        "yielded sequence -> drop the last item (is the final yield pinned?)",
+    ),
+    (
+        "yield_drop_first",
+        "yielded sequence -> drop the first item (is the first yield pinned?)",
+    ),
+    (
+        "yield_duplicate_last",
+        "yielded sequence -> repeat the last item (is multiplicity pinned?)",
+    ),
+    (
+        "yield_empty",
+        "yielded sequence -> nothing (does any test pin that it yields at all?)",
+    ),
+)
+
+# Bounds an INFINITE generator so a wrapper can never hang the evaluator; high enough not to bite a
+# real finite sequence. A wrapper materializes at most this many items before perturbing.
+_GENERATOR_MATERIALIZE_CAP = 10_000
+
+
+def _has_own_yield(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True when the function's OWN body yields — its codomain is the yielded sequence. A yield
+    inside a NESTED def/lambda is that scope's, not this function's, so nested scopes are not
+    descended into."""
+    stack = list(func_node.body)
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (ast.Yield, ast.YieldFrom)):
+            return True
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue  # a nested scope's yields are not this function's codomain
+        stack.extend(ast.iter_child_nodes(n))
+    return False
+
+
+def _perturb_yields(items: list, mode: str) -> list:
+    """The yielded-sequence perturbation for one Form-B sub-mode. Pure list transform; a no-op on
+    some inputs (e.g. truncate/drop on an empty sequence) simply yields a runtime candidate-equivalent."""
+    if mode == "yield_truncate":
+        return items[:-1]
+    if mode == "yield_drop_first":
+        return items[1:]
+    if mode == "yield_duplicate_last":
+        return items + items[-1:]
+    if mode == "yield_empty":
+        return []
+    return items
+
+
+def _make_generator_wrapper(
+    mode: str,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """A factory ``original -> wrapped``: the wrapped generator materializes the original's yields
+    (bounded by :data:`_GENERATOR_MATERIALIZE_CAP`), perturbs the sequence, and re-yields. Returned
+    from generation and CALLED by ``evaluate_mutant`` on the live original — never compiled."""
+
+    def factory(original: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            items = list(
+                itertools.islice(original(*args, **kwargs), _GENERATOR_MATERIALIZE_CAP)
+            )
+            yield from _perturb_yields(items, mode)
+
+        return wrapped
+
+    return factory
+
+
+def _generate_output_wrappers(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[Mutant]:
+    """μ⁻ Form B wrapper mutants for a generator target — one per yield sub-mode, or none if the
+    function does not yield. Each is a :class:`Mutant` carrying a ``wrapper_factory`` (so
+    ``evaluate_mutant`` builds the object by wrapping the original) and a per-mode SYNTHETIC marker
+    node, present only so the content-addressed id and diff stay distinct — it is never compiled."""
+    if not _has_own_yield(func_node):
+        return []
+    cat = MutationCategory.OUTPUT
+    lineno = getattr(func_node, "lineno", 0)
+    mutants: list[Mutant] = []
+    for mode, desc in _OUTPUT_YIELD_SUB_MODES:
+        marker = ast.Expr(value=ast.Constant(value=f"WRAPPER:{mode}:{lineno}"))
+        ast.fix_missing_locations(marker)
+        mid = _content_mutant_id(cat, marker)
+        mutants.append(
+            Mutant(
+                category=cat,
+                original_node=func_node,
+                mutated_node=marker,
+                description=f"{mid}: {desc}",
+                location=lineno,
+                mutant_id=mid,
+                target_index=0,
+                mutated_line=lineno,
+                dimension=f"OUTPUT:{mode}:{lineno}",
+                wrapper_factory=_make_generator_wrapper(mode),
+            )
+        )
+    return mutants
+
+
+def _count_output_wrapper_targets(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> int:
+    """Wrapper (Form B) OUTPUT targets — one per yield sub-mode for a generator, else zero. Derived
+    from the same generator test the generator uses, so count == generation."""
+    return len(_OUTPUT_YIELD_SUB_MODES) if _has_own_yield(func_node) else 0
 
 
 def _record_output_dimensions(
@@ -3970,6 +4101,8 @@ def generate_mutants(
                     observed=observed_return_types,
                 )
             )
+            # Form B: runtime-wrapper perturbations of the non-return codomain (generators).
+            mutants.extend(_generate_output_wrappers(func_node))
             continue
 
         target_count = _count_targets(func_node, cat)
@@ -4843,29 +4976,45 @@ def evaluate_mutant(
             getattr(original_func, "__code__", None), "co_filename", None
         )
 
-    # Compile mutated function
+    # Compile the mutated function — or, for a μ⁻ Form-B wrapper mutant, BUILD it by wrapping the
+    # original at runtime (its mutated_node is a synthetic marker that is never compiled).
     try:
-        module_ast = _mutant_module(mutant.mutated_node)
-        ast.fix_missing_locations(module_ast)
-        code = compile(module_ast, "<mutant>", "exec")
-        # Seed the mutant's namespace with the source module's globals so it can
-        # resolve sibling helpers, module constants, and imports. Without this a
-        # function that calls a module-level helper raises NameError under EVERY
-        # mutant — a false all-crash 100% that hides whether the mutation's
-        # behavior is actually caught. Degrades to an empty namespace (the prior
-        # behavior) when the caller passes no original_func.
-        namespace: dict[str, Any] = dict(
-            getattr(original_func, "__globals__", None) or {}
-        )
-        exec(code, namespace)  # noqa: S102  # nosec B102 — intentional: compiling AST mutants
-        func_name = getattr(mutant.mutated_node, "name", None)
-        mutated_obj = namespace.get(func_name) if func_name else None
-        if mutated_obj is not None:
-            # Make ENTERING the mutant observable, not just installing it (#18). Wrapped here,
-            # at the single point the object is built, so every install path downstream —
-            # `_patch_mutant_into_test`'s four strategies and `_patch_module_qualified`'s
-            # module/owner loops — carries the same recorder without knowing about it.
-            mutated_obj = _entry_probe(mutated_obj)
+        if mutant.wrapper_factory is not None:
+            # Form B: the codomain is delivered otherwise than by the return value (a generator's
+            # yields), so the perturbation is a runtime wrapper, not an AST rewrite. func_name comes
+            # from the ORIGINAL so the patch rebinds the same name the tests call; a missing original
+            # leaves mutated_obj None and the constructed=False guard below routes it to
+            # harness_error, exactly as an un-built AST mutant does.
+            func_name = getattr(mutant.original_node, "name", None) or getattr(
+                original_func, "__name__", None
+            )
+            mutated_obj = (
+                _entry_probe(mutant.wrapper_factory(original_func))
+                if original_func is not None
+                else None
+            )
+        else:
+            module_ast = _mutant_module(mutant.mutated_node)
+            ast.fix_missing_locations(module_ast)
+            code = compile(module_ast, "<mutant>", "exec")
+            # Seed the mutant's namespace with the source module's globals so it can
+            # resolve sibling helpers, module constants, and imports. Without this a
+            # function that calls a module-level helper raises NameError under EVERY
+            # mutant — a false all-crash 100% that hides whether the mutation's
+            # behavior is actually caught. Degrades to an empty namespace (the prior
+            # behavior) when the caller passes no original_func.
+            namespace: dict[str, Any] = dict(
+                getattr(original_func, "__globals__", None) or {}
+            )
+            exec(code, namespace)  # noqa: S102  # nosec B102 — intentional: compiling AST mutants
+            func_name = getattr(mutant.mutated_node, "name", None)
+            mutated_obj = namespace.get(func_name) if func_name else None
+            if mutated_obj is not None:
+                # Make ENTERING the mutant observable, not just installing it (#18). Wrapped here,
+                # at the single point the object is built, so every install path downstream —
+                # `_patch_mutant_into_test`'s four strategies and `_patch_module_qualified`'s
+                # module/owner loops — carries the same recorder without knowing about it.
+                mutated_obj = _entry_probe(mutated_obj)
         # `func_name is None` is already implied (the lookup above yields None without it), but
         # saying it here is what narrows the name for the patch/restore code below — where an
         # unrestored binding would leak this mutant into the NEXT one's evaluation.

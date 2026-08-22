@@ -209,3 +209,68 @@ def test_a_nested_functions_return_is_not_the_targets_codomain():
     # The outer `return g(x)` is line 4; the nested `return y + 1` is line 3 — never a target.
     lines = {int(m.dimension.split(":")[2]) for m in muts if m.dimension}
     assert lines == {4}, lines
+
+
+# ── μ⁻ Form B: the non-return codomain (generators), via a runtime wrapper ──────────────
+def test_form_b_generates_yield_wrappers_only_for_generators():
+    gen = ast.parse("def g(n):\n    for i in range(n):\n        yield i\n").body[0]
+    gmuts = generate_mutants(gen, {MutationCategory.OUTPUT}, max_per_category=0)
+    assert {_sub_mode(m) for m in gmuts if m.wrapper_factory is not None} == {
+        "yield_truncate",
+        "yield_drop_first",
+        "yield_duplicate_last",
+        "yield_empty",
+    }
+    # A non-generator gets no wrappers (its codomain is the return value, Form A's job).
+    nongen = ast.parse("def f(x):\n    return x * 2\n").body[0]
+    assert not any(
+        m.wrapper_factory
+        for m in generate_mutants(nongen, {MutationCategory.OUTPUT}, max_per_category=0)
+    )
+    # A yield in a NESTED def is that scope's codomain, not the outer function's.
+    nested = ast.parse(
+        "def outer(n):\n    def inner():\n        yield 1\n    return inner\n"
+    ).body[0]
+    assert not any(
+        m.wrapper_factory
+        for m in generate_mutants(nested, {MutationCategory.OUTPUT}, max_per_category=0)
+    )
+
+
+def test_form_b_count_equals_generation_for_a_generator():
+    # count == generation (the issue-#9 invariant) must hold with the wrapper family too.
+    node = ast.parse("def g(n):\n    for i in range(n):\n        yield i\n").body[0]
+    muts = generate_mutants(node, {MutationCategory.OUTPUT}, max_per_category=0)
+    assert len(muts) == estimate_universe_size(node, {MutationCategory.OUTPUT})
+
+
+def test_form_b_wrapper_is_built_and_kills_by_assertion_and_can_survive(tmp_path):
+    # The Form-B seam: the mutant is a RUNTIME wrapper (constructed via wrapper_factory, not
+    # compiled), installed by the shared patch pipeline, and killed BY ASSERTION when a test pins
+    # the yielded sequence — never a crash. It survives when the suite does not pin the yield DOF.
+    src = "def g(n):\n    for i in range(n):\n        yield i\n"
+    mod, path = _load(tmp_path, "mu_gen", src)
+    try:
+        (trunc,) = [
+            m
+            for m in generate_mutants(
+                ast.parse(src).body[0], {MutationCategory.OUTPUT}, max_per_category=0
+            )
+            if _sub_mode(m) == "yield_truncate"
+        ]
+        assert trunc.wrapper_factory is not None
+
+        def pins():
+            assert list(mod.g(3)) == [0, 1, 2]
+
+        r = evaluate_mutant(trunc, [pins], mod.g, qualname="g", source_path=path)
+        assert r.constructed and r.killed and r.killed_by == "assertion"
+
+        def degenerate():
+            assert list(mod.g(0)) == []
+
+        assert not evaluate_mutant(
+            trunc, [degenerate], mod.g, qualname="g", source_path=path
+        ).killed
+    finally:
+        sys.modules.pop("mu_gen", None)

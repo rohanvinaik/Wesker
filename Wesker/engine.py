@@ -6539,6 +6539,71 @@ def _generate_boundary_inputs(
     return [tuple(base[i % len(base)] for _ in range(n_params)) for i in range(5)]
 
 
+def form_b_equivalence(outcomes: list[str]) -> str:
+    """The Form-B (runtime-wrapper) μ⁻ equivalence verdict over per-boundary-input outcomes (§18 Q3, pure
+    — pinned). Form A resolves equivalence by COMPILING the perturbation-as-mutant (Prop. 11.5); a Form-B
+    perturbation is a runtime ``wrapper_factory`` with no compilable mutant, so :func:`check_equivalent`
+    cannot see it and it needs this negative mirror. Each outcome is ``match`` (the wrapper is
+    indistinguishable from the original on that input), ``differ`` (a witness distinguishes them), or
+    ``raised`` (the original raised — no codomain evidence). The two non-equivalent reasons are DISTINCT and
+    must not fuse — a distinguished perturbation is a real μ⁻ kill, an all-raised one is simply unmeasured:
+
+    * ``distinguished`` — ANY input differs: the perturbation is a real kill, NOT equivalent.
+    * ``no_evidence``   — no ``differ`` but no ``match`` either (every input raised): equivalence unclaimable.
+    * ``equivalent``    — at least one ``match`` and no ``differ``: a runtime candidate-equivalent, the
+                          Form-B mirror of :func:`check_equivalent`'s ``successful_comparisons > 0`` rule.
+    """
+    if "differ" in outcomes:
+        return "distinguished"
+    if "match" not in outcomes:
+        return "no_evidence"
+    return "equivalent"
+
+
+def _check_equivalent_wrapper(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    mutant: Mutant,
+) -> bool:
+    """Form-B (runtime-wrapper) equivalence — the negative mirror of :func:`check_equivalent` for a μ⁻
+    perturbation with NO compilable mutant (§18 Q3). Compiles the ORIGINAL, builds the wrapper
+    (``mutant.wrapper_factory(original)``), runs BOTH on the same boundary inputs, and compares the
+    observable codomain — the materialized yield sequence (capped by :data:`_GENERATOR_MATERIALIZE_CAP`,
+    the same cap the wrapper uses). Equivalent iff the wrapper is indistinguishable from the original on
+    every boundary input with at least one real comparison (:func:`form_b_equivalence`): a generator that
+    yields nothing on those inputs makes truncate/drop/duplicate a no-op — a runtime candidate-equivalent.
+    Skips methods, exactly as :func:`check_equivalent` does (no synthesizable receiver)."""
+    if mutant.wrapper_factory is None:
+        return False  # not a Form-B mutant; caller should not have routed here
+    if func_node.args.args and func_node.args.args[0].arg in ("self", "cls"):
+        return False
+    try:
+        orig_mod = ast.Module(body=[func_node], type_ignores=[])  # type: ignore[list-item]
+        ast.fix_missing_locations(orig_mod)
+        orig_ns: dict[str, Any] = {}
+        exec(compile(orig_mod, "<original>", "exec"), orig_ns)  # noqa: S102
+        orig_fn = orig_ns.get(func_node.name)
+        if orig_fn is None:
+            return False
+        wrapped = mutant.wrapper_factory(orig_fn)
+        outcomes: list[str] = []
+        for args in _generate_boundary_inputs(func_node):
+            try:
+                orig_items = list(
+                    itertools.islice(orig_fn(*args), _GENERATOR_MATERIALIZE_CAP)
+                )
+                # +2 so a duplicate-last perturbation's extra element is observed, not clipped by the cap.
+                pert_items = list(
+                    itertools.islice(wrapped(*args), _GENERATOR_MATERIALIZE_CAP + 2)
+                )
+            except Exception:  # noqa: BLE001 — the original raised on this input; no codomain evidence
+                outcomes.append("raised")
+                continue
+            outcomes.append("match" if pert_items == orig_items else "differ")
+        return form_b_equivalence(outcomes) == "equivalent"
+    except Exception:  # noqa: BLE001 — a non-generator or un-compilable original is conservatively NOT equivalent
+        return False
+
+
 def check_equivalent(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     mutant: Mutant,
@@ -6552,6 +6617,10 @@ def check_equivalent(
     Skips methods (self/cls parameter) since we cannot synthesize a
     meaningful instance for boundary testing.
     """
+    # μ⁻ Form B (§18 Q3): a runtime-wrapper perturbation has no compilable mutant, so route it to the
+    # runtime mirror rather than compile a synthetic marker (which would except → a false NOT-equivalent).
+    if mutant.wrapper_factory is not None:
+        return _check_equivalent_wrapper(func_node, mutant)
     # Methods: can't provide meaningful self — skip equivalence check
     if func_node.args.args and func_node.args.args[0].arg in ("self", "cls"):
         return False

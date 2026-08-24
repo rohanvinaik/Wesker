@@ -369,6 +369,17 @@ def run_in_session(
                 )
             except Exception:  # noqa: BLE001 — a manifest that raises breaks a working run
                 pass
+            # Surface the collection errors this live session captured (a test that failed to COLLECT
+            # is silently absent from the routed suite, so its target's COMPLETE claim is unsafe).
+            # `collect_errors` accumulated them via its own pytest_collectreport, which fired during
+            # THIS collection before modifyitems; set the shared ContextVar fresh (empty when clean) so
+            # `last_collection_errors()` names this session's collection, mirroring `_LAST_MANIFEST`.
+            try:
+                from Wesker.pytest_discovery import _LAST_COLLECTION_ERRORS
+
+                _LAST_COLLECTION_ERRORS.set(tuple(nid for nid, _ in collect_errors.errors))
+            except Exception:  # noqa: BLE001 — describing the run must not fail the run
+                pass
 
         def pytest_runtestloop(self, session):  # type: ignore[no-untyped-def]
             if (

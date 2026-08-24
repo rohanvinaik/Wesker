@@ -60,6 +60,27 @@ def last_session_manifest() -> PytestSessionManifest | None:
     return _LAST_MANIFEST.get()
 
 
+# The node-ids that FAILED TO COLLECT in the most recent collection (an ImportError at collection —
+# a torch dep, a broken conftest). The manifest above is built from the SUCCESSFUL items only, so an
+# erroring file is invisible to it; without this, a test that failed to collect is silently absent
+# from the routed suite and a mutant only its tests would kill reads as candidate-equivalent. Same
+# session-state idiom and same "collect returns CALLABLES, not a second value" rationale as
+# `_LAST_MANIFEST`. Set per collection (fresh plugin instance), so it names the LAST collection only.
+_LAST_COLLECTION_ERRORS: ContextVar[tuple[str, ...]] = ContextVar(
+    "wesker_last_collection_errors", default=()
+)
+
+
+def last_collection_errors() -> tuple[str, ...]:
+    """Node-ids that failed to collect in the most recent collection in this context (empty if none).
+
+    Empty is a REAL answer: either the collection was complete, or no collection happened here. A
+    consumer stamps ``collection_incomplete`` on a non-empty tuple — the "degrade loudly" enforcement
+    for the test floor — rather than let the measurement rest on fewer tests than the layout implies.
+    """
+    return _LAST_COLLECTION_ERRORS.get()
+
+
 # The live measurement session currently in scope (#26). `_LAST_MANIFEST` alone is process-global
 # "the last manifest captured" — a collect-only run for project A leaks into a live run for
 # project B, and B's certificate gets authorized by A's collection (reproduced: A's rootpath,
@@ -258,6 +279,12 @@ def collect_pytest_callables(
             # exists, and every consumer was otherwise re-deriving it from files on disk.
             # Never allowed to fail the collection: the measurement is the product, its
             # description is not.
+            #
+            # Collection ERRORS are NOT captured on THIS (discovery) path: `collect_pytest_callables`
+            # is handed explicit files and seeds `sys.path` differently than the live measuring session
+            # (the #15/#58 import-identity issue), so its `from <target> import ...` failures are
+            # SPURIOUS — the live session collects the same files fine. `last_collection_errors()` is
+            # therefore fed only by the live session's own capture (`run_in_session`, the authority).
             try:
                 from Wesker.session_manifest import capture_manifest
 

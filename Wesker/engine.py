@@ -2639,6 +2639,25 @@ _OUTPUT_TYPE_CONDITIONAL = (
 )
 
 
+def output_mode_applies(observed: frozenset[str], applicable: frozenset[str]) -> bool:
+    """Whether a type-conditional μ⁻ OUTPUT perturbation is APPLICABLE to an observed return set
+    (Def. 11.10/Prop. 11.11, pure — pinned).
+
+    Fork 2 rewrites the return SITE STATICALLY — `return X` -> `return -X` fires on every branch — so a
+    perturbation is only sound if it applies to EVERY observed return, not merely to one. The engine used
+    `observed & types` (any-intersection), which for a heterogeneous return like `int | str` generated
+    `return_negate` off the `int` and then raised on the `str` branch: the mis-typed perturbation Def. 7.3
+    calls a source-(b) `undefined`. Requiring `observed <= applicable` (every observed type applicable)
+    makes Fork 2 "sound by restriction" as the paper claims — the perturbation is never generated where it
+    could raise, so no `undefined` ever arises. A heterogeneous return simply forgoes the type-conditional
+    perturbation (the honest Fork-1-style restriction), never a crash-scored phantom value gap.
+
+    Empty ``observed`` (nothing harvested / an unobservable return) is NOT applicable to any
+    type-conditional mode — only the always-applicable Fork-1 set is emitted there, handled by the caller.
+    """
+    return bool(observed) and observed <= applicable
+
+
 def _output_sub_modes(
     observed: frozenset[str] | None = None,
 ) -> tuple[tuple[str, str], ...]:
@@ -2654,7 +2673,7 @@ def _output_sub_modes(
         modes.extend(
             (name, desc)
             for name, desc, types in _OUTPUT_TYPE_CONDITIONAL
-            if observed & types
+            if output_mode_applies(observed, types)
         )
     return tuple(modes)
 

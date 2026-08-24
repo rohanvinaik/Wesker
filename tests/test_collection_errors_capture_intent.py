@@ -47,10 +47,14 @@ def _errors_during(tmp_path) -> tuple[str, ...]:
 def test_the_live_session_surfaces_a_collection_error(tmp_path):
     _write(tmp_path, "brk", broken=True)
     errors = _errors_during(tmp_path)
-    assert errors and errors != ("<body-never-ran>",), "the live session must surface a collection error"
+    assert errors and errors != ("<body-never-ran>",), (
+        "the live session must surface a collection error"
+    )
     assert any("test_broken_brk" in e for e in errors), errors
 
 
 def test_a_clean_live_session_reports_no_errors(tmp_path):
     _write(tmp_path, "cln", broken=False)
-    assert _errors_during(tmp_path) == (), "a clean collection must report zero errors, fresh per session"
+    assert _errors_during(tmp_path) == (), (
+        "a clean collection must report zero errors, fresh per session"
+    )

@@ -377,7 +377,9 @@ def run_in_session(
             try:
                 from Wesker.pytest_discovery import _LAST_COLLECTION_ERRORS
 
-                _LAST_COLLECTION_ERRORS.set(tuple(nid for nid, _ in collect_errors.errors))
+                _LAST_COLLECTION_ERRORS.set(
+                    tuple(nid for nid, _ in collect_errors.errors)
+                )
             except Exception:  # noqa: BLE001 — describing the run must not fail the run
                 pass
 

@@ -59,6 +59,10 @@ path = "Wesker/__init__.py"
 # that slips back into an un-ignored state still cannot ship. Regeneratable session state, never source.
 [tool.hatch.build]
 exclude = [
+    # Agent-instruction files carry absolute /Users/... paths and local agent-memory references —
+    # a machine-identity leak in a published sdist (same class as the .lintgate leak noted above).
+    "AGENTS.md",
+    "CLAUDE.md",
     ".lintgate",
     ".detective",
     ".wesker",

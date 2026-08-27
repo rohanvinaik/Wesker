@@ -8,7 +8,15 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Matrix over the classifiers' claimed Pythons (3.10–3.13) and two OSes. Mutation runs use
+    # in-process pytest sessions and subprocess isolation — the surface that varies across
+    # versions/platforms — so a single ubuntu/one-Python job left the claims unverified.
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -19,7 +27,8 @@ jobs:
           version: "latest"
 
       - name: Install dependencies
-        run: uv sync
+        # --python overrides the repo .python-version pin so each cell resolves its own interpreter.
+        run: uv sync --python ${{ matrix.python-version }}
 
       - name: Lint
         run: uv run ruff check Wesker/ tests/
@@ -31,6 +40,9 @@ jobs:
         run: uv run pytest tests/ --cov=Wesker --cov-report=xml:coverage.xml -q
 
       - name: Upload coverage report
+        # Only the canonical cell feeds SonarCloud — avoids a matrix artifact-name collision, and
+        # coverage is platform/Python-independent so one cell suffices.
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report

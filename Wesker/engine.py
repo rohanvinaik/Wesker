@@ -4461,6 +4461,26 @@ def _is_private_copy(module_name: str, private_prefix: str) -> bool:
     return module_name.startswith(private_prefix)
 
 
+def _safe_code(obj: Any) -> Any:
+    """``obj.__code__`` or None, surviving a foreign module's hostile ``__getattr__``.
+
+    ``_patch_module_qualified`` scans every module in ``sys.modules`` and asks each
+    attribute for its ``__code__`` to match the function under test by co_filename. Some
+    libraries return a PROXY for ANY attribute name rather than raising AttributeError —
+    ``torch._classes`` is the canonical case — so ``getattr(mod, func_name, None)`` yields a
+    proxy (the ``None`` default never fires), and asking that proxy for ``__code__`` raises a
+    RuntimeError (``Tried to instantiate class '<name>.__code__'``). That exception used to
+    escape the scan, escape ``evaluate_mutant``, and route EVERY mutant to un-evaluable
+    survivor: a whole torch-importing module read as ``0/N killed``, silently — the one
+    outcome measurement must never produce (a false all-survived is a false clean bill).
+    Any exception here just means "not the function we are looking for" — skip it.
+    """
+    try:
+        return getattr(obj, "__code__", None)
+    except Exception:
+        return None
+
+
 def _patch_module_qualified(
     _proof: _PatchProof,
     func_name: str | None,
@@ -4512,7 +4532,7 @@ def _patch_module_qualified(
             obj = getattr(mod, func_name, None)
         except Exception:
             continue
-        code = getattr(obj, "__code__", None)
+        code = _safe_code(obj)
         if code is None:
             continue
         try:
@@ -4545,7 +4565,7 @@ def _patch_module_qualified(
             ):
                 continue
             existing = _get_raw_attr(owner, method)
-            code = getattr(_unwrap_descriptor(existing), "__code__", None)
+            code = _safe_code(_unwrap_descriptor(existing))
             if code is None:
                 continue
             try:

@@ -9,15 +9,26 @@ followed it — so the runaway it was bounding was never stopped: a live thread 
 the rest of the process (two of them in the faulthandler dump, thread numbers past 4,600), and
 every later phase crawled. All four bounded-join sites in the pair were written in that shape.
 
-Pinned from intent, with the same runaway the abandon tests use:
+WHAT IS PINNED, AND HOW. The mid-wait claim is about CONTROL FLOW — whether the wait's exit hands
+the thread it was bounding to `abandon` — and it is pinned with a FAKE thread whose `join` raises
+the abandonment itself and which always reports alive. Not with a real runaway: where an injection
+lands, and what else it does, varies with the interpreter and with a tracer. Two earlier versions
+of these tests used real runaways; under coverage's C tracer — every CI cell, 3.10 through 3.13,
+and Detective's pinned 3.11 locally — the joiner's injection landed INSIDE the C-level join AND
+the runaway ended on its own without unwinding through its handler
+(the recorded unknown in test_abandon_thread.py, one step stranger), so the "old shape orphans
+it" control could not hold there, and the first version leaked runaways into the rest of the
+suite — the very defect, committed by its own test. A fake removes the interpreter from the
+claim; the real-thread tests below cover the ordinary paths, where the model holds everywhere.
 
-- the defect, as a control: the old shape (join, then abandon-if-alive) orphans the runaway when
-  the joiner is abandoned mid-wait;
-- the fix: `bounded_join` stops the runaway on that same exit, and reports the wait as timed out;
-- the ordinary paths keep their meaning: a timeout abandons and reports (True, True); a thread that
-  finishes in time is (False, True); ``None`` waits unbounded;
-- the honest boundary survives: a thread blocked outside the interpreter is (True, False), and the
-  caller's extra unwind allowance is granted only when the injection did not land.
+- the defect, as a control: the old shape (join, then abandon-if-alive) never reaches the abandon
+  when the joiner is abandoned inside the join;
+- the fix: `bounded_join` reaches it on that same exit, and the joiner's own abandonment still
+  propagates;
+- the ordinary paths keep their meaning: a timeout abandons a real runaway and reports
+  (True, True); a thread that finishes in time is (False, True); ``None`` waits unbounded;
+- the honest boundary survives: a thread blocked outside the interpreter is (True, False) —
+  untraced, per the recorded unknown.
 """
 
 from __future__ import annotations
@@ -28,101 +39,115 @@ import time
 
 import pytest
 
-from Wesker.interrupt import abandon, bounded_join
+from Wesker import interrupt
+from Wesker.interrupt import Abandoned, bounded_join
 
 
-def _runaway(flag: dict) -> None:
-    try:
-        for i in range(10**9):
-            flag["n"] = i
-    except BaseException:  # noqa: BLE001 — the injection unwinds through here
-        flag["unwound"] = True
+class _CutInsideTheJoin:
+    """A thread whose `join` is where the joiner's own abandonment lands, and which is still
+    running afterwards — the nested case, with no interpreter in the loop."""
+
+    ident = None
+    name = "fake (_run)"
+
+    def __init__(self) -> None:
+        self.joined_with: list = []
+
+    def join(self, timeout=None) -> None:
+        self.joined_with.append(timeout)
+        raise Abandoned
+
+    def is_alive(self) -> bool:
+        return True
 
 
-def _spawn(target, *args) -> threading.Thread:
-    t = threading.Thread(target=target, args=args, daemon=True)
-    t.start()
-    time.sleep(0.05)  # let it actually enter the loop
-    return t
+@pytest.fixture
+def recorded_abandon(monkeypatch):
+    """`abandon`, observed: which threads it was asked to stop, in order. The real primitive still
+    runs (a fake has no ident, so it honestly reports False); the recorder is the witness."""
+    seen: list = []
+    real = interrupt.abandon
 
+    def recording(thread):
+        seen.append(thread)
+        return real(thread)
 
-def _abandon_after(thread: threading.Thread, delay_s: float) -> None:
-    time.sleep(delay_s)
-    abandon(thread)
+    monkeypatch.setattr(interrupt, "abandon", recording)
+    return seen
 
 
 # --- the defect, then the fix --------------------------------------------------------------------
 
 
-def test_the_old_shape_orphans_the_runaway_when_the_joiner_is_abandoned_mid_wait():
+def test_the_old_shape_never_reaches_the_abandon_when_the_joiner_is_cut_inside_the_join(
+    recorded_abandon,
+):
     """The control: what every bounded-join site did before 2026-09-06."""
-    flag: dict = {}
-    runaway = _spawn(_runaway, flag)
+    runaway = _CutInsideTheJoin()
 
     def old_shape() -> None:
-        try:
-            # Parked here when the abandonment is injected. It CANNOT land in a C-level lock wait
-            # (the boundary): it lands at the first bytecode after the join returns — the next line.
-            runaway.join(0.5)
-            if runaway.is_alive():  # …so this line is never reached
-                abandon(runaway)
-        except BaseException:  # noqa: BLE001 — the expected abandonment; keep it out of pytest's thread warning
-            pass
+        runaway.join(0.5)  # the joiner's abandonment lands here…
+        if runaway.is_alive():  # …and this line is never reached
+            interrupt.abandon(runaway)
 
-    joiner = threading.Thread(target=old_shape, daemon=True)
-    joiner.start()
-    _abandon_after(joiner, 0.1)
-    joiner.join(2.0)
-    assert not joiner.is_alive(), (
-        "the joiner itself was abandoned once its join returned"
+    with pytest.raises(Abandoned):
+        old_shape()
+    assert recorded_abandon == [], "the orphan: nothing ever tried to stop the runaway"
+
+
+def test_bounded_join_reaches_the_abandon_when_the_joiner_is_cut_inside_the_join(
+    recorded_abandon,
+):
+    """The fix: the same exit, and the runaway is handed to `abandon` on the way out."""
+    runaway = _CutInsideTheJoin()
+    with pytest.raises(Abandoned):
+        bounded_join(runaway, 0.5)
+    assert recorded_abandon == [runaway], (
+        "no orphan: the runaway was handed to abandon on the way out"
     )
+    assert runaway.joined_with == [0.5], "the bounded wait itself was the one join"
+
+
+def test_the_extra_unwind_allowance_is_granted_only_when_the_injection_did_not_land(
+    recorded_abandon,
+):
+    runaway = _CutInsideTheJoin()
+    with pytest.raises(Abandoned):
+        bounded_join(runaway, 0.5, unwind_s=0.2)
+    # abandon() reports False for a thread with no ident, so the allowance is paid: one more join.
+    assert runaway.joined_with == [0.5, 0.2]
+
+
+# --- the ordinary paths keep their meaning, on real threads --------------------------------------
+
+
+def _runaway(flag: dict, stop: threading.Event) -> None:
+    """A pure-Python runaway that ALSO honours a stop flag, so no test can leak it."""
     try:
-        assert runaway.is_alive(), (
-            "the orphan: the runaway outlived the joiner that was bounding it"
-        )
+        i = 0
+        while not stop.is_set():
+            flag["n"] = i
+            i += 1
+    except BaseException:  # noqa: BLE001 — the injection unwinds through here
+        flag["unwound"] = True
+
+
+def test_a_timeout_abandons_a_real_runaway_and_reports_timed_out_and_contained():
+    flag: dict = {}
+    stop = threading.Event()
+    runaway = threading.Thread(target=_runaway, args=(flag, stop), daemon=True)
+    runaway.start()
+    time.sleep(0.05)  # let it actually enter the loop
+    try:
+        assert bounded_join(runaway, 0.1) == (True, True)
+        assert not runaway.is_alive()
     finally:
-        abandon(runaway)  # do not leak it into the rest of the suite
+        stop.set()
 
 
-def test_bounded_join_stops_the_runaway_when_the_joiner_is_abandoned_mid_wait():
-    """The fix: the same exit, and the runaway is stopped on the way out."""
-    flag: dict = {}
-    runaway = _spawn(_runaway, flag)
-    seen: dict = {}
-
-    def new_shape() -> None:
-        try:
-            seen["result"] = bounded_join(runaway, 0.5)
-        except BaseException as exc:  # noqa: BLE001 — the abandonment propagates out of the join
-            seen["raised"] = type(exc).__name__
-
-    joiner = threading.Thread(target=new_shape, daemon=True)
-    joiner.start()
-    _abandon_after(joiner, 0.1)
-    joiner.join(2.0)
-    assert not joiner.is_alive()
-    assert seen.get("raised") == "Abandoned", (
-        "the joiner's own abandonment still propagates"
-    )
-    runaway.join(0.5)
-    assert not runaway.is_alive(), (
-        "no orphan: the runaway was stopped on the joiner's way out"
-    )
-    assert flag.get("unwound") is True
-
-
-# --- the ordinary paths keep their meaning ---------------------------------------------------------
-
-
-def test_a_timeout_abandons_the_runaway_and_reports_timed_out_and_contained():
-    flag: dict = {}
-    runaway = _spawn(_runaway, flag)
-    assert bounded_join(runaway, 0.1) == (True, True)
-    assert not runaway.is_alive()
-    assert flag.get("unwound") is True
-
-
-def test_a_thread_that_finishes_in_time_is_neither_timed_out_nor_abandoned():
+def test_a_thread_that_finishes_in_time_is_neither_timed_out_nor_abandoned(
+    recorded_abandon,
+):
     done: dict = {}
 
     def quick() -> None:
@@ -132,6 +157,7 @@ def test_a_thread_that_finishes_in_time_is_neither_timed_out_nor_abandoned():
     t.start()
     assert bounded_join(t, 1.0) == (False, True)
     assert done == {"ran": True}
+    assert recorded_abandon == []
 
 
 def test_none_waits_unbounded():

@@ -85,6 +85,13 @@ a deliberate `v == v` NaN check (`falsepositive`).
   — 0/N killed even with a killing test. Look up the trailing attribute too.
 - **Validate through the real command end-to-end**, not by poking `profile()` on a
   half-built target. That trap once cost a deep and entirely wrong spelunk.
+- **A bounded wait on a worker thread is `interrupt.bounded_join`, never `join; if alive:
+  abandon`.** Bounded joins NEST (the classifier joins a runaway from inside a test the traced
+  baseline is running in a worker under its own budget); when the joiner is abandoned while
+  parked in a join, the injection lands at the first bytecode AFTER the join — before the
+  abandon — and the runaway it was bounding is orphaned, hogging the GIL for the rest of the
+  process. Measured 2026-09-06 (a 13-minute stall against a 300 s wall). The `finally` in
+  `bounded_join` is the whole fix; all four sites in the pair use it.
 
 ## Scope
 

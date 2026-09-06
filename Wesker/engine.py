@@ -24,7 +24,7 @@ from contextvars import ContextVar
 from enum import Enum
 from typing import TYPE_CHECKING, Any, TypeGuard
 
-from .interrupt import abandon as _abandon
+from .interrupt import bounded_join
 from .line_coverage import admissible_coverage as _admissible_coverage
 from .line_coverage import arcs_from_trace as _arcs_from_trace
 from .line_coverage import coverage_from_trace as _coverage_from_trace
@@ -5540,35 +5540,35 @@ def _run_test_with_timeout(
         contextlib.redirect_stderr(io.StringIO()),
     ):
         thread.start()
-        thread.join(timeout=timeout_ms / 1000.0)
-        timed_out = thread.is_alive()
-        if timed_out:
-            # Timed out. STOP the runaway rather than abandoning it: the verdict is already
-            # decided (below), so what is left is the thread itself, and a daemon thread is only
-            # reclaimed at PROCESS exit — i.e. never, across a run. Every timeout used to leave
-            # one live thread burning a core for the rest of the session, so later mutants timed
-            # out BECAUSE earlier ones were still running and the failure compounded.
-            #
-            # The abandon and the unwind it triggers MUST happen INSIDE the redirect above, which
-            # is why they are in here rather than after it. `redirect_stdout` restores the value
-            # IT captured; the abandoned test's own frames may hold their own. A test — or any
-            # library it called — that entered `redirect_stdout` and is cut mid-block unwinds
-            # through that `__exit__` and reinstalls what IT saved, which is this StringIO. Run
-            # after the `with` exited, that write lands AFTER our restoration and therefore wins:
-            # `sys.stdout` is left a dead buffer for the rest of the PROCESS and every later
-            # print — the engine's own report included — is discarded in silence. Measured on
-            # Regenesis: one JVM-backed test overran the 5s cap and `detective diagnose` then
-            # exited 0 having printed nothing at all, which in CI is an empty artifact and a
-            # green check. Unwinding in here means any such restore is itself captured, and OUR
-            # `__exit__` is the last writer.
-            _abandon(thread)
-            thread.join(timeout=_ABANDON_UNWIND_S)
-            # `abandon` injects an async exception that CANNOT land while the worker is blocked
-            # OUTSIDE the interpreter (subprocess/socket/C-extension) — it only lands at the next
-            # bytecode. If the thread is still alive after the unwind allowance, the timed-out work
-            # is UNCONTAINED: it may still be running and mutating shared state, so reporting it as
-            # a clean "timeout" is a false measurement. The caller must refuse to gate on it (#14).
-            contained = not thread.is_alive()
+        # Timed out → STOP the runaway rather than abandoning it: the verdict is already decided
+        # (below), so what is left is the thread itself, and a daemon thread is only reclaimed at
+        # PROCESS exit — i.e. never, across a run. Every timeout used to leave one live thread
+        # burning a core for the rest of the session, so later mutants timed out BECAUSE earlier
+        # ones were still running and the failure compounded.
+        #
+        # The abandon and the unwind it triggers MUST happen INSIDE the redirect above, which is
+        # why they are in here rather than after it. `redirect_stdout` restores the value IT
+        # captured; the abandoned test's own frames may hold their own. A test — or any library it
+        # called — that entered `redirect_stdout` and is cut mid-block unwinds through that
+        # `__exit__` and reinstalls what IT saved, which is this StringIO. Run after the `with`
+        # exited, that write lands AFTER our restoration and therefore wins: `sys.stdout` is left a
+        # dead buffer for the rest of the PROCESS and every later print — the engine's own report
+        # included — is discarded in silence. Measured on Regenesis: one JVM-backed test overran
+        # the 5s cap and `detective diagnose` then exited 0 having printed nothing at all, which in
+        # CI is an empty artifact and a green check. Unwinding in here means any such restore is
+        # itself captured, and OUR `__exit__` is the last writer.
+        #
+        # `bounded_join` (interrupt) stops the runaway on EVERY exit from the wait — including this
+        # thread itself being abandoned while parked in the join, which is what happens when a test
+        # that runs the engine is traced by the engine's own baseline (the 2026-09-06 orphan).
+        # `abandon` injects an async exception that CANNOT land while the worker is blocked OUTSIDE
+        # the interpreter (subprocess/socket/C-extension) — it only lands at the next bytecode. If
+        # the thread is still alive after the unwind allowance, the timed-out work is UNCONTAINED:
+        # it may still be running and mutating shared state, so reporting it as a clean "timeout"
+        # is a false measurement. The caller must refuse to gate on it (#14).
+        timed_out, contained = bounded_join(
+            thread, timeout_ms / 1000.0, unwind_s=_ABANDON_UNWIND_S
+        )
 
     if timed_out:
         return "timeout" if contained else "uncontained"

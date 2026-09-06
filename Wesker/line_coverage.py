@@ -26,7 +26,7 @@ import time
 from types import CodeType
 from typing import Any, Callable
 
-from Wesker.interrupt import abandon
+from Wesker.interrupt import bounded_join
 
 
 def _traceable_lines(
@@ -149,12 +149,11 @@ def _traced_in_thread(
 
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
-    thread.join(timeout=budget_s if budget_s and budget_s > 0 else None)
-    if not thread.is_alive():
-        return False, True
-    # Cut: stop it, don't leak it. Partial coverage is kept either way — and whether the stop
-    # actually LANDED travels with the result instead of being discarded (#19).
-    return True, abandon(thread)
+    # Cut → stop it, don't leak it. Partial coverage is kept either way — and whether the stop
+    # actually LANDED travels with the result instead of being discarded (#19). `bounded_join`
+    # stops the worker on EVERY exit from the wait, this thread's own abandonment included: a
+    # trace_suite run from inside a test that another baseline is tracing is the nested case.
+    return bounded_join(thread, budget_s if budget_s and budget_s > 0 else None)
 
 
 def _target_matcher(target_files: set[str]) -> Callable[[str], str | None]:

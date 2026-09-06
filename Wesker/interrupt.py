@@ -77,3 +77,38 @@ def abandon(thread: Any) -> bool:
         return False
     thread.join(timeout=UNWIND_S)
     return not thread.is_alive()
+
+
+def bounded_join(
+    thread: Any, timeout_s: float | None, unwind_s: float = 0.0
+) -> tuple[bool, bool]:
+    """Wait for ``thread`` at most ``timeout_s`` (``None`` = unbounded) and, on EVERY way out, leave
+    no runaway behind. Returns ``(timed_out, contained)``: ``timed_out`` when the wait expired with
+    the thread still running; ``contained`` when it is confirmed gone afterwards (``abandon``'s
+    honest answer — False for a thread blocked outside the interpreter). ``unwind_s`` is extra
+    settling time the caller grants after the injection, on top of ``abandon``'s own.
+
+    THE ORPHAN (measured 2026-09-06, `detective converge` on its own engine): a bounded join is often
+    NESTED — the classifier's `_outcome` joins a runaway mutant from inside a test that the traced
+    baseline is itself running in a worker, and the baseline's budget can abandon THAT worker while
+    it is parked in this join. The injected exception lands at the first bytecode after the join
+    returns — before the line that would have abandoned the runaway — so the runaway was orphaned:
+    a live thread hogging the GIL for the rest of the process (two of them in the faulthandler
+    dump, thread numbers past 4,600), and every later phase crawled. Written as `join; if alive:
+    abandon`, every one of the four bounded-join sites in the pair had this hole. The `finally` is
+    the fix: the caller may leave by any exception, its own abandonment included, and the thread it
+    was bounding is stopped on the way out. What `abandon` cannot reach (the BOUNDARY above) is
+    still reported, never claimed.
+    """
+    timed_out = False
+    contained = True
+    try:
+        thread.join(timeout=timeout_s)
+    finally:
+        timed_out = thread.is_alive()
+        if timed_out:
+            contained = abandon(thread)
+            if unwind_s > 0 and not contained:
+                thread.join(timeout=unwind_s)
+                contained = not thread.is_alive()
+    return timed_out, contained

@@ -22,6 +22,7 @@ import time
 
 import pytest
 
+from Wesker import interrupt as INTERRUPT
 from Wesker import line_coverage as LC
 
 _FILE = __file__
@@ -47,8 +48,11 @@ _LINES = {33, 34, 35, 36}
 
 @pytest.fixture
 def unstoppable(monkeypatch):
-    """`abandon` reporting False — a worker confirmed still alive after the injection."""
-    monkeypatch.setattr(LC, "abandon", lambda _thread: False)
+    """`abandon` reporting False — a worker confirmed still alive after the injection. Patched at
+    the primitive (`interrupt.abandon`): since 2026-09-06 the trace worker is bounded through
+    `interrupt.bounded_join`, which reaches `abandon` by name in its own module, so the seam is
+    the same one every bounded join in the pair consumes."""
+    monkeypatch.setattr(INTERRUPT, "abandon", lambda _thread: False)
 
 
 def test_a_cut_worker_that_stops_is_reported_contained():

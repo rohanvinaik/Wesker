@@ -612,10 +612,13 @@ class IsolatedMutantWorker:
             }
         )
         try:
-            assert self._proc.stdin is not None
+            # An explicit check, not an `assert`: under `python -O` an assert vanishes and the
+            # `None` stdin would surface as an uncaught AttributeError instead of a dead worker.
+            if self._proc.stdin is None:
+                raise BrokenPipeError("worker stdin is closed")
             self._proc.stdin.write(session + "\n")
             self._proc.stdin.flush()
-        except (BrokenPipeError, ValueError, AssertionError):
+        except (BrokenPipeError, ValueError):
             self._alive = False
 
     @property
@@ -644,10 +647,12 @@ class IsolatedMutantWorker:
         if node_ids is not None:
             spec["node_ids"] = list(node_ids)
         try:
-            assert self._proc.stdin is not None and self._proc.stdout is not None
+            # Explicit checks, not `assert`s (see `open`): an assert vanishes under `python -O`.
+            if self._proc.stdin is None or self._proc.stdout is None:
+                raise BrokenPipeError("worker pipes are closed")
             self._proc.stdin.write(json.dumps(spec) + "\n")
             self._proc.stdin.flush()
-        except (BrokenPipeError, ValueError, AssertionError):
+        except (BrokenPipeError, ValueError):
             self._alive = False
             return IsolatedRun(-9, True, self._reap(), "")
         ready, _, _ = select.select([self._proc.stdout], [], [], timeout_s)

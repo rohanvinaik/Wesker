@@ -52,6 +52,25 @@ uvx ruff@0.14.10 format . 2>&1 | tail -1 \
   && uvx ruff@0.14.10 format --check . 2>&1 | tail -1
 ```
 
+### Before every PUSH: pylint-as-Sonar, then the REAL Sonar, locally
+
+CI runs SonarCloud on every push of this repo — so run the same scanner locally FIRST, not blind:
+
+```bash
+uvx pylint Wesker          # reproducible from [tool.pylint] in pyproject
+set -a && . ~/.config/detective/sonar-local.env && set +a
+docker run --rm -e SONAR_HOST_URL=http://host.docker.internal:9000 -e SONAR_TOKEN="$SONAR_TOKEN" \
+  -v "$PWD:/usr/src" sonarsource/sonar-scanner-cli -Dsonar.organization=
+curl -s -u "$SONAR_TOKEN:" "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=rohanvinaik_Wesker"
+```
+
+`-Dsonar.organization=` blanks the SonarCloud org for the local server (the shared persistent
+`peitho-sonar` container). Poll `api/ce/component?component=rohanvinaik_Wesker` for `SUCCESS`
+before reading the gate. Bar: gate `OK`, 0 bugs, 0 vulnerabilities, 0 hotspots. Coverage is
+intentionally not gated here (the kill rate is the stronger signal — see sonar-project.properties).
+Residue is transitioned by API WITH a comment, never silently: S3776 on the orchestrators (`accept`),
+a deliberate `v == v` NaN check (`falsepositive`).
+
 ## Wesker-specific hazards
 
 - **Mutant binding is by `__code__.co_filename`.** Wesker monkeypatches mutants onto live

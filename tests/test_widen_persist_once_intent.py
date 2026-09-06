@@ -225,7 +225,7 @@ def test_the_widen_loop_persists_once_at_its_end(tmp_path, monkeypatch):
         assert scoreit(5, 3, False) == 2  # noqa: F821 — flag=False branch only
 
     def test_ua():
-        assert 1 == 1
+        assert len("ua") == 2  # reaches nothing of scoreit — an unrelated unknown
 
     def test_ub():
         assert "x".upper() == "X"

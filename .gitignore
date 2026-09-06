@@ -26,3 +26,5 @@ coverage.xml
 # nobody notices staging.
 .env
 .env.*
+# SonarQube scanner work dir (local pre-push scan)
+.scannerwork/

@@ -385,8 +385,8 @@ def route_test_item(
       * ``"item"`` — the item's OWN function body statically references the target: a ``candidate_static``
                      seed (the direct-item stratum, the strongest static positive).
       * ``"file"`` — only the item's FILE references the target, not the item itself: a ``file_peer`` —
-                     KEPT (widened, never dropped) but NOT a seed candidate. A weak routing reason, so
-                     one real test naming the target no longer promotes its file-siblings into the seed.
+                     tagged and kept in the pool, NOT a seed candidate. A weak routing reason, so one
+                     real test naming the target no longer promotes its file-siblings into the seed.
       * ``"none"`` — the item's file does not reference the target at all.
     ``fixture_reaches`` (a fixture in the item's closure defined in a file that names the target — the
     autouse/conftest reach a body scan cannot see) outranks ``"file"`` but sits below an own-body name.
@@ -394,12 +394,22 @@ def route_test_item(
     ``caller_reaches`` is a positive TRANSITIVE-caller signal (#15 B): the item's body names a
     production function that itself reaches the target, so a test of a public API reaches a private
     helper it never names (``test_resolve_roles`` → ``resolve_roles`` → ``_compute_sets``). It is a
-    widen stratum (``caller_reaches``), ranked below a fixture edge and above a ``file_peer`` — traced
-    FIRST among the unknowns (`_unknown_stratum_rank`), never eagerly seeded. Positive-only: it can
-    only promote an item toward the front of the widen, never rule one out.
+    widen stratum (``caller_reaches``), ranked below a fixture edge and above a ``file_peer`` — first
+    among the unknowns (`_unknown_stratum_rank`), never eagerly seeded. Positive-only: it can only
+    promote an item toward the front of the widen, never rule one out.
 
-    ``dynamic_uncertain`` widens to unknown rather than excluding: plugins or dynamic imports mean
-    the static picture is incomplete, and incomplete is not proof of irrelevance.
+    ``dynamic_uncertain`` tags the item unknown rather than excluding it: plugins or dynamic imports
+    mean the static picture is incomplete, and incomplete is not proof of irrelevance.
+
+    THE ROUTER TAGS; THE DRIVER DECIDES WHAT TO TRACE. These codes exist so that decision is explicit
+    and disclosable, not so that every unknown is widened. Discovery is an efficiency device for
+    finding the tests applicable to ONE function, never a proof of a negative over the suite: a test
+    with no static path to the target cannot be discovered by tracing it, only found to not reach at
+    the price of running it. Detective (2026-09-05) widens the ``caller_reaches`` stratum only and
+    discloses ``file_peer`` / ``unknown_dynamic`` / ``unknown_no_path`` as "not consulted" — a
+    sibling's name is no evidence about this item — with no opt-in; a missed dynamic reacher
+    under-counts the FLOOR (one redundant generated test), never the ceiling. The widen's gap
+    (`next_routing_action`) is therefore sound relative to the driver's APPLICABLE set.
     """
     if observed_reach == "reached":
         return "candidate_observed"
@@ -561,7 +571,8 @@ def _unknown_stratum_rank(code: str) -> int:
     item names a production caller that reaches the target — #15 B) is the strongest widen signal,
     then ``file_peer`` (its FILE names the target), then ``unknown_dynamic`` (a plugin / dynamic
     import MIGHT reach it), then ``unknown_no_path`` (no static signal at all). An unrecognised code
-    sorts last."""
+    sorts last. The order is over whatever the driver hands the widen; which strata it hands over is
+    the driver's policy (Detective: ``caller_reaches`` only — see `route_test_item`)."""
     return {
         "caller_reaches": 0,
         "file_peer": 1,
@@ -583,9 +594,10 @@ def partition_live_callables(
     Each unknown is returned as ``(callable, route_code)`` (#D3, §8.3): the widen stratum's code —
     ``caller_reaches`` / ``file_peer`` / ``unknown_dynamic`` / ``unknown_no_path`` — travels WITH its
     item, so the driver reads a caller-reacher off the tag instead of RE-PARSING every unknown's body
-    (`_item_body_names`) a second time to recover a bit computed here and discarded. Candidates and
-    impossibles stay plain callable lists — the seed is traced whole and the impossibles are dropped,
-    so neither consumes a code.
+    (`_item_body_names`) a second time to recover a bit computed here and discarded — and so the
+    driver can DECIDE which strata to widen and disclose the rest (Detective widens ``caller_reaches``
+    only; see `route_test_item`). Candidates and impossibles stay plain callable lists — the seed is
+    traced whole and the impossibles are dropped, so neither consumes a code.
 
     Static and fixture evidence can only promote an unseen item to CANDIDATE. The third bucket is
     populated solely from an exact per-TestId observation loaded under the same target content,
@@ -1612,7 +1624,12 @@ def run_with_live_suite(
         # it — never a module global, or it becomes the stale cross-run cache `fresh` refuses.
         _within_run: dict = {}
 
-        def _build(subset: list[Any] | None = None, fresh: bool = False) -> Any:
+        def _build(
+            subset: list[Any] | None = None,
+            fresh: bool = False,
+            persist: bool = True,
+            carry: Any = None,
+        ) -> Any:
             # The guard lives INSIDE the closure because the closure decides when it runs. The
             # baseline RUNS the consumer's whole suite — arbitrary third-party code — and any of
             # it can leave `sys.stdout` replaced: by assigning it, or by being cut mid-
@@ -1654,6 +1671,11 @@ def run_with_live_suite(
                     fresh=fresh,
                     regime_digest=_regime,
                     within_run=_within_run,
+                    # A batched widen holds persistence back per micro-batch and flushes ONCE
+                    # (`LazySessionBaseline.expand(persist=False)` / `flush()`); `carry` is the
+                    # merged held-back cells the flush build writes alongside its own (none).
+                    persist=persist,
+                    carry=carry,
                     **budgets,
                 )
 

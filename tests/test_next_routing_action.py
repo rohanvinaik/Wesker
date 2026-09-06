@@ -2,8 +2,11 @@
 
 INTENT: the widen must trace only as far as it needs to. It COMPLETES the instant every proof
 obligation is discharged (so the low-stratum unknowns are never traced — the efficiency win); it
-declares a GAP only once the eligible unknown set is EXHAUSTED (the negative conclusion is sound
-only then); and a mid-widen containment loss yields a typed UNRESOLVED, never a false gap.
+declares a GAP only once the ELIGIBLE set is EXHAUSTED — the strata the DRIVER handed over as
+`widen_tests`, which is the APPLICABLE set, not the whole collection (Detective hands over the
+caller-reaching stratum only and discloses the rest as not consulted; the negative conclusion is
+sound relative to that set, and the driver states the boundary); and a mid-widen containment loss
+yields a typed UNRESOLVED, never a false gap.
 """
 
 from __future__ import annotations
@@ -31,7 +34,8 @@ def test_an_open_obligation_with_items_left_traces_next():
 
 def test_an_open_obligation_with_no_items_left_is_the_honest_gap():
     """Every eligible unknown was traced and an obligation still stands — THIS is the specification
-    gap, sound precisely because the unknown set is exhausted."""
+    gap, sound relative to the eligible set: the strata the driver handed over (its APPLICABLE set,
+    whose boundary the driver discloses), now exhausted."""
     assert next_routing_action(True, False, False) == "gap"
 
 

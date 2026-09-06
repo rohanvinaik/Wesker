@@ -69,9 +69,11 @@ def test_a_static_name_is_a_candidate():
 
 def test_a_file_only_reference_is_a_file_peer_not_a_seed_candidate():
     """residual-1 (#15, per-item): only the item's FILE names the target — a sibling test does, the
-    item's own body does not. That is a `file_peer`: KEPT (widened, never dropped) but NOT a seed
+    item's own body does not. That is a `file_peer`: tagged and kept in the pool, NOT a seed
     candidate, so one real test naming the target no longer drags its file-siblings into the eager
-    seed. The distinction file-vs-item is the whole point — a file bit conflated them."""
+    seed. Whether a stratum is WIDENED is the driver's policy — Detective does not consult
+    `file_peer` (a sibling's name is no evidence about this item) and discloses it as not consulted.
+    The distinction file-vs-item is the whole point — a file bit conflated them."""
     assert route_test_item("file", False, False, "unseen", False) == "file_peer"
 
 
@@ -104,7 +106,8 @@ def test_admits_keeps_unknown_by_default_and_drops_it_when_conservative():
     # impossible is dropped either way; a candidate is kept either way.
     assert route_admits("impossible_observed", conservative=False) is False
     assert route_admits("candidate_fixture", conservative=True) is True
-    # file_peer is a WEAK reason: kept by default (widened), dropped only in conservative/lossy mode.
+    # file_peer is a WEAK reason: admitted to the POOL by default, dropped only in conservative/lossy
+    # mode. Admission to the pool is not a trace: whether a stratum is widened is the driver's policy.
     assert route_admits("file_peer", conservative=False) is True
     assert route_admits("file_peer", conservative=True) is False
 

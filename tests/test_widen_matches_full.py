@@ -219,7 +219,8 @@ def test_line_only_widen_that_crosses_the_budget_is_non_gateable(monkeypatch):
         # One uncovered executable line with every mutant already killed: widening is line-only.
         return (lambda mutant: [killer]), {"seed": [1]}, [1, 2], []
 
-    def slow_expand(self, more):
+    def slow_expand(self, more, persist=True):
+        # The double mirrors `expand`'s signature: the loop holds persistence back per step.
         time.sleep(0.2)
         return True
 

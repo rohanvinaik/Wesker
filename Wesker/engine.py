@@ -2937,6 +2937,39 @@ def _live_dimension_count(keys: list[str]) -> int:
     return len({k for k in keys if not _is_dead(k)})
 
 
+@dataclass(frozen=True)
+class PendingPersist:
+    """The cells ONE partial baseline build would have written to the persistent trace cache, held
+    back because the caller batches persistence (``build_session_baseline(persist=False)``).
+
+    The item-incremental widen builds one test per micro-batch, and each build used to write the
+    WHOLE cache — every prior cell plus its own — twice (a checkpoint and a final save, each a full
+    ``json.dump`` + fsync of the file). Measured: at 1,600 traced tests one save is ~96 ms, so a
+    suite-scale widen spent ~5 minutes rewriting an unchanged file, O(n²) in the widen's length.
+    Carried on the returned :class:`SessionBaseline` as ``pending_persist`` and merged by
+    :meth:`LazySessionBaseline.flush` into ONE save when the widen ends. Only THIS build's fresh
+    cells and outcomes — never a prior run's — so a flush can only add to what is on disk; a run
+    killed mid-widen loses this widen's cells and nothing else.
+    """
+
+    entries: dict[str, dict[str, Any]]
+    failing: tuple[str, ...]
+    inert: tuple[str, ...]
+    outcomes: tuple[str, ...]
+    outcome_fps: dict[str, str]
+    ids: frozenset[str]
+
+    def merged(self, other: PendingPersist) -> PendingPersist:
+        return PendingPersist(
+            {**self.entries, **other.entries},
+            self.failing + other.failing,
+            self.inert + other.inert,
+            self.outcomes + other.outcomes,
+            {**self.outcome_fps, **other.outcome_fps},
+            self.ids | other.ids,
+        )
+
+
 class SessionBaseline:
     """The suite-global half of the baseline, computed ONCE per session.
 
@@ -2981,6 +3014,7 @@ class SessionBaseline:
         "identity_standing",
         "identity_conflicts",
         "proof_basis",
+        "pending_persist",
     )
 
     def __init__(
@@ -2996,6 +3030,9 @@ class SessionBaseline:
         replayed: set[str] | None = None,
     ) -> None:
         self.traced = traced
+        # Cells a `persist=False` build held back from the trace cache (see `PendingPersist`); None
+        # when the build persisted itself or had nothing to write.
+        self.pending_persist: PendingPersist | None = None
         self.failing = failing
         self.inert = inert
         self.n_tests = n_tests
@@ -3113,7 +3150,15 @@ class LazySessionBaseline:
     Whatever wraps this must therefore live in the closure, not around the site that stores it.
     """
 
-    __slots__ = ("_build", "_value", "_built", "_budgets", "_regime_digest")
+    __slots__ = (
+        "_build",
+        "_value",
+        "_built",
+        "_budgets",
+        "_regime_digest",
+        "_pending",
+        "_batched",
+    )
 
     def __init__(
         self,
@@ -3128,6 +3173,19 @@ class LazySessionBaseline:
         self._value: SessionBaseline | None = None
         self._built = False
         self._budgets = budgets
+        # Cells held back by `expand(..., persist=False)`, written once by `flush()`.
+        self._pending: list[PendingPersist] = []
+        # Whether the build closure can hold persistence back at all (`persist=` / `carry=`). The
+        # production closure (Wesker.ci) can; a test's bare closure or an older seam may not — then a
+        # batched expand degrades to the per-step save rather than guessing at the closure's kwargs.
+        # Probed ONCE by signature, never by catching a TypeError from a call that may have done work.
+        try:
+            import inspect as _inspect
+
+            _params = _inspect.signature(build).parameters
+            self._batched = "persist" in _params and "carry" in _params
+        except (TypeError, ValueError):
+            self._batched = False
         # The pytest execution-regime digest of THIS session's collection (#63), fixed when the
         # closure is stored — like the budgets above, readable without forcing the trace, so a cache
         # key can bind the regime a verdict was measured under before deciding to measure at all.
@@ -3299,7 +3357,7 @@ class LazySessionBaseline:
         self._value = self._build(candidates, fresh=True)
         self._built = True
 
-    def expand(self, more: list[Callable[..., None]]) -> bool:
+    def expand(self, more: list[Callable[..., None]], persist: bool = True) -> bool:
         """Widen a seeded baseline by measuring ``more`` and splicing them in — lazy widening.
 
         Nothing is dropped (``affected`` is empty): the existing seeded coverage stays and the new
@@ -3311,6 +3369,12 @@ class LazySessionBaseline:
         under-report coverage, and an under-covered test is one the mutation loop never runs — a
         false survivor. So the widening can be skipped (the next read re-traces in full) but can
         never be half-applied.
+
+        ``persist=False`` holds this step's trace-cache write back (`PendingPersist`) for one
+        :meth:`flush` at the widen's end — the per-step save was a full rewrite of the whole cache
+        per single-test batch, O(n²) over a widen. Honoured only when the build closure takes the
+        batching parameters (``_batched``); otherwise the step persists itself as before, so a cell
+        is never lost to an older seam.
         """
         if not self._built or self._value is None or not more:
             return False
@@ -3320,12 +3384,41 @@ class LazySessionBaseline:
             # from `_tests_for`, hiding a real kill as a false survivor (#Fix-B/#20) — the one thing
             # the widen exists to prevent. The seed's own reach is freshened separately by
             # `freshen_proof`; the widened tests have no such pass, so they must be fresh here.
-            partial = self._build(more, fresh=True)
+            if persist or not self._batched:
+                partial = self._build(more, fresh=True)
+            else:
+                partial = self._build(more, fresh=True, persist=False)
+                held = getattr(partial, "pending_persist", None)
+                if held is not None:
+                    self._pending.append(held)
             self._value = self._value.replaced(
                 set(), set(), partial, self._value.n_tests + partial.n_tests
             )
         except Exception:  # noqa: BLE001 — see `refresh`: correctness over speed
             self.invalidate()
+            return False
+        return True
+
+    def flush(self) -> bool:
+        """Write every cell :meth:`expand` held back, in ONE save. True if something was written.
+
+        Runs a persisting build over NO tests with the merged held-back data as ``carry``: the build
+        loads the cache, merges the carried cells and outcomes as if it had measured them, and saves
+        once (its checkpoint is skipped — nothing was traced). Best-effort like `trace_cache.save`
+        itself: a failure drops the pending cells (they were routing evidence for a LATER run, never
+        this run's proof basis) and returns False. A no-op when nothing is pending or the closure
+        cannot batch.
+        """
+        if not self._pending or not self._batched:
+            self._pending = []
+            return False
+        merged = self._pending[0]
+        for held in self._pending[1:]:
+            merged = merged.merged(held)
+        self._pending = []
+        try:
+            self._build([], fresh=True, persist=True, carry=merged)
+        except Exception:  # noqa: BLE001 — persistence is best-effort; the measurement already stands
             return False
         return True
 
@@ -3456,8 +3549,17 @@ def build_session_baseline(
     fresh: bool = False,
     regime_digest: str = "",
     within_run: dict | None = None,
+    persist: bool = True,
+    carry: PendingPersist | None = None,
 ) -> SessionBaseline:
     """Run the suite-global baseline passes ONCE. See :class:`SessionBaseline`.
+
+    ``persist=False`` measures exactly as before but writes NOTHING to the persistent cache: the
+    build's fresh cells and outcomes ride out on the result as ``pending_persist`` (see
+    :class:`PendingPersist`) for the caller to merge and write once — the item-incremental widen's
+    per-step save was a full rewrite of the whole cache per single-test batch. ``carry`` is that
+    merged held-back data handed to a later persisting build (typically over NO tests), which writes
+    it alongside its own; the flush therefore costs one save, not one per step.
 
     ``project_root`` turns on the PERSISTENT cache (`Wesker.trace_cache`) and is the difference
     between once-per-session and once-per-suite-state. Both passes here measure constants, and a
@@ -3532,7 +3634,13 @@ def build_session_baseline(
     )
     entries_out = dict(persisted_cache or {})
     entries_out.update(cache or {})
-    if project_root and cache is not None:
+    if carry is not None:
+        # A batched widen's held-back cells (`PendingPersist`), written as if THIS build measured
+        # them — it is the persisting build the flush hands them to.
+        entries_out.update(carry.entries)
+    # The checkpoint protects a trace that was just PAID FOR: skipped when persistence is held back
+    # (the flush writes once) and when nothing was traced (a flush build over no tests).
+    if persist and project_root and cache is not None and test_functions:
         # CHECKPOINT REACH BEFORE the second (plain outcome) pass. An interruption there must not
         # erase the exact trace just paid for. Outcome qualification is separately keyed per TestId
         # below, so a checkpointed item with no outcome is re-run, never assumed green (#15/#17).
@@ -3582,22 +3690,50 @@ def build_session_baseline(
                 # narrower thing failing_on_baseline reports to a human. Other outcomes
                 # are ambiguous and are barred from attribution without accusation.
                 failing.append(test_id)
-    if project_root and cache is not None:
+    pending: PendingPersist | None = None
+    if project_root and cache is not None and not persist:
+        # HELD BACK (a batched widen step): nothing touches the disk; this build's own fresh cells
+        # and outcomes ride out on the result for `LazySessionBaseline.flush` to write once.
+        pending = PendingPersist(
+            dict(cache),
+            tuple(failing),
+            tuple(current_inert),
+            tuple(sorted(current_outcomes)),
+            dict(current_outcome_fps),
+            frozenset(current_ids),
+        )
+    elif project_root and cache is not None:
         # Persist the individually COMPLETE cells even when a sibling was cut. `trace_suite` never
         # inserts a cut cell, so that TestId remains absent/UNKNOWN on the next run; discarding the
         # other N-1 exact observations because one item timed out defeats per-TestId routing and is
         # unnecessary. What is forbidden is persisting the CUT item, not the safe remainder (#15).
         # Replace the current subset's outcome cells and preserve every other TestId. This is the
         # outcome analogue of the trace splice above; exact identities make partial persistence
-        # deterministic rather than all-or-nothing.
-        failing_out = [tid for tid in prior_failing if tid not in current_ids] + failing
-        inert_out = [
-            tid for tid in prior_inert if tid not in current_ids
-        ] + current_inert
-        outcomes_out = sorted((prior_outcome_set - current_ids) | current_outcomes)
+        # deterministic rather than all-or-nothing. A `carry` (held-back cells from batched widen
+        # steps) is merged as part of the current subset: its TestIds are replaced, not duplicated.
+        carried_ids: frozenset[str] = carry.ids if carry is not None else frozenset()
+        replaced_ids = current_ids | carried_ids
+        carried_failing = list(carry.failing) if carry is not None else []
+        carried_inert = list(carry.inert) if carry is not None else []
+        carried_outcomes = set(carry.outcomes) if carry is not None else set()
+        failing_out = (
+            [tid for tid in prior_failing if tid not in replaced_ids]
+            + carried_failing
+            + failing
+        )
+        inert_out = (
+            [tid for tid in prior_inert if tid not in replaced_ids]
+            + carried_inert
+            + current_inert
+        )
+        outcomes_out = sorted(
+            (prior_outcome_set - replaced_ids) | carried_outcomes | current_outcomes
+        )
         outcome_fps_out = {
-            tid: fp for tid, fp in prior_outcome_fps.items() if tid not in current_ids
+            tid: fp for tid, fp in prior_outcome_fps.items() if tid not in replaced_ids
         }
+        if carry is not None:
+            outcome_fps_out.update(carry.outcome_fps)
         outcome_fps_out.update(current_outcome_fps)
         trace_cache.save(
             project_root,
@@ -3629,6 +3765,7 @@ def build_session_baseline(
     _sb.identity_standing = _standing
     _sb.identity_conflicts = _conflicts
     _sb.proof_basis = _basis
+    _sb.pending_persist = pending
     return _sb
 
 
@@ -5758,7 +5895,12 @@ def next_routing_action(
     * ``has_remaining_items`` — an eligible test remains that MIGHT discharge an obligation:
       ``"trace_next"``, widen one more stratum/micro-batch and re-evaluate.
     * otherwise every eligible unknown was traced and an obligation still stands — ``"gap"``: the
-      honest specification gap, sound precisely because the unknown set is now exhausted.
+      honest specification gap, sound relative to the ELIGIBLE set — the strata the driver handed
+      over as ``widen_tests``, its APPLICABLE set, not the whole collection. Discovery is an
+      efficiency device for finding ONE function's applicable tests, never a proof of a negative over
+      the suite; Detective (2026-09-05) hands over the ``caller_reaches`` stratum only and discloses
+      the rest as "not consulted", so a missed dynamic reacher under-counts the floor (one redundant
+      generated test), never the ceiling. The driver states that boundary; this rule is sound within it.
     """
     if not has_open_obligations:
         return "complete"
@@ -6129,7 +6271,7 @@ def run_function_profiling(
     #
     # The widen ALSO fires when a target line is not yet covered by the seed (closeout, line axis):
     # a mutant-less executable line reached only by an UNKNOWN test would otherwise read as a false
-    # line gap. One `expand` traces every unknown, so a single fire completes BOTH the kill matrix
+    # line gap. One `expand` traces every unknown the DRIVER handed over, so a single fire completes BOTH the kill matrix
     # (survivors re-evaluated) and the line-coverage denominator, matching a full run on each axis.
     _covered_lines = {ln for lines in line_cov.values() for ln in lines}
     _lines_incomplete = bool(
@@ -6145,7 +6287,9 @@ def run_function_profiling(
     # additively — so the DISPOSITION equals the full-baseline disposition over whatever was traced
     # (the differential oracle pins it); early-stop only skips UNNEEDED tests, never a verdict. A
     # budget cut mid-widen is `unresolved` (non-gateable via `budget_exhausted`), never a false gap;
-    # a true gap is declared only once the unknown list is exhausted. Batch of 1 gives the tightest
+    # a true gap is declared only once that applicable list is exhausted (the driver
+    # decides which strata to hand over — Detective: `caller_reaches` only, the rest disclosed as not
+    # consulted — so the gap is sound relative to its APPLICABLE set, never a claim about the suite). Batch of 1 gives the tightest
     # early-stop and the least exposure to a single hanging integration test (#19-adjacent).
     _remaining_widen = (
         list(widen_tests)
@@ -6173,7 +6317,8 @@ def run_function_profiling(
         # `_remaining_widen` is non-empty only when the holder is non-None (they are set together
         # above), so this narrowing always holds; the assert states the invariant for reader and ty.
         assert _widen_holder is not None
-        _widen_holder.expand(_batch)
+        # Persistence is held back per micro-batch and flushed ONCE after the loop (O(n), not O(n²)).
+        _widen_holder.expand(_batch, persist=False)
         # The widen runs tests and can cross the aggregate deadline even with NO survivors to enter
         # the loop below (line-only closeout). Consume that elapsed signal here; a cut unknown
         # partition is unresolved and can never remain gateable (#15 closeout #6).
@@ -6208,8 +6353,9 @@ def run_function_profiling(
         for _mid, _mutant in list(_survivor_mutants.items()):
             if budget_ms is not None and _elapsed(start) > budget_ms:
                 # A cut widen leaves some survivors NOT re-evaluated against the unknowns
-                # (closeout #6): a negative gap is only valid once every unknown is resolved, so
-                # mark the run exhausted — non-gateable, never a false gap or a synthesis target.
+                # (closeout #6): a negative gap is only valid once every APPLICABLE unknown the
+                # driver handed over is resolved, so mark the run exhausted — non-gateable, never a
+                # false gap or a synthesis target.
                 budget_exhausted = True
                 break
             _remaining_ms = (
@@ -6268,6 +6414,13 @@ def run_function_profiling(
                     "elapsed_ms": round(_res.elapsed_ms, 1),
                 }
             )
+
+    # Persist the widen's observations ONCE, here — not once per micro-batch. Each per-step save
+    # rewrote the whole cache (json.dump + fsync): ~96 ms at 1,600 cells, ~5 minutes of a 42-minute
+    # run. Runs on every exit from the loop, cut included; a run killed mid-widen loses only this
+    # widen's cells, never a prior run's. Routing evidence for a SIBLING is what is written here.
+    if _widen_holder is not None:
+        _widen_holder.flush()
 
     per_cat = list(results_by_cat.values())
     total = sum(cr.total for cr in per_cat)
@@ -7043,7 +7196,7 @@ def run_function_converged(
     # one micro-batch at a time in stratum order, stopping the instant every obligation discharges. A
     # containment loss or a budget cut mid-widen ends it as `unresolved` (loop control only —
     # converged's own gateability path is unchanged), never a false gap; a true gap only once the
-    # unknowns are exhausted.
+    # APPLICABLE unknowns — the strata the driver handed over — are exhausted.
     _remaining_widen = (
         list(widen_tests)
         if (
@@ -7069,7 +7222,8 @@ def run_function_converged(
         _batch, _remaining_widen = _remaining_widen[:1], _remaining_widen[1:]
         # `_remaining_widen` is non-empty only when the holder is non-None (set together above).
         assert _widen_holder is not None
-        _widen_holder.expand(_batch)
+        # Persistence is held back per micro-batch and flushed ONCE after the loop (O(n), not O(n²)).
+        _widen_holder.expand(_batch, persist=False)
         _wt: set[str] = set()
         _wu: set[str] = set()
         _tests_for, line_cov, exec_lines, failing = _build_test_scope(
@@ -7148,6 +7302,10 @@ def run_function_converged(
                 if _res.killed_by == "assertion":
                     dims_pinned.add(_dk)
             del _survivor_mutants[_mid]
+
+    # One save for the whole widen — see the same site in `run_function_profiling`.
+    if _widen_holder is not None:
+        _widen_holder.flush()
 
     # Aggregate by category
     results_by_cat: dict[MutationCategory, CategoryResult] = {}

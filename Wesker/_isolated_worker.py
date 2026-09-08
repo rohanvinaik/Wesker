@@ -38,30 +38,48 @@ from Wesker.isolation import aggregate_kill_reason, classify_kill_reason
 
 
 def _build_mutant(target_file: str, func_name: str, mutant_source: str) -> Any | None:
-    """Compile the mutant with the target module's globals in scope (#19).
+    """Compile in the namespace pytest actually imported for this source.
 
-    Without them a function that calls a module-level helper raises ``NameError`` under EVERY
-    mutant — a false all-crash 100% that hides whether the mutation is actually caught (the reason
-    ``evaluate_mutant`` seeds the same namespace). Returns None if the file/name cannot be resolved
-    or the mutant will not compile — the caller reports ``constructed=False`` so the engine scores it
-    ``harness_error`` (outside the denominator), never a survivor.
+    Relative imports, dataclasses and namespace packages use their real module identity.
+    A flat module not imported during collection retains the standalone fallback, with
+    normal sys.modules registration while its module body executes.
     """
+    from types import ModuleType
+
     from Wesker.engine import _entry_probe
 
-    spec = importlib.util.spec_from_file_location("_wesker_mutant_target", target_file)
-    if spec is None or spec.loader is None:
-        return None
-    module = importlib.util.module_from_spec(spec)
+    target = os.path.realpath(target_file)
+    module = next(
+        (
+            candidate
+            for candidate in list(sys.modules.values())
+            if isinstance(candidate, ModuleType)
+            and isinstance(vars(candidate).get("__file__"), str)
+            and os.path.realpath(vars(candidate)["__file__"]) == target
+        ),
+        None,
+    )
     try:
-        spec.loader.exec_module(module)
+        if module is None:
+            name = "_wesker_mutant_target"
+            spec = importlib.util.spec_from_file_location(name, target_file)
+            if spec is None or spec.loader is None:
+                return None
+            module = importlib.util.module_from_spec(spec)
+            previous = sys.modules.get(name)
+            sys.modules[name] = module
+            try:
+                spec.loader.exec_module(module)
+            finally:
+                if previous is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = previous
         namespace: dict[str, Any] = dict(vars(module))
         exec(compile(mutant_source, "<mutant>", "exec"), namespace)  # noqa: S102
-    except Exception:  # noqa: BLE001 — a mutant that will not compile installs nothing
+    except Exception:  # noqa: BLE001 — construction failure is unmeasured, never adequacy
         return None
     obj = namespace.get(func_name)
-    # Wrap so ENTERING the mutant is observable (#18), exactly as `evaluate_mutant` does in-process:
-    # `.entered` flips True on the first call, so a mutant installed but never reached (a decorator/
-    # capture/registry holding the original) is seen as not_entered, not a false survivor.
     return _entry_probe(obj) if obj is not None else None
 
 
@@ -76,7 +94,15 @@ class _MutantPlugin:
     ``KeyboardInterrupt``/``SystemExit`` excluded exactly as it re-raises them.
     """
 
-    def __init__(self, mutated_obj: Any, func_qualname: str) -> None:
+    def __init__(
+        self,
+        mutated_obj: Any,
+        func_qualname: str,
+        target_file: str = "",
+        mutant_source: str = "",
+    ) -> None:
+        self._target_file = target_file
+        self._mutant_source = mutant_source
         self._mutated = mutated_obj
         self._qualname = func_qualname
         self._func_name = func_qualname.split(".")[-1]
@@ -92,12 +118,20 @@ class _MutantPlugin:
         #: CUT, not a kill: the measurement could not complete, so the engine marks it non-gateable.
         self.memory_cut = False
 
+    def pytest_collection_finish(self, session: Any) -> None:
+        """Compile after pytest establishes the actual package/import regime."""
+        if self._mutant_source:
+            self._mutated = _build_mutant(
+                self._target_file, self._func_name, self._mutant_source
+            )
+
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_call(self, item: Any) -> Any:
         from Wesker.engine import (
             _execution_guard,
             _is_declared_failure,
             _patch_mutant_into_test,
+            _patch_module_qualified,
             _unpatch_mutant,
         )
 
@@ -106,16 +140,21 @@ class _MutantPlugin:
             yield
             return
         with _execution_guard() as proof:
+            module_saved = _patch_module_qualified(
+                proof, self._func_name, self._mutated, self._target_file, self._qualname
+            )
             patched, saved, target = _patch_mutant_into_test(
                 proof, test_fn, self._qualname, self._mutated
             )
-            if patched:
+            if patched or module_saved:
                 self.installed = True
             self.ran += 1
             try:
                 outcome = yield
             finally:
                 _unpatch_mutant(proof, patched, saved, target, self._func_name)
+                for owner, original in reversed(module_saved):
+                    setattr(owner, self._func_name, original)
         self._record(item, outcome, _is_declared_failure)
 
     def _record(self, item: Any, outcome: Any, is_declared_failure: Any) -> None:
@@ -142,9 +181,23 @@ class _MutantPlugin:
         reason = classify_kill_reason(
             isinstance(exc, AssertionError), bool(is_declared_failure(exc))
         )
+        previous = aggregate_kill_reason(self.reasons)
         self.reasons.append(reason)
-        if self.first_failing_node is None:
+        # Credit the node supplying the strongest reason, never a preceding crash
+        # that would otherwise borrow a later assertion's value-kill attribution.
+        if (
+            self.first_failing_node is None
+            or aggregate_kill_reason(self.reasons) != previous
+        ):
             self.first_failing_node = getattr(item, "nodeid", None)
+        # Like the in-process evaluator, stop once a value kill is established.
+        # Otherwise a later slow test can time out the worker and erase the already
+        # observed assertion. shouldfail ends pytest with TESTS_FAILED, preserving it.
+        if (
+            reason in ("assertion", "exception")
+            and getattr(item, "session", None) is not None
+        ):
+            item.session.shouldfail = "mutation distinguished by a value assertion"
 
 
 def _resolve_target(root: str, target_file: str) -> str:
@@ -165,8 +218,7 @@ def _evaluate_full(
     server mode, it cannot land in the JSON-line protocol on stdout; ``--capture=sys`` keeps the same
     isolation at the Python level without touching descriptor 1, the protocol channel.
     """
-    mutated = _build_mutant(target_abspath, func_qualname.split(".")[-1], mutant_source)
-    plugin = _MutantPlugin(mutated, func_qualname)
+    plugin = _MutantPlugin(None, func_qualname, target_abspath, mutant_source)
     with (
         contextlib.redirect_stdout(io.StringIO()),
         contextlib.redirect_stderr(io.StringIO()),
@@ -178,13 +230,13 @@ def _evaluate_full(
     return {
         "rc": int(rc),
         "killed_by": aggregate_kill_reason(plugin.reasons) or None,
-        "constructed": mutated is not None,
+        "constructed": plugin._mutated is not None,
         "test_name": plugin.first_failing_node,
         # Installation-and-entry proof (#18): the engine feeds these to `mutant_disposition` so an
         # installed-but-never-entered mutant scores `not_entered`, outside the denominator.
         "installed": plugin.installed,
         "ran": plugin.ran,
-        "entered": bool(getattr(mutated, "entered", False)),
+        "entered": bool(getattr(plugin._mutated, "entered", False)),
         # W#21: this mutant hit the worker's address-space cap — a budget CUT, not a kill.
         "memory_cut": plugin.memory_cut,
     }

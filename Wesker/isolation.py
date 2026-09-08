@@ -51,6 +51,17 @@ _THREAD_NAMES = frozenset({"threading", "_thread", "Thread", "start_new_thread"}
 _SIGNAL_NAMES = frozenset({"signal", "setitimer", "sigwait", "pthread_kill"})
 
 
+def isolated_test_selection(node_id: str, has_plain_source: bool) -> str:
+    """Select only test identities the isolated collector can verify (#B/#19, pure — pinned)."""
+    if node_id.startswith("legacy:"):
+        return "unavailable"
+    if "::" in node_id:
+        return "recorded"
+    if has_plain_source and node_id.isidentifier():
+        return "collect_plain"
+    return "unavailable"
+
+
 def isolated_test_outcome(returncode: int, timed_out: bool) -> str:
     """Map an isolated pytest run's exit to a typed outcome (#19, pure — pinned).
 

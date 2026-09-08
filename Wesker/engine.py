@@ -5864,10 +5864,35 @@ def _evaluate_isolated(
     the hang bound instead; `select` returns the instant the worker answers, so the generous floor
     costs a normal mutant nothing and only bounds a true runaway.
     """
-    from Wesker.ci import callable_test_id
+    import os
+    from dataclasses import replace
+
+    from Wesker.ci import callable_node_id, callable_origin, callable_test_id
+    from Wesker.isolation import isolated_test_selection
 
     root, target, qualname, recycle_cap, mem_limit = iso_ctx
-    node_ids = [tid for c in scoped_tests if "::" in (tid := callable_test_id(c))]
+    node_ids = []
+    identities = {}
+
+    def selector_key(selector):
+        path, separator, case = selector.partition("::")
+        return os.path.realpath(os.path.join(root, path)) + separator + case
+
+    for call in scoped_tests:
+        raw = callable_node_id(call)
+        origin = callable_origin(call)
+        code = getattr(call, "__code__", None)
+        plain = bool(origin and code is not None and code.co_name == raw)
+        selection = isolated_test_selection(raw, plain)
+        if selection == "unavailable":
+            return (
+                MutantResult(mutant=mutant, killed=False, constructed=False),
+                worker,
+                None,
+            )
+        selector = f"{origin}::{raw}" if selection == "collect_plain" else raw
+        node_ids.append(selector)
+        identities[selector_key(selector)] = callable_test_id(call)
     if not node_ids:
         return MutantResult(mutant=mutant, killed=False, elapsed_ms=0.0), worker, None
     if (
@@ -5887,6 +5912,10 @@ def _evaluate_isolated(
     timeout_s = max(per_mutant_timeout_ms / 1000.0, _ISOLATED_MIN_TIMEOUT_S)
     t0 = time.monotonic()
     run = worker.evaluate(source, timeout_s, node_ids=node_ids)
+    if run.test_name:
+        run = replace(
+            run, test_name=identities.get(selector_key(run.test_name), run.test_name)
+        )
     return _isolated_result(mutant, run, _elapsed(t0)), worker, run
 
 
@@ -6582,7 +6611,11 @@ def run_function_profiling(
         killed_records=killed_records,
         budget_exhausted=budget_exhausted,
         is_gateable=_measurement_gateable(
-            True,
+            not any(
+                cr.unscored_by.get(reason, 0)
+                for cr in per_cat
+                for reason in ("harness_error", "not_installed", "not_entered")
+            ),
             _contained,
             not budget_exhausted,
             _identity_standing != "ambiguous",
@@ -6595,7 +6628,7 @@ def run_function_profiling(
         # from the mutation loop OR the baseline trace (#19): the depth must not read "profiled"
         # when the run stopped short or ran against a live abandoned worker. is_gateable already
         # reflects both; coverage_depth now agrees.
-        coverage_depth="cut" if (budget_exhausted or not _contained) else "profiled",
+        coverage_depth="cut" if budget_exhausted or not _contained else "profiled",
         # Which execution mode measured this (#19): `isolated` ran each mutant in a killable worker
         # PROCESS — containment is a real guarantee — while `in_process` shares the interpreter and
         # can only ASK a runaway thread to stop. `execution_mode_standing` (4c) turns this into a

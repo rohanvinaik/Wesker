@@ -77,6 +77,15 @@ def conflicting_module_names(
     listed twice is one file observed twice, not two (origins accumulate per sighting); a name
     with no origins never participated, and flagging it would refuse verdicts over nothing; and
     a clean name alongside a dirty one must not drag the clean one into the refusal.
+
+    CANONICALISATION IS THE CALLER'S, deliberately. This compares the spellings it is given and
+    does not resolve them, because resolving here would make a pure decision read the filesystem.
+    So two spellings of ONE file — `/var/x.py` and `/private/var/x.py`, the macOS symlink — must be
+    canonicalised by whoever builds `module_origins`, or this reports a conflict where there is only
+    a symlink. That is the defect measured in #15, and it is the false-REFUSAL direction: a run that
+    was fine is told its identity is ambiguous, and nothing it computes can be gated on.
+    (Recorded here 2026-09-09, carried over from Detective's now-deleted duplicate of this decision
+    — the caveat was written there and would otherwise have been lost with it.)
     """
     return tuple(
         sorted(name for name, files in module_origins.items() if len(set(files)) > 1)

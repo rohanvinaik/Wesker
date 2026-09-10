@@ -33,6 +33,12 @@ moving from Beta to Production/Stable.
 ### Housekeeping
 
 - CI matrix across Python versions and operating systems; agent files excluded from the sdist.
+- **The sdist is checked against git rather than trusted to an exclude list**, via
+  `scripts/check_sdist.py`, in CI and before every publish. Wesker's sdist was already clean, which
+  is a fact about what happens to be in the tree rather than a property of the build: the note in
+  `pyproject.toml` claiming hatchling excludes VCS-ignored files by default has been corrected,
+  because that holds for the **root** `.gitignore` only and a nested one is not consulted. Detective
+  hit the real version of this and nearly published 110 MB of gitignored Lean build output.
 - `pylint`-as-Sonar configuration baked into `pyproject.toml` so the pre-push gate is reproducible
   rather than reconstructed per session; the local SonarQube recipe recorded.
 - `session_manifest.conflicting_module_names` gained the canonicalisation caveat it needed:

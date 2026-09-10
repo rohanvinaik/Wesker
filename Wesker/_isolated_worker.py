@@ -77,7 +77,9 @@ def _build_mutant(target_file: str, func_name: str, mutant_source: str) -> Any |
                     sys.modules[name] = previous
         namespace: dict[str, Any] = dict(vars(module))
         exec(compile(mutant_source, "<mutant>", "exec"), namespace)  # noqa: S102
-    except Exception:  # noqa: BLE001 — construction failure is unmeasured, never adequacy
+    # BLE001: a construction failure is UNMEASURED, never evidence of adequacy — the mutant could
+    # not be built, so there is nothing to conclude about the suite that would have faced it.
+    except Exception:  # noqa: BLE001
         return None
     obj = namespace.get(func_name)
     return _entry_probe(obj) if obj is not None else None

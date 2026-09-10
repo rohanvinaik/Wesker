@@ -48,6 +48,29 @@ jobs:
           name: coverage-report
           path: coverage.xml
 
+  package:
+    # The artifact gate. One cell: an sdist's CONTENTS do not vary by OS or interpreter.
+    #
+    # What it catches and what it cannot. In a fresh clone the working tree IS the tracked set, so
+    # this proves the build does not generate files into the tree and package them, and that no
+    # exclude has been dropped. It CANNOT catch untracked output sitting in a developer's tree and
+    # being swept in — CI has no such tree — which is the failure that nearly shipped a 38 MB
+    # Detective sdist. That one is caught only by running `python3 scripts/check_sdist.py` locally
+    # before publishing. A green job here is not a licence to skip the local run.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Build sdist and wheel
+        run: uv build --out-dir dist
+
+      - name: Sdist carries only tracked files
+        run: python3 scripts/check_sdist.py
+
   sonarcloud:
     name: SonarCloud
     runs-on: ubuntu-latest

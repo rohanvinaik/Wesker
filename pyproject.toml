@@ -57,6 +57,15 @@ path = "Wesker/__init__.py"
 # `.lintgate/` was riding along (737 files, some with absolute /Users/... paths) because it was the one
 # dot-tool dir not yet ignored. This second guard states the intent at the boundary itself: an artifact
 # that slips back into an un-ignored state still cannot ship. Regeneratable session state, never source.
+#
+# CORRECTED 2026-09-09 — "Hatchling excludes VCS-ignored files by default" is true only of the ROOT
+# `.gitignore`. A NESTED one is invisible to it: measured with a minimal probe project, a rule in
+# `nested/deep/.gitignore` was ignored and its target shipped, while the equivalent root rule held.
+# Detective hit this for real, packaging 6.9 GB of Lean build output that `git status` never showed.
+# So the sentence above states a guarantee over a subspace without saying it is one, which is why
+# the list below is the contract and `scripts/check_sdist.py` — which fails on any sdist member git
+# does not track — is what actually enforces it. Wesker has no nested .gitignore today; that is a
+# fact about the tree, not a property of the build, and it is the reason to check rather than not.
 [tool.hatch.build]
 exclude = [
     # Agent-instruction files carry absolute /Users/... paths and local agent-memory references —

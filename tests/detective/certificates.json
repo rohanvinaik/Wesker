@@ -3,5 +3,13 @@
     "function_digest": "cd8a3be413a6f79c",
     "refusal": "",
     "standing": "complete"
+  },
+  "Wesker/policy.py::mutation_policy": {
+    "cut_reasons": [
+      "mutant_construction_failed"
+    ],
+    "function_digest": "fb7f62c63ad4985a",
+    "refusal": "",
+    "standing": "ungateable"
   }
 }

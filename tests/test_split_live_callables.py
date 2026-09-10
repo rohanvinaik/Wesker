@@ -31,7 +31,8 @@ def _mk_caller(origin):
     itself (#15 B). Reaches the target transitively when `resolve` is passed in `caller_names`."""
 
     def t():
-        return resolve  # noqa: F821 — names a caller of the target, never executed
+        # F821: names a caller of the target, never executed
+        return resolve  # noqa: F821
 
     t.__wesker_origin__ = str(origin)
     return t

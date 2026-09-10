@@ -270,7 +270,8 @@ def capture_manifest(
     def _opt(name: str, default: str = "") -> str:
         try:
             return str(config.getoption(name))
-        except Exception:  # noqa: BLE001 — an absent option is not an error here
+        # BLE001: an absent option is not an error here
+        except Exception:  # noqa: BLE001
             return default
 
     try:

@@ -28,7 +28,8 @@ def _runaway(flag: dict) -> None:
     try:
         for i in range(10**9):
             flag["n"] = i
-    except BaseException:  # noqa: BLE001 — the injection unwinds through here
+    # BLE001: the injection unwinds through here
+    except BaseException:  # noqa: BLE001
         flag["unwound"] = True
 
 
@@ -60,9 +61,11 @@ def test_abandon_outranks_the_test_s_own_broad_except():
             try:
                 for _ in range(10**9):
                     pass
-            except Exception:  # noqa: BLE001 — the point of the test: this must NOT stop it
+            # BLE001: the point of the test: this must NOT stop it
+            except Exception:  # noqa: BLE001
                 pass
-        except BaseException:  # noqa: BLE001 — mirrors _target's own outer catch
+        # BLE001: mirrors _target's own outer catch
+        except BaseException:  # noqa: BLE001
             pass
 
     t = _spawn(_swallower)

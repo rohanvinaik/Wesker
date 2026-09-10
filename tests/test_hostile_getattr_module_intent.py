@@ -47,7 +47,8 @@ class _HostileProxy:
 class _HostileModule(types.ModuleType):
     """A `sys.modules` entry that returns a proxy for every attribute name, torch._classes-style."""
 
-    def __getattr__(self, name: str):  # noqa: D401 — any name resolves, never AttributeError
+    # D401: any name resolves, never AttributeError
+    def __getattr__(self, name: str):  # noqa: D401
         return _HostileProxy(name)
 
 

@@ -128,7 +128,8 @@ def _runaway(flag: dict, stop: threading.Event) -> None:
         while not stop.is_set():
             flag["n"] = i
             i += 1
-    except BaseException:  # noqa: BLE001 — the injection unwinds through here
+    # BLE001: the injection unwinds through here
+    except BaseException:  # noqa: BLE001
         flag["unwound"] = True
 
 

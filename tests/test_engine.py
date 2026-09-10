@@ -581,7 +581,8 @@ def _exec_mutant(mutant) -> dict:
     mod = ast.Module(body=[mutant.mutated_node], type_ignores=[])
     ast.fix_missing_locations(mod)
     ns: dict = {}
-    exec(compile(mod, "<mutant>", "exec"), ns)  # noqa: S102 — test-local exec
+    # S102: test-local exec
+    exec(compile(mod, "<mutant>", "exec"), ns)  # noqa: S102
     return ns
 
 

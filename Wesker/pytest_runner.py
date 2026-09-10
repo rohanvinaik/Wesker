@@ -143,7 +143,8 @@ def _reset_item(item: Any) -> None:
                 continue
             try:
                 fixturedef.finish(request)
-            except BaseException:  # noqa: BLE001,S110 — stale teardown; see docstring
+            # BLE001,S110: stale teardown; see docstring
+            except BaseException:  # noqa: BLE001,S110
                 pass
     init = getattr(item, "_initrequest", None)
     if init is not None:
@@ -367,7 +368,8 @@ def run_in_session(
                 box["manifest_token"] = _LAST_MANIFEST.set(
                     capture_manifest(session, config, items)
                 )
-            except Exception:  # noqa: BLE001 — a manifest that raises breaks a working run
+            # BLE001: a manifest that raises breaks a working run
+            except Exception:  # noqa: BLE001
                 pass
             # Surface the collection errors this live session captured (a test that failed to COLLECT
             # is silently absent from the routed suite, so its target's COMPLETE claim is unsafe).
@@ -380,7 +382,8 @@ def run_in_session(
                 _LAST_COLLECTION_ERRORS.set(
                     tuple(nid for nid, _ in collect_errors.errors)
                 )
-            except Exception:  # noqa: BLE001 — describing the run must not fail the run
+            # BLE001: describing the run must not fail the run
+            except Exception:  # noqa: BLE001
                 pass
 
         def pytest_runtestloop(self, session):  # type: ignore[no-untyped-def]
@@ -411,7 +414,8 @@ def run_in_session(
                         box["result"] = body(calls, session)
                 else:
                     box["result"] = body(calls, session)
-            except BaseException as exc:  # noqa: BLE001 — captured to re-raise below
+            # BLE001: captured to re-raise below
+            except BaseException as exc:  # noqa: BLE001
                 # pytest.main would otherwise absorb this (SystemExit especially) and the
                 # caller would see an indistinguishable None. Stash and re-raise outside.
                 box["exc"] = exc

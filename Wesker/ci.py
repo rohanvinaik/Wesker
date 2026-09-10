@@ -1492,7 +1492,8 @@ def refresh_live_suite(project_root: str, path: str) -> int:
         from Wesker.pytest_discovery import collect_pytest_callables
 
         fresh = list(collect_pytest_callables(project_root, paths=[target]) or [])
-    except Exception:  # noqa: BLE001 — a failed refresh must not fail the caller's run
+    # BLE001: a failed refresh must not fail the caller's run
+    except Exception:  # noqa: BLE001
         fresh = []
     for c in fresh:
         with contextlib.suppress(Exception):  # builtins/C callables reject attributes

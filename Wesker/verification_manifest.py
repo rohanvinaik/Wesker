@@ -38,5 +38,6 @@ def pytest_collection_modifyitems(session: Any, config: Any, items: list[Any]) -
         }
         with open(out, "w", encoding="utf-8") as fh:
             json.dump(payload, fh)
-    except Exception:  # noqa: BLE001 — a manifest that raises must not fail the verification
+    # BLE001: a manifest that raises must not fail the verification
+    except Exception:  # noqa: BLE001
         pass

@@ -190,5 +190,6 @@ def nodes_equivalent(original_node: Any, mutant_node: Any) -> bool:
     """
     try:
         return bytecode_equivalent(ast.unparse(original_node), ast.unparse(mutant_node))
-    except Exception:  # noqa: BLE001 — an optimisation must never fail the run
+    # BLE001: an optimisation must never fail the run
+    except Exception:  # noqa: BLE001
         return False

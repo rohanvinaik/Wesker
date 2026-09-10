@@ -289,7 +289,8 @@ def collect_pytest_callables(
                 from Wesker.session_manifest import capture_manifest
 
                 _LAST_MANIFEST.set(capture_manifest(session, config, items))
-            except Exception:  # noqa: BLE001 — a manifest that raises breaks a working run
+            # BLE001: a manifest that raises breaks a working run
+            except Exception:  # noqa: BLE001
                 pass
 
     # Evict already-imported test modules whose source lives under any collection

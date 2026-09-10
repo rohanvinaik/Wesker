@@ -3288,7 +3288,8 @@ class LazySessionBaseline:
         try:
             partial = self._build(retrace)
             self._value = self._value.replaced(affected, removed_ids, partial, n_tests)
-        except Exception:  # noqa: BLE001 — see DEGRADES above; correctness over speed
+        # BLE001: see DEGRADES above; correctness over speed
+        except Exception:  # noqa: BLE001
             self.invalidate()
             return False
         return True
@@ -3337,7 +3338,8 @@ class LazySessionBaseline:
             spliced.identity_conflicts = self._value.identity_conflicts
             spliced.proof_basis = self._value.proof_basis
             self._value = spliced
-        except Exception:  # noqa: BLE001 — see `refresh`: correctness over speed
+        # BLE001: see `refresh`: correctness over speed
+        except Exception:  # noqa: BLE001
             self.invalidate()
             return False
         return True
@@ -3394,7 +3396,8 @@ class LazySessionBaseline:
             self._value = self._value.replaced(
                 set(), set(), partial, self._value.n_tests + partial.n_tests
             )
-        except Exception:  # noqa: BLE001 — see `refresh`: correctness over speed
+        # BLE001: see `refresh`: correctness over speed
+        except Exception:  # noqa: BLE001
             self.invalidate()
             return False
         return True
@@ -3418,7 +3421,8 @@ class LazySessionBaseline:
         self._pending = []
         try:
             self._build([], fresh=True, persist=True, carry=merged)
-        except Exception:  # noqa: BLE001 — persistence is best-effort; the measurement already stands
+        # BLE001: persistence is best-effort; the measurement already stands
+        except Exception:  # noqa: BLE001
             return False
         return True
 
@@ -3872,7 +3876,8 @@ def _baseline_failures(
                     uncontained = True
                 if disposition != "usable":
                     inert.add(id(test_fn))
-            except Exception:  # noqa: BLE001 — an unrunnable baseline is itself inert
+            # BLE001: an unrunnable baseline is itself inert
+            except Exception:  # noqa: BLE001
                 inert.add(id(test_fn))
             finally:
                 _unpatch_mutant(_proof, patched, saved, patch_target, func_name)
@@ -4929,7 +4934,8 @@ def _live_collection_identity() -> tuple[
 
         manifest = last_session_manifest()
         scope = current_measurement_scope() or 0
-    except Exception:  # noqa: BLE001 — describing the run must not fail the run
+    # BLE001: describing the run must not fail the run
+    except Exception:  # noqa: BLE001
         return "unobserved", (), ()
     # Admit the manifest only if THIS live session captured it (#26). A prior project's collection
     # left in the ContextVar, or a collect-only manifest never stamped by a live session, is
@@ -5182,7 +5188,8 @@ def evaluate_mutant(
             namespace: dict[str, Any] = dict(
                 getattr(original_func, "__globals__", None) or {}
             )
-            exec(code, namespace)  # noqa: S102  # nosec B102 — intentional: compiling AST mutants
+            # S102: intentional: compiling AST mutants
+            exec(code, namespace)  # noqa: S102  # nosec B102
             func_name = getattr(mutant.mutated_node, "name", None)
             mutated_obj = namespace.get(func_name) if func_name else None
             if mutated_obj is not None:
@@ -5907,7 +5914,8 @@ def _evaluate_isolated(
         )
     try:
         source = ast.unparse(mutant.mutated_node)
-    except Exception:  # noqa: BLE001 — an un-unparseable mutant is un-evaluable: conservative survivor
+    # BLE001: an un-unparseable mutant is un-evaluable: conservative survivor
+    except Exception:  # noqa: BLE001
         return MutantResult(mutant=mutant, killed=False, elapsed_ms=0.0), worker, None
     timeout_s = max(per_mutant_timeout_ms / 1000.0, _ISOLATED_MIN_TIMEOUT_S)
     t0 = time.monotonic()
@@ -6820,12 +6828,14 @@ def _check_equivalent_wrapper(
                 pert_items = list(
                     itertools.islice(wrapped(*args), _GENERATOR_MATERIALIZE_CAP + 2)
                 )
-            except Exception:  # noqa: BLE001 — the original raised on this input; no codomain evidence
+            # BLE001: the original raised on this input; no codomain evidence
+            except Exception:  # noqa: BLE001
                 outcomes.append("raised")
                 continue
             outcomes.append("match" if pert_items == orig_items else "differ")
         return form_b_equivalence(outcomes) == "equivalent"
-    except Exception:  # noqa: BLE001 — a non-generator or un-compilable original is conservatively NOT equivalent
+    # BLE001: a non-generator or un-compilable original is conservatively NOT equivalent
+    except Exception:  # noqa: BLE001
         return False
 
 

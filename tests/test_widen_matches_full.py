@@ -73,14 +73,17 @@ def _run(node, tests, original, holder, **kw):
 def test_seed_widen_matches_full_baseline():
     node = _fn(_SRC)
     ns: dict = {}
-    exec(compile(ast.parse(_SRC), "<sw>", "exec"), ns)  # noqa: S102 — test fixture source
+    # S102: test fixture source
+    exec(compile(ast.parse(_SRC), "<sw>", "exec"), ns)  # noqa: S102
     original = ns["scoreit"]
 
     def test_true():
-        assert scoreit(1, 2, True) == 4  # noqa: F821 — flag=True branch only
+        # F821: flag=True branch only
+        assert scoreit(1, 2, True) == 4  # noqa: F821
 
     def test_false():
-        assert scoreit(5, 3, False) == 2  # noqa: F821 — flag=False branch only
+        # F821: flag=False branch only
+        assert scoreit(5, 3, False) == 2  # noqa: F821
 
     tests = [test_true, test_false]
     for t in tests:
@@ -116,7 +119,8 @@ def test_widen_with_no_survivors_is_a_noop():
     # must still match the full baseline.
     node = _fn(_SRC)
     ns: dict = {}
-    exec(compile(ast.parse(_SRC), "<sw2>", "exec"), ns)  # noqa: S102 — test fixture source
+    # S102: test fixture source
+    exec(compile(ast.parse(_SRC), "<sw2>", "exec"), ns)  # noqa: S102
     original = ns["scoreit"]
 
     def test_true():
@@ -165,7 +169,8 @@ def test_seed_widen_matches_full_baseline_on_run_function_profiling():
     # counts directly; this proves those updates reach the byte-identical matrix a full run produces.
     node = _fn(_SRC)
     ns: dict = {}
-    exec(compile(ast.parse(_SRC), "<swp>", "exec"), ns)  # noqa: S102 — test fixture source
+    # S102: test fixture source
+    exec(compile(ast.parse(_SRC), "<swp>", "exec"), ns)  # noqa: S102
     original = ns["scoreit"]
 
     def test_true():
@@ -253,20 +258,24 @@ def test_early_stop_skips_an_unneeded_widen_test():
     test_true+test_false is complete — 5/5 killed, 0 survivors — so batch 1 discharges everything.)"""
     node = _fn(_SRC)
     ns: dict = {}
-    exec(compile(ast.parse(_SRC), "<early>", "exec"), ns)  # noqa: S102 — test fixture source
+    # S102: test fixture source
+    exec(compile(ast.parse(_SRC), "<early>", "exec"), ns)  # noqa: S102
     original = ns["scoreit"]
 
     ran = {"extra": False}
 
     def test_true():
-        assert scoreit(1, 2, True) == 4  # noqa: F821 — flag=True branch only
+        # F821: flag=True branch only
+        assert scoreit(1, 2, True) == 4  # noqa: F821
 
     def test_false():
-        assert scoreit(5, 3, False) == 2  # noqa: F821 — kills the flag=False mutants (the needed widen)
+        # F821: kills the flag=False mutants (the needed widen)
+        assert scoreit(5, 3, False) == 2  # noqa: F821
 
     def extra_unused():
         ran["extra"] = True
-        assert scoreit(9, 9, True) == 27  # noqa: F821 — covers ONLY the already-covered flag=True branch
+        # F821: covers ONLY the already-covered flag=True branch
+        assert scoreit(9, 9, True) == 27  # noqa: F821
 
     tests = [test_true, test_false, extra_unused]
     for t in tests:

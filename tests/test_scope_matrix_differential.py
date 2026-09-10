@@ -84,7 +84,8 @@ def _bind(tests, original, name):
 def test_matrix_exact_with_a_non_covering_passing_test():
     node = _fn(_SCORE_SRC)
     ns: dict = {}
-    exec(compile(ast.parse(_SCORE_SRC), "<m>", "exec"), ns)  # noqa: S102 — test fixture source
+    # S102: test fixture source
+    exec(compile(ast.parse(_SCORE_SRC), "<m>", "exec"), ns)  # noqa: S102
     original = ns["scoreit"]
 
     def test_true():
@@ -108,7 +109,8 @@ def test_matrix_exact_with_a_non_covering_passing_test():
 def test_matrix_exact_with_a_baseline_failing_test_present():
     node = _fn(_SCORE_SRC)
     ns: dict = {}
-    exec(compile(ast.parse(_SCORE_SRC), "<m2>", "exec"), ns)  # noqa: S102 — test fixture source
+    # S102: test fixture source
+    exec(compile(ast.parse(_SCORE_SRC), "<m2>", "exec"), ns)  # noqa: S102
     original = ns["scoreit"]
 
     def test_true():
@@ -147,7 +149,8 @@ _BRANCHY_SRC = (
 def test_matrix_exact_on_a_multi_branch_function():
     node = _fn(_BRANCHY_SRC)
     ns: dict = {}
-    exec(compile(ast.parse(_BRANCHY_SRC), "<m3>", "exec"), ns)  # noqa: S102 — test fixture source
+    # S102: test fixture source
+    exec(compile(ast.parse(_BRANCHY_SRC), "<m3>", "exec"), ns)  # noqa: S102
     original = ns["classify"]
 
     def test_neg():

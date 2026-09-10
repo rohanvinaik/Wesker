@@ -166,7 +166,8 @@ def _darwin_resident_bytes() -> int:
         if libc.task_info(task, 20, ctypes.byref(info), ctypes.byref(count)) != 0:
             return 0
         return int(info.resident_size)
-    except Exception:  # noqa: BLE001 — an unavailable probe is not an error; it is degraded mode
+    # BLE001: an unavailable probe is not an error; it is degraded mode
+    except Exception:  # noqa: BLE001
         return 0
 
 

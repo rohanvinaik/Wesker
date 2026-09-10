@@ -215,14 +215,17 @@ def test_the_widen_loop_persists_once_at_its_end(tmp_path, monkeypatch):
     src_file = tmp_path / "scoreit_mod.py"
     src_file.write_text(_SRC, encoding="utf-8")
     ns: dict = {}
-    exec(compile(_SRC, str(src_file), "exec"), ns)  # noqa: S102 — test fixture source
+    # S102: test fixture source
+    exec(compile(_SRC, str(src_file), "exec"), ns)  # noqa: S102
     original = ns["scoreit"]
 
     def test_true():
-        assert scoreit(1, 2, True) == 4  # noqa: F821 — flag=True branch only
+        # F821: flag=True branch only
+        assert scoreit(1, 2, True) == 4  # noqa: F821
 
     def test_false():
-        assert scoreit(5, 3, False) == 2  # noqa: F821 — flag=False branch only
+        # F821: flag=False branch only
+        assert scoreit(5, 3, False) == 2  # noqa: F821
 
     def test_ua():
         assert len("ua") == 2  # reaches nothing of scoreit — an unrelated unknown

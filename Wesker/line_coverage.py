@@ -141,7 +141,8 @@ def _traced_in_thread(
         sys.settrace(dispatch)
         try:
             body()
-        except BaseException:  # noqa: BLE001 — a failing/raising/ABANDONED test still reached lines
+        # BLE001: a failing/raising/ABANDONED test still reached lines
+        except BaseException:  # noqa: BLE001
             pass
         finally:
             sys.settrace(previous)
@@ -283,7 +284,8 @@ def failing_on_baseline(
                 test_fn()
             except AssertionError:
                 failing.append(callable_test_id(test_fn))
-            except BaseException:  # noqa: BLE001,S110 — ambiguous (fixtures/imports); not a wrong assertion
+            # BLE001,S110: ambiguous (fixtures/imports); not a wrong assertion
+            except BaseException:  # noqa: BLE001,S110
                 pass
     return failing
 

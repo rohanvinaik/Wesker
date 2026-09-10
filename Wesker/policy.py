@@ -152,19 +152,6 @@ class MutationPolicy:
     categories: dict[str, dict[str, Any]]
     exclusions: tuple[str, ...]
     fingerprint_counts: dict[str, dict[str, int]]
-    # The DENOMINATOR for `categories` and `exclusions` (see `Wesker.language_surface`). Those two
-    # are a numerator: what somebody thought to declare. This is the census of every semantic slot
-    # in CPython's own AST grammar, each carrying exactly one disposition, checked against the
-    # RUNNING interpreter so a new language node breaks the build instead of passing unnoticed.
-    #
-    # Deliberately OUTSIDE the `policy_id` digest, and that is the load-bearing choice here. The
-    # fault model did not change when this landed — Wesker mutates exactly what it mutated before
-    # — so folding it into `policy_id` would invalidate every receipt and cached verdict in
-    # existence to record a change in BOOKKEEPING. It carries its own `surface_id` instead, which
-    # is what a consumer keys on when a claim depends on the coverage declaration rather than on
-    # the operators. Same reason Detective keeps `policy_id`, `transform_class_id` and its own
-    # census id apart: they are separate parameters of separate claims.
-    language_surface: dict[str, Any]
 
     def to_json(self) -> str:
         """Canonical serialization — stable key order, no whitespace variance."""
@@ -389,26 +376,4 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
         categories=manifest["categories"],
         exclusions=tuple(manifest["exclusions"]),
         fingerprint_counts=fingerprint,
-        language_surface=_language_surface_manifest(),
     )
-
-
-def _language_surface_manifest() -> dict[str, Any]:
-    """The coverage census, summarised for the policy manifest.
-
-    Carries the full ``unsupported`` list rather than only its count: a consumer deciding whether
-    a target sits inside the model needs the slots by name, and a bare number would be a summary
-    of exactly the thing that must not be summarised.
-    """
-    from .language_surface import SURFACE_CENSUS, surface_id, unsupported_slots
-
-    counts: dict[str, int] = {}
-    for disposition in SURFACE_CENSUS.values():
-        counts[disposition] = counts.get(disposition, 0) + 1
-    return {
-        "surface_id": surface_id(),
-        "derived_from": "CPython ast grammar (ASDL), checked against the running interpreter",
-        "slots": len(SURFACE_CENSUS),
-        "dispositions": counts,
-        "unsupported": list(unsupported_slots()),
-    }

@@ -1,4 +1,16 @@
 {
+  "Wesker/engine.py::_baseline_failures": {
+    "cut_reasons": [],
+    "function_digest": "9ed39ddb1a438d8f",
+    "refusal": "",
+    "standing": "incomplete"
+  },
+  "Wesker/engine.py::execution_lock_disposition": {
+    "cut_reasons": [],
+    "function_digest": "8f0703283b596e96",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/isolation.py::isolated_test_selection": {
     "function_digest": "cd8a3be413a6f79c",
     "refusal": "",

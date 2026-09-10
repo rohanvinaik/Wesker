@@ -3810,14 +3810,22 @@ def _baseline_failures(
     original_func: Callable[..., Any] | None,
     qualname: str | None,
     timeout_ms: float = 5000,
-) -> tuple[set[int], bool]:
+) -> tuple[set[int], set[str]]:
     """``id()`` of every test that FAILS against the UNMUTATED function, under
-    ``evaluate_mutant``'s own call convention, AND whether any probe went uncontained.
+    ``evaluate_mutant``'s own call convention, AND the NAMED reasons the baseline was compromised.
 
     The second element is not decoration. This runs the suite BEFORE any mutant exists, so an
     uncontained worker here poisons every measurement that follows — and the old ``set[int]``
     return had nowhere to say so, which is precisely why it said nothing and the caller
     reported a gateable profile over zero usable tests (#14).
+
+    NAMES, not a bool (2026-09-10). It carried a bare flag that the caller turned into the single
+    literal ``"baseline_probe"``. A second way to be compromised then had two bad options: borrow
+    that name and assert something false, or stay silent. Silent was measured and it was worse
+    than the hang it replaced — a run whose execution lock was unavailable reported
+    ``Incomplete: 5 killable · 0/14 killed``, i.e. "your suite is weak" for a run that measured
+    NOTHING. Distinct causes need distinct names; the set is consumed by emptiness, so adding one
+    reaches the containment verdict without any consumer needing to know it.
 
     Such a test fails no matter what the mutation does, so crediting it with a kill
     measures the harness, not the suite. It cannot distinguish correct code from a
@@ -3841,7 +3849,7 @@ def _baseline_failures(
     TypeError before reaching the function under test, identically on the original.
     """
     if original_func is None or not qualname:
-        return set(), False
+        return set(), set()
     func_name = qualname.split(".")[-1]
     # A baseline is only meaningful against the GENUINE original. Several callers
     # deliberately STUB original_func (e.g. ``lambda *_a: None``) when they only want
@@ -3851,37 +3859,54 @@ def _baseline_failures(
     # the callable must actually be the function we are mutating.
     probe = _unwrap_descriptor(original_func)
     if getattr(probe, "__name__", None) != func_name:
-        return set(), False
+        return set(), set()
     inert: set[int] = set()
-    uncontained = False
+    compromised: set[str] = set()
     for test_fn in test_functions:
         # THE GUARD BELONGS HERE TOO, and this is the site the proof requirement found. This
         # function patches the same namespaces through the same helpers as `evaluate_mutant`,
         # but it is NOT `evaluate_mutant`, so serializing that one left this one racing — the
         # sibling-path miss. Held across patch → run → restore, because a restore visible to
         # another thread is exactly the mid-test body change that was measured.
-        with _execution_guard() as _proof:
-            patched, saved, patch_target = _patch_mutant_into_test(
-                _proof, test_fn, qualname, original_func
-            )
-            try:
-                disposition = baseline_probe_disposition(
-                    _run_test_with_timeout(test_fn, probe, patched, timeout_ms)
+        # BOUNDED here, and only here. A thread parked in this acquire is the case `interrupt`'s
+        # BOUNDARY names: blocked outside the interpreter, so an `abandon` injection cannot land
+        # until the acquire returns on its own -- at which point the thread HOLDS the lock and
+        # dies owning it, orphaning it for the rest of the process. Giving up first is what stops
+        # that from being created, and `_NESTED_GUARD_S` is short because losing that race IS the
+        # mechanism -- not because a shorter wall is cheaper.
+        try:
+            with _execution_guard(timeout_s=_NESTED_GUARD_S) as _proof:
+                patched, saved, patch_target = _patch_mutant_into_test(
+                    _proof, test_fn, qualname, original_func
                 )
-                # An uncontained probe is BOTH: inert, because a test that never finished cannot
-                # be credited with distinguishing anything; and a containment failure, because
-                # the worker is still live. Recording only the first is the bug — it is what let
-                # a live thread read as an ordinary unrunnable test.
-                if disposition == "uncontained":
-                    uncontained = True
-                if disposition != "usable":
+                try:
+                    disposition = baseline_probe_disposition(
+                        _run_test_with_timeout(test_fn, probe, patched, timeout_ms)
+                    )
+                    # An uncontained probe is BOTH: inert, because a test that never finished
+                    # cannot be credited with distinguishing anything; and a containment failure,
+                    # because the worker is still live. Recording only the first is the bug — it
+                    # is what let a live thread read as an ordinary unrunnable test.
+                    if disposition == "uncontained":
+                        compromised.add("baseline_probe")
+                    if disposition != "usable":
+                        inert.add(id(test_fn))
+                # BLE001: an unrunnable baseline is itself inert
+                except Exception:  # noqa: BLE001
                     inert.add(id(test_fn))
-            # BLE001: an unrunnable baseline is itself inert
-            except Exception:  # noqa: BLE001
-                inert.add(id(test_fn))
-            finally:
-                _unpatch_mutant(_proof, patched, saved, patch_target, func_name)
-    return inert, uncontained
+                finally:
+                    _unpatch_mutant(_proof, patched, saved, patch_target, func_name)
+        except ExecutionLockUnavailable:
+            # BOTH, and under its OWN name. Inert, because a test that cannot run cannot detect.
+            # And compromised, because an execution lock that could not be taken poisons every
+            # measurement after it exactly as an uncontained worker does — MEASURED: reporting
+            # only the first turned a hang into `0/14 killed`, which reads as a weak suite for a
+            # run that measured nothing. Not "baseline_probe": that names a worker still live
+            # after its timeout, which this is not, and two causes with different remedies must
+            # not share a signifier.
+            inert.add(id(test_fn))
+            compromised.add("execution_lock_unavailable")
+    return inert, compromised
 
 
 def _build_test_scope(
@@ -3949,7 +3974,12 @@ def _build_test_scope(
         line_cov, failing = precomputed_line_data
         inert, _unc = _baseline_failures(test_functions, original_func, qualname)
         if _unc and uncontained is not None:
-            uncontained.add("baseline_probe")
+            # Union the NAMES it reported rather than re-asserting one. The probe used to hand
+            # back a bool and this site turned it into a single literal, so a second way to be
+            # compromised had to lie or stay silent; it stayed silent, and a hang became a
+            # confident `0/14 killed`. The set is read by emptiness downstream, so a new name
+            # reaches the containment verdict without any consumer knowing it exists.
+            uncontained.update(_unc)
     elif session is not None:
         # Suite-global baseline, already paid for once. Only the per-function
         # intersection is left, and it is a set operation over data in hand.
@@ -3992,7 +4022,12 @@ def _build_test_scope(
         failing = _failing_on_baseline(test_functions, original_func)
         inert, _unc = _baseline_failures(test_functions, original_func, qualname)
         if _unc and uncontained is not None:
-            uncontained.add("baseline_probe")
+            # Union the NAMES it reported rather than re-asserting one. The probe used to hand
+            # back a bool and this site turned it into a single literal, so a second way to be
+            # compromised had to lie or stay silent; it stayed silent, and a hang became a
+            # confident `0/14 killed`. The set is read by emptiness downstream, so a new name
+            # reaches the containment verdict without any consumer knowing it exists.
+            uncontained.update(_unc)
     else:
         line_cov, failing = {}, []
 
@@ -5067,14 +5102,42 @@ class _PatchProof:
 
 
 @contextlib.contextmanager
-def _execution_guard() -> Iterator[_PatchProof]:
+def _execution_guard(timeout_s: float | None = None) -> Iterator[_PatchProof]:
     """Hold the process-wide execution lock and yield proof of it.
 
     Re-entrant by construction (`_EXECUTION_LOCK` is an RLock), so a coarse holder such as
     `evaluate_mutant` and the fine-grained patch sites inside it nest without deadlock.
+
+    `timeout_s=None` -- the default, and every pre-existing caller -- is UNBOUNDED and keeps the
+    original `with` form exactly. The bound is OPT-IN for two reasons. One consumer is a pytest
+    HOOKWRAPPER (`_isolated_worker._MutantPlugin.pytest_runtest_call`) where raising before its
+    `yield` is a hard pluggy error rather than a refusal anyone can read -- and it runs in its own
+    process, where the acquire is uncontended and a bound would never fire. And the `with` form
+    arms its exit handler as part of the statement, so replacing it with an explicit
+    acquire/release pair would WIDEN the unrecorded window that creates the orphan below.
+
+    WHERE A BOUND IS THE CURE rather than a courtesy: a worker parked here is exactly the thread
+    `interrupt`'s BOUNDARY describes -- blocked outside the interpreter, executing no bytecode, so
+    an `abandon` injection cannot land until the acquire returns ON ITS OWN. When it does return
+    the thread HOLDS the lock, and only then does the injection arrive, so it dies owning it and
+    nothing ever releases it. Giving up before that point is what stops the orphan being created
+    at all, which is why the in-process caller passes its own budget.
     """
-    with _EXECUTION_LOCK:
+    if timeout_s is None:
+        with _EXECUTION_LOCK:
+            _note_lock_entry()
+            try:
+                yield _PatchProof()
+            finally:
+                _note_lock_exit()
+        return
+    _acquire_execution_lock(probe_s=timeout_s, wait_s=0.0)
+    _note_lock_entry()
+    try:
         yield _PatchProof()
+    finally:
+        _note_lock_exit()
+        _EXECUTION_LOCK.release()
 
 
 def _held_patch_proof() -> _PatchProof:
@@ -5096,18 +5159,184 @@ def _held_patch_proof() -> _PatchProof:
     return _PatchProof()
 
 
+class ExecutionLockUnavailable(RuntimeError):
+    """The execution lock could not be taken, carrying WHY as a named code.
+
+    Raised instead of blocking forever. A lock that can block forever is UNCLASSIFIED BEHAVIOUR
+    inside the engine -- the one state this project refuses -- and no cooperative deadline can
+    bound it, because a thread parked in an acquire never runs the check. Measured 2026-09-10:
+    a converge on a Wesker-internal target sat for 600s at 2.11s of CPU, and the documented
+    300s aggregate wall never fired.
+
+    `disposition` is one of `execution_lock_disposition`'s codes and `owner_tid` names the
+    holder. The engine reports the fact; deciding what an operator should be TOLD belongs to
+    the caller, not here.
+    """
+
+    def __init__(self, disposition: str, owner_tid: int) -> None:
+        super().__init__(
+            f"execution lock unavailable: {disposition} (owner_tid={owner_tid})"
+        )
+        self.disposition = disposition
+        self.owner_tid = owner_tid
+
+
+# Written under the lock, cleared on the last release. This exists because CPython's RLock
+# exposes no owner: `_is_owned()` answers only about the CURRENT thread, and the repr is not a
+# contract. Without a record there is no way to tell an ORPHANED lock from ordinary contention,
+# and those two have OPPOSITE remedies -- wait, versus waiting can never work.
+_LOCK_OWNER_TID = 0
+_LOCK_DEPTH = 0
+
+# Probe briefly, then classify; only genuine contention pays the long wait. The orphan case is
+# refused at the probe because no amount of waiting can resolve it.
+_LOCK_PROBE_S = 5.0
+_LOCK_WAIT_S = 300.0
+
+# The NESTED guard's bound, and it measures something different from the two above. Those bound a
+# caller that wants the lock and will use it. This one bounds a caller that must LOSE A RACE: a
+# thread parked in a contended acquire cannot receive `abandon`'s injection until the acquire
+# returns on its own, at which point it holds the lock and dies owning it. Being short is the
+# whole mechanism -- there is no length at which waiting becomes the right answer, because the
+# holder is `evaluate_mutant` keeping it for an entire evaluation.
+#
+# It was first set to the caller's own `timeout_ms`, which LOOKED derived and was merely related:
+# that budget measures running a test, not losing a race. MEASURED cost of that mistake on
+# `_baseline_failures` itself: 4.2 mutants/s -> 38.9 s/mutant, ~160x, all of it spent waiting for
+# a lock that was never going to be free. Detective trades ceiling for tractability by doctrine;
+# it does not trade tractability for a number that sounded principled.
+_NESTED_GUARD_S = 0.05
+
+
+def execution_lock_disposition(
+    acquired: bool, owner_tid: int, self_tid: int, live_tids: tuple[int, ...]
+) -> str:
+    """Why a bounded acquire of the process-wide execution lock ended as it did.
+
+    (#19, pure -- pinned) FOUR facts, not one failure. A bare "could not acquire" would collapse
+    states whose remedies are opposite, which is the conflation this module exists to refuse:
+
+      acquired            -- the caller holds it; proceed.
+      held_by_live_thread -- genuine contention. A live thread owns it and will release; waiting
+                             longer is the correct response.
+      orphaned            -- nobody who could release it is alive. Waiting is futile BY
+                             CONSTRUCTION, and a longer bound only makes the hang longer.
+      free_but_unacquired -- the bound expired, no owner is recorded, and other threads are
+                             alive. Neither remedy is established; the measurement itself is
+                             untrustworthy (a second lock object, or a holder still inside the
+                             unrecorded window below).
+
+    TWO INDEPENDENT ORPHAN CHANNELS, because neither alone is sufficient:
+
+      the RECORD -- an owner was noted and that thread is gone. Precise, but blind to a thread
+      that died in the window between `acquire()` returning and the record being written.
+      MEASURED 2026-09-10: that window is exactly where this defect lands, because the async
+      exception is already PENDING while the thread sleeps in a contended acquire, so delivery
+      the instant the acquire succeeds is certain rather than raced. The record read 0 while the
+      lock's own repr named a dead owner.
+
+      SOLE SURVIVOR -- the caller is the only live thread and still cannot acquire. Then the
+      holder is definitionally not alive, whatever the record says. Sound with no dependence on
+      the record, and it is what catches the measured case. It is not complete: an orphan is
+      invisible to it while any other thread happens to be running. Both channels are checked
+      because each covers what the other misses; neither is presented as a proof of the other.
+
+    `owner_tid` is 0 when no owner is recorded. `live_tids` is the set of thread ids that
+    currently exist, `self_tid` the caller's own. All supplied by the caller: this decision reads
+    no process state, which is what makes it a total function over literals rather than a
+    snapshot of a race.
+    """
+    if acquired:
+        return "acquired"
+    if owner_tid and owner_tid not in live_tids:
+        return "orphaned"
+    if not tuple(t for t in live_tids if t != self_tid):
+        return "orphaned"
+    if owner_tid:
+        return "held_by_live_thread"
+    return "free_but_unacquired"
+
+
+def _note_lock_entry() -> None:
+    """Record this thread as owner. Called with the lock ALREADY HELD."""
+    global _LOCK_OWNER_TID, _LOCK_DEPTH  # noqa: PLW0603
+    _LOCK_OWNER_TID = threading.get_ident()
+    _LOCK_DEPTH += 1
+
+
+def _note_lock_exit() -> None:
+    """Drop one level of ownership. Called with the lock STILL HELD, so this cannot race."""
+    global _LOCK_OWNER_TID, _LOCK_DEPTH  # noqa: PLW0603
+    _LOCK_DEPTH = max(0, _LOCK_DEPTH - 1)
+    if _LOCK_DEPTH == 0:
+        _LOCK_OWNER_TID = 0
+
+
+def _live_thread_ids() -> tuple[int, ...]:
+    """Ids of threads that currently exist.
+
+    `threading.enumerate()` rather than `sys._current_frames()`: it is the public API, and a
+    thread killed by an async exception still runs `_bootstrap_inner`'s cleanup, so it leaves
+    this set. That departure is exactly what makes an orphaned owner detectable.
+    """
+    return tuple(t.ident for t in threading.enumerate() if t.ident is not None)
+
+
+def _acquire_execution_lock(
+    probe_s: float = _LOCK_PROBE_S, wait_s: float = _LOCK_WAIT_S
+) -> None:
+    """Take the execution lock under a bound, or REFUSE with a named reason.
+
+    Probe, then classify, then wait -- rather than one long timeout -- because the two failing
+    states differ in whether waiting can possibly help. An orphaned lock is refused at the probe:
+    a longer bound would only lengthen a hang whose outcome is already determined.
+
+    A nested caller passes `_NESTED_GUARD_S` instead, because it is answering a different question
+    -- see that constant. Deriving its bound from the caller's own test budget looked principled
+    and was merely related; the two measure different things, and the mismatch cost ~160x on a
+    dogfood target before it was measured.
+
+    HONEST LIMIT: an async exception delivered between `acquire()` returning and `_note_lock_entry()`
+    leaves the lock held with no record, and CPython offers no way to close that window from
+    Python. It is not hypothetical -- it is precisely where the measured defect lands -- which is
+    why `execution_lock_disposition` does not rely on the record alone.
+    """
+    if _EXECUTION_LOCK.acquire(timeout=probe_s):
+        return
+    _self = threading.get_ident()
+    disposition = execution_lock_disposition(
+        False, _LOCK_OWNER_TID, _self, _live_thread_ids()
+    )
+    if disposition == "orphaned":
+        raise ExecutionLockUnavailable(disposition, _LOCK_OWNER_TID)
+    if _EXECUTION_LOCK.acquire(timeout=wait_s):
+        return
+    raise ExecutionLockUnavailable(
+        execution_lock_disposition(False, _LOCK_OWNER_TID, _self, _live_thread_ids()),
+        _LOCK_OWNER_TID,
+    )
+
+
 def _serialized(fn):
     """Serialize a function that mutates process-global interpreter state.
 
     Applied rather than inlined because the region to protect is the WHOLE evaluation -- compile,
     install, run, restore -- and re-indenting 280 lines to wrap them in a `with` is a large
     diff whose risk is entirely unrelated to the defect.
+
+    The acquire is BOUNDED (`_acquire_execution_lock`) rather than a bare `with`. Serialization is
+    unchanged; what changed is that failing to get in is now a named fact instead of silence.
     """
 
     @functools.wraps(fn)
     def _wrapped(*args, **kwargs):
-        with _EXECUTION_LOCK:
+        _acquire_execution_lock()
+        _note_lock_entry()
+        try:
             return fn(*args, **kwargs)
+        finally:
+            _note_lock_exit()
+            _EXECUTION_LOCK.release()
 
     return _wrapped
 

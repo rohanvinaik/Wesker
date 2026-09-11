@@ -29,5 +29,23 @@
     "function_digest": "17bc0412de23ec64",
     "refusal": "",
     "standing": "ungateable"
+  },
+  "Wesker/swap_plan.py::swap_label": {
+    "cut_reasons": [],
+    "function_digest": "a4e1a445376e3f60",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/swap_plan.py::swap_pairs": {
+    "cut_reasons": [],
+    "function_digest": "545fa0366b943932",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/swap_plan.py::swap_plan": {
+    "cut_reasons": [],
+    "function_digest": "d15b60f8af8cfb83",
+    "refusal": "",
+    "standing": "complete"
   }
 }

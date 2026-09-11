@@ -118,3 +118,42 @@ def test_partial_suppression_still_counts_as_generated():
     assert operator_disposition(3, 2) == "generated"
     assert operator_disposition(0, 2) == "withheld"
     assert operator_disposition(0, 0) == "not_applicable"
+
+
+# ── the argument-order budget is a policy decision, so the census must carry it (policy 7) ──
+
+
+def _call_of(width: int):
+    """A function whose body is one call with `width` positional arguments."""
+    args = ", ".join(f"a{i}" for i in range(width))
+    return ast.parse(f"def f({args}):\n    return g({args})\n").body[0]
+
+
+def test_the_budget_withholds_argument_order_questions_and_says_so():
+    """The defect this closes. Capping `_alternatives` alone would shrink the universe with
+    NOTHING saying a question had been declined — a narrowed measurement indistinguishable from a
+    complete one. Six positional arguments pose C(6,2)=15 pairs; the budget asks the 10 nearest
+    and the census reports the other 5 as withheld."""
+    row = category_census(_call_of(6))[MutationCategory.SWAP]
+    assert row["withheld"] == 5
+    # 10 asked pairs + the one `~unwrap` dimension.
+    assert row["generated"] == 11
+
+
+def test_a_call_inside_the_budget_withholds_nothing():
+    """The control. If the count were nonzero here it would be reporting a suppression that never
+    happened — C(5,2) = 10 is exactly the budget, so every pair is asked."""
+    row = category_census(_call_of(5))[MutationCategory.SWAP]
+    assert row["withheld"] == 0
+    assert row["generated"] == 11  # 10 pairs + `~unwrap`
+
+
+def test_asked_plus_withheld_accounts_for_every_pair():
+    """The reconciliation that makes the number checkable rather than decorative: whatever the
+    width, generated-minus-unwrap plus withheld is the total number of pairs."""
+    from math import comb
+
+    for width in range(2, 9):
+        row = category_census(_call_of(width))[MutationCategory.SWAP]
+        asked = row["generated"] - 1  # the single `~unwrap` dimension is not a pair
+        assert asked + row["withheld"] == comb(width, 2), width

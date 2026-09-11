@@ -40,7 +40,9 @@ from Wesker.policy import (
 #   * you changed eligibility semantics BY ACCIDENT — a mutator, a counter, a
 #     skip rule — and this failure is the entire point: find the drift before
 #     touching the golden.
-GOLDEN_POLICY_ID = "6.13a1fd436d29"  # 5: type-impossible arithmetic leaves the universe
+GOLDEN_POLICY_ID = (
+    "7.a73c76cd1d65"  # 7: SWAP asks every positional pair, under a budget
+)
 
 # The same fact, readable: the engine's target counts over the fingerprint
 # corpus. A failure here names the category and function that moved.
@@ -56,6 +58,11 @@ GOLDEN_FINGERPRINT = {
     },
     "fp_bitwise": {"ARITHMETIC": 8, "STATE": 1, "STMT": 1, "VALUE": 2},
     "fp_swap": {"ARITHMETIC": 1, "STATE": 1, "SWAP": 9, "VALUE": 4},
+    # Policy 7's witness. Every OTHER corpus call has at most two positional arguments, where
+    # "every pair" and "every adjacent pair" coincide — so this row is the only one that moves
+    # when the argument-order vocabulary does. SWAP 15 = g(a,b,c)'s three pairs + its unwrap,
+    # plus h(...)'s ten ASKED pairs (of C(6,2)=15, five withheld) + its unwrap.
+    "fp_swap_wide": {"ARITHMETIC": 1, "STATE": 1, "SWAP": 15},
     "fp_state_type_exc": {
         "ARITHMETIC": 1,
         "BOUNDARY": 3,

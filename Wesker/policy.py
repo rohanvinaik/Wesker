@@ -49,6 +49,7 @@ from .engine import (
     _ValueMutator,
     estimate_universe_size,
 )
+from .swap_plan import SWAP_PAIR_BUDGET
 
 # 2: DATAFLOW landed (issue #10) — reference substitution enters the universe,
 #    and the fingerprint corpus gained fp_dataflow. Every completeness verdict
@@ -80,7 +81,25 @@ from .engine import (
 #    every builtin numeric and would pad the bucket policy 5 exists to shrink.
 #    The corpus gained fp_bitwise. Every verdict under policy 5 is a claim
 #    about a universe missing eight operator identities.
-POLICY_VERSION = 6
+# 7: SWAP asks about EVERY pair of positional arguments, not only adjacent ones,
+#    selected greedily under a hard per-call-site budget of 10 (`swap_plan`).
+#    Through policy 6 only `(i, i+1)` was a question, so `g(a, b, c) ->
+#    g(c, b, a)` — the first-and-third transposition — was never asked at all: a
+#    suite whose inputs happened to repeat a value across positions 0 and 2 read
+#    COMPLETE while that rewrite passed it, and `verify-rewrite` called it
+#    PRESERVED. Every pair is its own behavioral dimension (a singleton cover),
+#    so greedy marginal coverage ties across them and nearest-first is the
+#    deterministic tie-break; the budget bounds what is ASKED AT ALL, and what it
+#    does not reach is WITHHELD — counted by the census, carried to the reader,
+#    never dropped and never read as verified. Neighbour labels are byte-identical
+#    to policy 6 and keep their emission position, so no per-site prefix moves;
+#    farther pairs take the new `~p<i>,<j>` spelling. The corpus gained
+#    fp_swap_wide, because every other corpus call has at most two positional
+#    arguments — without it the policy id would move while every fingerprint
+#    count stayed identical, which is a version bump the corpus cannot tell you
+#    anything about. Every verdict under policy 6 is a claim about a universe
+#    that never asked whether non-adjacent argument positions are distinguished.
+POLICY_VERSION = 7
 
 # The behavioral fingerprint corpus: small functions that together reach every
 # category, every sub-mode, dead dimensions, the docstring skip, int
@@ -107,6 +126,15 @@ _FINGERPRINT_CORPUS: tuple[str, ...] = (
     # SWAP: adjacent transposition, used-call unwrap, builtin dual (min),
     # provenance-resolved math dual (floor).
     "def fp_swap(xs):\n    import math\n    return math.floor(min(len(xs), 2)) + pow(len(xs), 2)\n",
+    # SWAP, policy 7: the non-adjacent pairs, and the budget that bounds them.
+    # EVERY other corpus call has at most two positional arguments, where "every
+    # pair" and "every adjacent pair" are the same set — so without this entry the
+    # policy id would move while every fingerprint count stayed identical. The
+    # three-argument call carries the (0, 2) question that policy 6 never asked;
+    # the six-argument call exceeds C(6,2)=15 > 10, so it is also the corpus's
+    # only witness that the budget WITHHOLDS rather than silently truncates.
+    "def fp_swap_wide(a, b, c, d, e, f):\n"
+    "    return g(a, b, c) + h(a, b, c, d, e, f)\n",
     # STATE (all three sub-modes) + TYPE + EXCEPTION (raise_type,
     # handler_swallow, handler_broaden).
     "def fp_state_type_exc(self, xs):\n"
@@ -231,11 +259,23 @@ def _categories(two_sign: bool = False) -> dict[str, dict[str, Any]]:
         MutationCategory.SWAP.value: {
             "question": "are argument positions, call effect, and fold direction pinned?",
             "alternatives": [
-                "adjacent positional transposition per pair",
+                "positional transposition per PAIR — every pair, not only adjacent ones",
                 "unwrap (f(x, ...) -> x) when the call's value is used",
                 "curated callee dual, resolved by import provenance, not spelling",
             ],
             "duals": dict(_SwapMutator._DUALS),
+            # The budget is part of the declared surface, not an implementation detail: it is
+            # what makes a SWAP verdict a claim about the pairs ASKED rather than about all of
+            # them. Every pair of a call with up to five positional arguments fits.
+            "pair_budget": SWAP_PAIR_BUDGET,
+            "pair_order": (
+                "nearest first, then by left index — every pair is one behavioral dimension, so "
+                "greedy marginal coverage ties and nearest-first is the deterministic tie-break"
+            ),
+            "withheld": (
+                "pairs past the budget are WITHHELD: counted by the operator census and reported, "
+                "never generated and never read as verified (see swap_plan)"
+            ),
         },
         MutationCategory.STATE.value: {
             "question": "are side effects, return values, and loop control pinned?",
@@ -364,6 +404,19 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
             "callable references, and receiver (self/cls) substitutions are "
             "declared out of the supported slice, not silently covered "
             "(issue #10's remaining subfamilies)",
+            "argument-order questions are budgeted per call site: every PAIR of "
+            "positional arguments is a question, asked nearest-first up to "
+            f"{SWAP_PAIR_BUDGET} (every pair through five positional arguments). A "
+            "wider call has its remaining pairs WITHHELD — counted by the operator "
+            "census and reported, never generated. 'never asked' and 'asked, and no "
+            "distinguishing input was found' are different states with different "
+            "remedies; neither may be read as verified",
+            "argument order WITHIN a starred expansion is not a target: f(a, *rest) "
+            "carries two argument expressions whatever `rest` holds at runtime, so "
+            "the pairs are over the AST's positional entries, not the call's eventual "
+            "arguments",
+            "no rotations or multi-position reorderings: catching one does not pin "
+            "the pairs it moves, and the pairs are the declared dimension",
             "sorted(reverse=) has no curated dual until a measured case wants it",
             "bare re-raise carries no EXCEPTION target; an already-pass "
             "handler is not a handler_swallow target; an untyped except: is "

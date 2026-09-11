@@ -24,6 +24,7 @@ from Wesker.engine import (
     MutationCategory,
     _count_state_targets,
     _STATE_SUB_MODES,
+    count_swap_withheld,
     estimate_universe_size,
 )
 
@@ -175,6 +176,14 @@ def category_census(
             # but the policy withholds them. Shown as withheld (issue #22 auditability) — the
             # reader sees the negative operator is available and disabled, not absent.
             row = _census_row(0, estimate_universe_size(func_node, {cat}))
+        elif cat is MutationCategory.SWAP:
+            # The per-call-site budget can leave argument-order questions UNASKED (policy 7). Those
+            # are withheld by policy exactly as μ⁻ is above — the operator is available and some of
+            # its questions were declined — so the reader sees a narrowed universe as narrowed,
+            # never as a complete one. Both numbers come from the one plan generation used.
+            row = _census_row(
+                estimate_universe_size(func_node, {cat}), count_swap_withheld(func_node)
+            )
         else:
             generated, withheld = estimate_universe_size(func_node, {cat}), 0
             row = _census_row(generated, withheld)

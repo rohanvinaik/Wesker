@@ -47,6 +47,7 @@ from .isolation import (
 )
 from .subsumption import distinct_obligations as _distinct_obligations
 from .subsumption import redundancy_groups
+from .swap_plan import SWAP_PAIR_BUDGET, swap_label, swap_plan
 from .tce import WARRANT_BYTECODE, nodes_equivalent
 from .trace_evidence import TraceEvidence, build_trace_ledger
 from .memory_guard import memory_enforcement_standing
@@ -1122,16 +1123,29 @@ class _SwapMutator(_BaseMutator):
     def _alternatives(
         node: ast.Call, stmt_ids: set[int], bindings: dict[str, str] | None = None
     ) -> list[tuple[Any, str]]:
-        """Ordered (spec, dimension label) for one call site — a spec is the
-        left index of the adjacent pair to transpose, ``"unwrap"``, or ``"dual"``
-        (swap the callee for its curated dual: ``min``↔``max``, ``any``↔``all``,
-        ``math.floor``↔``math.ceil``). The dual expresses the wrong-fold-direction
-        bug class no argument transposition can reach — ``min(a, b)`` and
-        ``max(a, b)`` take the same arguments in every order."""
+        """Ordered (spec, dimension label) for one call site — a spec is the ``(i, j)`` pair of
+        positional indices to transpose, ``"unwrap"``, or ``"dual"`` (swap the callee for its
+        curated dual: ``min``↔``max``, ``any``↔``all``, ``math.floor``↔``math.ceil``). The dual
+        expresses the wrong-fold-direction bug class no argument transposition can reach —
+        ``min(a, b)`` and ``max(a, b)`` take the same arguments in every order.
+
+        EVERY pair is a question, not just the neighbours (policy 7). Through policy 6 this asked
+        only ``(i, i + 1)``, so ``g(c, b, a)`` — the first-and-third transposition — was never a
+        question, and a suite that happened to repeat a value across those positions read complete
+        while that rewrite passed it. :func:`swap_plan` selects which pairs are ASKED under the hard
+        per-call-site budget; what it withholds is counted by the census, never dropped and never
+        read as verified.
+
+        Emission ORDER is deliberate: asked neighbours first, in policy 6's order, then ``~unwrap``
+        and ``~dual``, and only then the farther pairs. Every label a call site already emitted keeps
+        its position in the sequence, so per-site prefixes do not shift under the new questions.
+        """
         name = _callee_name(node)
+        asked, _withheld = swap_plan(len(node.args), SWAP_PAIR_BUDGET)
         alts: list[tuple[Any, str]] = []
-        for i in range(len(node.args) - 1):
-            alts.append((i, f"SWAP:{name}" if i == 0 else f"SWAP:{name}~p{i}"))
+        for i, j in asked:
+            if j == i + 1:
+                alts.append(((i, j), swap_label(name, i, j)))
         if (
             node.args
             and not isinstance(node.args[0], ast.Starred)
@@ -1140,7 +1154,22 @@ class _SwapMutator(_BaseMutator):
             alts.append(("unwrap", f"SWAP:{name}~unwrap"))
         if _SwapMutator._dual_eligible(node, bindings or {}):
             alts.append(("dual", f"SWAP:{name}~dual"))
+        for i, j in asked:
+            if j != i + 1:
+                alts.append(((i, j), swap_label(name, i, j)))
         return alts
+
+    @staticmethod
+    def _withheld(node: ast.Call) -> int:
+        """Argument-order questions the budget did not ask at this call site (policy 7).
+
+        The SAME :func:`swap_plan` call that decides what ``_alternatives`` emits decides what this
+        reports, so generation and the census cannot disagree about what was left unasked. Capping
+        ``_alternatives`` alone would have hidden the remainder: the reader would see a smaller
+        universe with nothing saying a question had been withheld, which is precisely the "absence
+        of evidence read as evidence of absence" this project refuses.
+        """
+        return swap_plan(len(node.args), SWAP_PAIR_BUDGET)[1]
 
     def visit_Call(self, node: ast.Call) -> ast.AST:
         if self.applied:
@@ -1178,8 +1207,10 @@ class _SwapMutator(_BaseMutator):
                 # mutator raises AttributeError on `f[i](x)` instead of declining to mutate it.
                 # Naming the branch it actually handles keeps the invariant checkable.
                 continue
+            # The spec is the PAIR of positional indices to transpose — adjacent or not (policy 7).
+            left, right = spec
             node.args = list(node.args)
-            node.args[spec], node.args[spec + 1] = node.args[spec + 1], node.args[spec]
+            node.args[left], node.args[right] = node.args[right], node.args[left]
         return self.generic_visit(node)
 
 
@@ -2288,6 +2319,7 @@ def _count_targets(
             for node in ast.walk(func_node)
             if isinstance(node, ast.Call)
         )
+    # (SWAP's WITHHELD counterpart is `count_swap_withheld` below — same walk, same plan.)
     # STATE and EXCEPTION carry independent sub-modes, each with its own
     # target index space; count them the way generation iterates them.
     if category == MutationCategory.STATE:
@@ -2322,6 +2354,25 @@ def _count_targets(
         _docstring_positions(func_node) if category == MutationCategory.VALUE else None
     )
     return len(_record_dimensions(func_node, category, ds_pos))
+
+
+def count_swap_withheld(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> int:
+    """Argument-order questions the per-call-site budget did not ask, across a whole function.
+
+    The WITHHELD counterpart to :func:`_count_targets`'s SWAP branch, over the SAME walk and the
+    same :func:`swap_plan`, so what generation skipped and what the census reports are one number
+    derived once. "Never asked" is a different fact from "asked, and no distinguishing input was
+    found": both may request an input from the reader, neither is a failure, and neither may be
+    read as verified. Reporting zero here while the budget silently bound would make a narrowed
+    universe indistinguishable from a complete one.
+    """
+    return sum(
+        _SwapMutator._withheld(node)
+        for node in ast.walk(func_node)
+        if isinstance(node, ast.Call)
+    )
 
 
 def _is_self_assign(target: ast.AST) -> TypeGuard[ast.Attribute]:

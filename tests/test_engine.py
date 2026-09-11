@@ -628,11 +628,28 @@ def test_swap_unwrap_skips_starred_first_arg():
     assert not any(k.endswith("~unwrap") for k in keys)
 
 
-def test_swap_adjacent_pairs_one_dimension_each():
+def test_swap_every_pair_is_one_dimension_each():
+    """Policy 7: EVERY pair of positional arguments is a question, not only the adjacent ones.
+
+    Through policy 6 this asserted exactly the three adjacent-or-unwrap dimensions, and that was the
+    defect — ``g(c, b, a)``, the first-and-third transposition, was never asked, so a suite whose
+    inputs repeated a value across positions 0 and 2 read complete while that rewrite passed it. The
+    neighbour labels keep their spelling AND their position; ``~p0,2`` is appended after the existing
+    dimensions so no per-site prefix shifts.
+    """
     func = _fn("def f(a, b, c):\n    return g(a, b, c)")
     keys = _record_dimensions(func, MutationCategory.SWAP, set())
-    assert keys == ["SWAP:g", "SWAP:g~p1", "SWAP:g~unwrap"]
-    assert _count_targets(func, MutationCategory.SWAP) == 3
+    assert keys == ["SWAP:g", "SWAP:g~p1", "SWAP:g~unwrap", "SWAP:g~p0,2"]
+    assert _count_targets(func, MutationCategory.SWAP) == 4
+
+
+def test_swap_distant_pair_transposes_first_and_last():
+    """The audit's rewrite, as a mutant: ``g(c, b, a)`` is now a question the suite must answer."""
+    func = _fn('def f(a, b, c):\n    return "{}{}{}".format(a, b, c)')
+    muts = generate_mutants(func, {MutationCategory.SWAP}, max_per_category=0)
+    p02 = next(m for m in muts if m.dimension.endswith("~p0,2"))
+    f = _exec_mutant(p02)["f"]
+    assert f(1, 2, 3) == "321"  # (a, c) transposed; b untouched
 
 
 def test_swap_second_pair_transposes_later_neighbors():

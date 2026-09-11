@@ -5191,7 +5191,14 @@ _LOCK_DEPTH = 0
 # Probe briefly, then classify; only genuine contention pays the long wait. The orphan case is
 # refused at the probe because no amount of waiting can resolve it.
 _LOCK_PROBE_S = 5.0
-_LOCK_WAIT_S = 300.0
+# MUST stay well under the caller's aggregate deadline, or the diagnosis is unreachable. Set to
+# 300.0 first -- the same value as Detective's default `--deadline` -- and MEASURED 2026-09-10:
+# the deadline always won, the run ended `⚠ CUT — aggregate deadline exhausted` at 351s, and the
+# remedy it printed was "re-run with a larger wall", which for a lock that will never come free is
+# advice that makes things worse. A named refusal nobody can reach is not a refusal. The wait's
+# real job is riding out TRANSIENT contention, which is seconds; 30s is generous for that and
+# leaves the classification reachable inside any sane budget.
+_LOCK_WAIT_S = 30.0
 
 # The NESTED guard's bound, and it measures something different from the two above. Those bound a
 # caller that wants the lock and will use it. This one bounds a caller that must LOSE A RACE: a
@@ -5208,8 +5215,38 @@ _LOCK_WAIT_S = 300.0
 _NESTED_GUARD_S = 0.05
 
 
+def parse_lock_owner(text: str) -> int:
+    """The owning thread id named in an RLock's repr, or 0 when none can be read.
+
+    (#19, pure -- pinned) CPython renders a held RLock as
+    `<locked _thread.RLock object owner=6147403776 count=1 at 0x...>`. That is the ONLY channel
+    reporting the true owner: `_is_owned()` answers solely about the calling thread, and there is
+    no public accessor.
+
+    Total over `str` and deliberately not a regex, so every branch is reachable from a literal.
+    An unreadable repr returns 0 -- the same value as "nothing recorded" -- because a parse that
+    guessed would be worse than one that abstains: 0 routes to the channels that do not depend on
+    it rather than to a fabricated owner.
+    """
+    marker = "owner="
+    start = text.find(marker)
+    if start < 0:
+        return 0
+    digits = start + len(marker)
+    end = digits
+    while end < len(text) and text[end].isdigit():
+        end += 1
+    if end == digits:
+        return 0
+    return int(text[digits:end])
+
+
 def execution_lock_disposition(
-    acquired: bool, owner_tid: int, self_tid: int, live_tids: tuple[int, ...]
+    acquired: bool,
+    owner_tid: int,
+    repr_owner: int,
+    self_tid: int,
+    live_tids: tuple[int, ...],
 ) -> str:
     """Why a bounded acquire of the process-wide execution lock ended as it did.
 
@@ -5248,13 +5285,32 @@ def execution_lock_disposition(
     """
     if acquired:
         return "acquired"
-    if owner_tid and owner_tid not in live_tids:
+    known = tuple(tid for tid in (owner_tid, repr_owner) if tid)
+    if any(tid not in live_tids for tid in known):
         return "orphaned"
-    if not tuple(t for t in live_tids if t != self_tid):
+    if not tuple(tid for tid in live_tids if tid != self_tid):
         return "orphaned"
-    if owner_tid:
+    if known:
         return "held_by_live_thread"
     return "free_but_unacquired"
+
+
+def _lock_owner_from_repr() -> int:
+    """The execution lock's true owner, read from CPython's own repr. 0 if unreadable.
+
+    The THIRD orphan channel, and the only one that saw the dead owner in the measured case:
+    the record was 0 (the thread died before it could be written) and two threads were alive, so
+    sole-survivor stayed silent. `repr` named it correctly in every sample of every run.
+
+    Not a documented contract, which is exactly why `test_rlock_repr_still_names_its_owner`
+    constructs a genuinely held lock and asserts this reads its id back. A CPython format change
+    then fails LOUDLY in the suite rather than silently degrading detection to the other two.
+    """
+    try:
+        return parse_lock_owner(repr(_EXECUTION_LOCK))
+    # BLE001: a probe that cannot read must abstain, never break the acquire it is informing
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _note_lock_entry() -> None:
@@ -5305,15 +5361,19 @@ def _acquire_execution_lock(
         return
     _self = threading.get_ident()
     disposition = execution_lock_disposition(
-        False, _LOCK_OWNER_TID, _self, _live_thread_ids()
+        False, _LOCK_OWNER_TID, _lock_owner_from_repr(), _self, _live_thread_ids()
     )
     if disposition == "orphaned":
-        raise ExecutionLockUnavailable(disposition, _LOCK_OWNER_TID)
+        raise ExecutionLockUnavailable(
+            disposition, _LOCK_OWNER_TID or _lock_owner_from_repr()
+        )
     if _EXECUTION_LOCK.acquire(timeout=wait_s):
         return
     raise ExecutionLockUnavailable(
-        execution_lock_disposition(False, _LOCK_OWNER_TID, _self, _live_thread_ids()),
-        _LOCK_OWNER_TID,
+        execution_lock_disposition(
+            False, _LOCK_OWNER_TID, _lock_owner_from_repr(), _self, _live_thread_ids()
+        ),
+        _LOCK_OWNER_TID or _lock_owner_from_repr(),
     )
 
 
@@ -6432,6 +6492,18 @@ def run_function_profiling(
                     source_path=source_path,
                 )
         except Exception as exc:  # noqa: BLE001
+            # ONE EXCEPTION to "one bad mutant must never abort the run", and it is not a mutant
+            # at all: an ORPHANED execution lock. That lock is process-global and its owner no
+            # longer exists, so it is never coming back and EVERY remaining mutant fails the same
+            # way. MEASURED 2026-09-10: 14 mutants × a 5s acquire bound = 70s spent re-learning
+            # one fact, ending in a floor. The first refusal already decided the run, so it is
+            # re-raised for the caller to report ONCE, in seconds. Every other disposition can
+            # clear on its own and stays survivable below.
+            if (
+                isinstance(exc, ExecutionLockUnavailable)
+                and exc.disposition == "orphaned"
+            ):
+                raise
             # A pathological mutant can crash the evaluation harness itself —
             # e.g. self-profiling the engine's own internals, where the mutant
             # replaces the live machinery that runs the profile. One bad mutant

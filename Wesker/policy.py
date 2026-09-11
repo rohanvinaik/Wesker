@@ -67,7 +67,20 @@ from .engine import (
 #    unproven-equivalent bucket ("COMPLETE modulo 12" where the honest number
 #    was 4). Proof-only inference — literals, f-strings, str-literal-receiver
 #    methods — never annotations; the corpus gained fp_str_arith.
-POLICY_VERSION = 5
+# 6: ARITHMETIC becomes COMPLETE over the grammar's operator families, measured
+#    against `ast` rather than curated. `_BIN_SWAP` covered 7 of 13 `operator`
+#    nodes and `visit_UnaryOp` 1 of the 3 arithmetic `unaryop` nodes, so
+#    MatMult, LShift, RShift, BitAnd, BitOr, BitXor, Invert and UAdd had NO
+#    fault model — not withheld, not declared, absent. A target using `@` or
+#    `<<` carried a dimension nothing covered and nothing said so, which is the
+#    one state the project forbids. Each dual is behaviourally distinguishable
+#    rather than merely symmetric (verified: every one has a distinguishing
+#    input; Invert is never equivalent over ints since `~x == -x - 1`), and
+#    `+x` maps to `-x` rather than removal because `+x -> x` is identity for
+#    every builtin numeric and would pad the bucket policy 5 exists to shrink.
+#    The corpus gained fp_bitwise. Every verdict under policy 5 is a claim
+#    about a universe missing eight operator identities.
+POLICY_VERSION = 6
 
 # The behavioral fingerprint corpus: small functions that together reach every
 # category, every sub-mode, dead dimensions, the docstring skip, int
@@ -83,6 +96,14 @@ _FINGERPRINT_CORPUS: tuple[str, ...] = (
     "def fp_boundary(a, b):\n    return (a < b) == (a in b) is (a is b)\n",
     # ARITHMETIC + LOGICAL: BinOp, AugAssign, unary minus; and/or, not.
     "def fp_arith_logic(a, b):\n    a += 1\n    return -(a * b) if a and not b else a - b\n",
+    # ARITHMETIC, policy 6: the eight operator identities that had no fault model
+    # before it — MatMult, the shifts, the three bitwise, and unary Invert/UAdd.
+    # Without a corpus entry reaching them the policy id would move while every
+    # fingerprint count stayed identical, which is a version bump the corpus
+    # cannot tell you anything about.
+    "def fp_bitwise(a, b, m):\n"
+    "    a <<= 1\n"
+    "    return (m @ m, a >> b, a & b, a | b, a ^ b, ~a, +a)\n",
     # SWAP: adjacent transposition, used-call unwrap, builtin dual (min),
     # provenance-resolved math dual (floor).
     "def fp_swap(xs):\n    import math\n    return math.floor(min(len(xs), 2)) + pow(len(xs), 2)\n",

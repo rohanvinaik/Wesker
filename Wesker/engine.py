@@ -1603,6 +1603,11 @@ class _ArithmeticMutator(_BaseMutator):
     DeMillo/Lipton/Sayward operator set.
     """
 
+    # COMPLETE over `ast.operator` -- all 13, measured against the grammar rather than curated.
+    # The six below were absent entirely: not withheld, not declared, simply missing, so a target
+    # using `@` or `<<` had a dimension no fault model covered and nothing said so. Each dual is
+    # chosen to be BEHAVIOURALLY distinguishable rather than merely symmetric, because a swap that
+    # is equivalent on its natural domain pads the unproven-equivalent bucket (issue #12).
     _BIN_SWAP: dict[type, type] = {
         ast.Add: ast.Sub,
         ast.Sub: ast.Add,
@@ -1611,6 +1616,17 @@ class _ArithmeticMutator(_BaseMutator):
         ast.FloorDiv: ast.Div,
         ast.Mod: ast.Mult,
         ast.Pow: ast.Mult,
+        # matrix product vs elementwise -- differ for any non-trivial operands
+        ast.MatMult: ast.Mult,
+        # duals: differ for any nonzero shift of a nonzero value
+        ast.LShift: ast.RShift,
+        ast.RShift: ast.LShift,
+        # duals: differ wherever the operands' bits differ
+        ast.BitAnd: ast.BitOr,
+        ast.BitOr: ast.BitAnd,
+        # differs wherever both bits are SET, so it needs an overlap -- weaker than the pair
+        # above by construction, and that is a property of xor, not a gap in the choice
+        ast.BitXor: ast.BitOr,
     }
 
     def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
@@ -1631,13 +1647,33 @@ class _ArithmeticMutator(_BaseMutator):
         return self.generic_visit(node)
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.AST:
+        """Complete over the arithmetic `ast.unaryop` -- USub, Invert and UAdd.
+
+        (`Not` is `_LogicalMutator`'s, which covers it along with And/Or.)
+
+        REMOVAL for USub and Invert, a DUAL for UAdd, and the asymmetry is the point:
+
+          -x -> x   and   ~x -> x   are never equivalent on their natural domain. `~x == -x - 1`,
+          which equals `x` only at `x == -0.5`, so no integer input makes the mutant agree.
+
+          +x -> x   WOULD be equivalent for every builtin numeric, so removal there generates a
+          mutant nothing can ever kill -- padding the unproven-equivalent bucket that issue #12
+          exists to shrink. `+x -> -x` is distinguishable for every nonzero input instead. The
+          class's own rule is "provable cases only"; a dual that is provably equivalent is not one.
+        """
         if self.applied:
             return self.generic_visit(node)
-        if isinstance(node.op, ast.USub):
+        if isinstance(node.op, (ast.USub, ast.Invert)):
             if self.current == self.target:
                 self._mark_applied(node)
                 return self.generic_visit(node.operand)
-            self._note("ARITHMETIC:USub")
+            self._note(f"ARITHMETIC:{type(node.op).__name__}")
+            self.current += 1
+        elif isinstance(node.op, ast.UAdd):
+            if self.current == self.target:
+                self._mark_applied(node)
+                node.op = ast.USub()
+            self._note("ARITHMETIC:UAdd")
             self.current += 1
         return self.generic_visit(node)
 

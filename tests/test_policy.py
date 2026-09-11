@@ -40,12 +40,12 @@ from Wesker.policy import (
 #   * you changed eligibility semantics BY ACCIDENT — a mutator, a counter, a
 #     skip rule — and this failure is the entire point: find the drift before
 #     touching the golden.
-GOLDEN_POLICY_ID = "5.751e8e9f4f11"  # 5: type-impossible arithmetic leaves the universe
+GOLDEN_POLICY_ID = "6.13a1fd436d29"  # 5: type-impossible arithmetic leaves the universe
 
 # The same fact, readable: the engine's target counts over the fingerprint
 # corpus. A failure here names the category and function that moved.
 GOLDEN_FINGERPRINT = {
-    "fp_value": {"VALUE": 9, "STATE": 1, "STMT": 1},
+    "fp_value": {"STATE": 1, "STMT": 1, "VALUE": 9},
     "fp_boundary": {"BOUNDARY": 17, "STATE": 1},
     "fp_arith_logic": {
         "ARITHMETIC": 4,
@@ -54,6 +54,7 @@ GOLDEN_FINGERPRINT = {
         "STMT": 1,
         "VALUE": 2,
     },
+    "fp_bitwise": {"ARITHMETIC": 8, "STATE": 1, "STMT": 1, "VALUE": 2},
     "fp_swap": {"ARITHMETIC": 1, "STATE": 1, "SWAP": 9, "VALUE": 4},
     "fp_state_type_exc": {
         "ARITHMETIC": 1,
@@ -68,21 +69,9 @@ GOLDEN_FINGERPRINT = {
     },
     "fp_stmt": {"DATAFLOW": 2, "STATE": 1, "STMT": 3, "SWAP": 1, "VALUE": 7},
     "fp_async": {"ARITHMETIC": 1, "STATE": 1, "VALUE": 2},
-    # The enrolled slice: return total over both visible candidates. (name_sub
-    # would add x→y/y→x at the binding statement — implemented, not enrolled;
-    # see _DATAFLOW_SUB_MODES for the measured reason.)
     "fp_dataflow": {"ARITHMETIC": 1, "DATAFLOW": 2, "STATE": 1},
-    # Policy 3: one STATE target per self-write SPELLING (plain, annotated,
-    # augmented); the valueless declaration is not a write. STMT's overlap on
-    # attribute writes extends symmetrically; ARITHMETIC is the += itself.
-    # Policy 4: the two-target write adds one dimension PER attribute (left,
-    # right), each with its own per-target mutant.
-    "fp_state_spellings": {"ARITHMETIC": 1, "STATE": 5, "STMT": 4},
-    # Policy 5: only the one-sided f-string Add, `n + 1`, and the name-name
-    # return Add survive as arithmetic; the two-str Adds and `'-' * 3` are
-    # type-impossible. VALUE 9 = four str literals + two ints (two dims each)
-    # + the f-string's '!' fragment.
     "fp_str_arith": {"ARITHMETIC": 3, "STATE": 1, "SWAP": 1, "VALUE": 9},
+    "fp_state_spellings": {"ARITHMETIC": 1, "STATE": 5, "STMT": 4},
 }
 
 

@@ -15,5 +15,19 @@
     "function_digest": "cd8a3be413a6f79c",
     "refusal": "",
     "standing": "complete"
+  },
+  "Wesker/policy.py::_fingerprint_counts": {
+    "cut_reasons": [],
+    "function_digest": "c9f6a705ec9f2619",
+    "refusal": "",
+    "standing": "unverified"
+  },
+  "Wesker/policy.py::mutation_policy": {
+    "cut_reasons": [
+      "mutant_not_installed"
+    ],
+    "function_digest": "17bc0412de23ec64",
+    "refusal": "",
+    "standing": "ungateable"
   }
 }

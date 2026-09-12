@@ -2,6 +2,52 @@
 
 Notable changes, newest first. Dates are the commit dates.
 
+## 1.1.0 — 2026-09-11
+
+**Mutation policy 6 → 7.** SWAP asks about every PAIR of positional arguments, not only adjacent
+ones. Every verdict under policy 6 is a claim about a universe that never asked whether
+non-adjacent argument positions are distinguished.
+
+### The defect
+
+Measured through the real CLI. For `f(a, b, c) = g(a, b, c)` with the hand-written test
+`f(1, 2, 1) == 8`, the suite read COMPLETE and `verify-rewrite` returned PRESERVED for the rewrite
+`g(c, b, a)` — which returns 10 where the original returns 14 at `(1, 2, 3)`. `_alternatives` looped
+`for i in range(len(args) - 1)`, so the first-and-third transposition was never a question, and a
+suite whose inputs happened to repeat a value across positions 0 and 2 read complete while that
+rewrite passed it. An unasked question is not a passed one.
+
+### What changed
+
+- **Every pair is a question**, selected greedily (each pair is its own behavioural dimension, so
+  marginal coverage ties and nearest-first is the deterministic tie-break) under a **hard
+  per-call-site budget of 10** — every pair of a call with up to five positional arguments.
+- **What the budget declines is WITHHELD, counted, and reported** in the operator census, from the
+  same `swap_plan` call that drives generation, so the counter and the generator cannot disagree.
+  "Never asked" and "asked, and no distinguishing input was found" stay different states.
+- **Neighbour labels are byte-identical to policy 6** and keep their emission position, so no
+  per-site prefix moves; farther pairs take a new `~p<i>,<j>` spelling.
+- The declared surface carries the budget, the ordering rule and the withholding, so changing the
+  budget moves the policy id by construction. The fingerprint corpus gained `fp_swap_wide` —
+  every other corpus call has at most two positional arguments, where "every pair" and "every
+  adjacent pair" are the same set.
+
+Policy id: `6.13a1fd436d29` → `7.a73c76cd1d65`. Every existing fingerprint row is unmoved.
+
+### Not changed
+
+No rotations or multi-position reorderings, and no blanket skip for "symmetric" builtins —
+`max(1, 1.0)` is `1` and `max(1.0, 1)` is `1.0`, equal under `==` and different in type, so any
+regression test for that case must check TYPE or IDENTITY. Argument order *within* a starred
+expansion remains an unresolved surface: pairs are over the AST's positional entries.
+
+### Quality
+
+Cleared the local SonarQube new-code gate to OK / 0 bugs / 0 vulnerabilities / 0 hotspots. Three
+`except BaseException` handlers narrowed to `(Exception, Abandoned)` — `Abandoned` derives from
+BaseException by design so a test's own handler cannot swallow a stop, which is why those catches
+reached that low; naming the pair keeps abandonment and lets a real KeyboardInterrupt end the run.
+
 ## 1.0.0 — 2026-09-09
 
 First stable release. The API and the verdict vocabulary are what Detective 1.0.0 is built against,

@@ -43,6 +43,8 @@ import os
 import sys
 from typing import Any, Callable
 
+from Wesker.interrupt import Abandoned
+
 __all__ = ["session_callables", "run_in_session"]
 
 try:  # pytest is an OPTIONAL dependency — this module degrades to a no-op without it.
@@ -143,8 +145,10 @@ def _reset_item(item: Any) -> None:
                 continue
             try:
                 fixturedef.finish(request)
-            # BLE001,S110: stale teardown; see docstring
-            except BaseException:  # noqa: BLE001,S110
+            # BLE001,S110: stale teardown; see docstring. `Abandoned` is named because it derives
+            # from BaseException by design; narrowing to this pair keeps that case while letting a
+            # genuine KeyboardInterrupt/SystemExit end the run rather than be swallowed (S5754).
+            except (Exception, Abandoned):  # noqa: BLE001,S110
                 pass
     init = getattr(item, "_initrequest", None)
     if init is not None:

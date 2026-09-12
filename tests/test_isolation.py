@@ -509,11 +509,15 @@ def test_worker_patches_indirect_calls_and_credits_the_asserting_test(tmp_path, 
         timeout=30,
     )
     killed, unchanged = json.loads(run.stdout)
-    assert killed["installed"] and killed["entered"]
+    # Split rather than composed: a failure must name WHICH half broke — "installed but never
+    # entered" is a different defect from "never installed" (S9073).
+    assert killed["installed"]
+    assert killed["entered"]
     assert killed["killed_by"] == "assertion"
     assert killed["test_name"].endswith("::test_value")
     assert unchanged["rc"] == 0
-    assert unchanged["installed"] and unchanged["entered"]
+    assert unchanged["installed"]
+    assert unchanged["entered"]
 
 
 def test_a_value_kill_stops_before_a_later_blocking_test(tmp_path):

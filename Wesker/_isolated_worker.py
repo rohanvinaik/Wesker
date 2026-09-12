@@ -49,10 +49,14 @@ def _build_mutant(target_file: str, func_name: str, mutant_source: str) -> Any |
     from Wesker.engine import _entry_probe
 
     target = os.path.realpath(target_file)
+    # SNAPSHOT, not a redundant copy: the search below can trigger an import (and another thread
+    # may import at any time), and mutating `sys.modules` while iterating its values raises
+    # "dictionary changed size during iteration". Materialising first is what makes this safe.
+    loaded_modules = list(sys.modules.values())
     module = next(
         (
             candidate
-            for candidate in list(sys.modules.values())
+            for candidate in loaded_modules
             if isinstance(candidate, ModuleType)
             and isinstance(vars(candidate).get("__file__"), str)
             and os.path.realpath(vars(candidate)["__file__"]) == target

@@ -145,6 +145,20 @@ def _terminate_group(proc: subprocess.Popen[str]) -> bool:
         return False  # not confirmed dead — the honest answer is uncontained
 
 
+def _close_pipes(proc: subprocess.Popen[str]) -> None:
+    """Close the parent's ends of a worker's pipes, whatever state the worker is in.
+
+    `communicate()` closes them on its normal path. A timeout path that kills the group, and a
+    persistent worker's `close()`, did not: the pipe objects then lived until garbage collection and
+    were finalized with a `ResourceWarning` (surfaced by running the suite under `-W error`). A pipe
+    that is already closed, or whose buffered write meets a dead reader, is not an error here.
+    """
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is not None:
+            with contextlib.suppress(OSError, ValueError):
+                stream.close()
+
+
 def run_pytest_node_isolated(
     project_root: str,
     node_ids: Sequence[str],
@@ -186,6 +200,8 @@ def run_pytest_node_isolated(
         except (subprocess.TimeoutExpired, ValueError):
             out = ""
         return IsolatedRun(-9, True, contained, out or "")
+    finally:
+        _close_pipes(proc)
 
 
 def mutant_verdict(outcome: str) -> str:
@@ -300,6 +316,8 @@ def run_mutant_isolated(
         except (subprocess.TimeoutExpired, ValueError):
             out = ""
         return IsolatedRun(-9, True, contained, out or "")
+    finally:
+        _close_pipes(proc)
 
 
 def run_baseline_traced_isolated(
@@ -338,6 +356,8 @@ def run_baseline_traced_isolated(
     except subprocess.TimeoutExpired:
         contained = _terminate_group(proc)
         return [], "timeout", contained
+    finally:
+        _close_pipes(proc)
     lines = [ln for ln in (out or "").splitlines() if ln.strip()]
     if not lines:
         return [], "error", True
@@ -702,7 +722,9 @@ class IsolatedMutantWorker:
         )
 
     def _reap(self) -> bool:
-        return _terminate_group(self._proc)
+        contained = _terminate_group(self._proc)
+        _close_pipes(self._proc)
+        return contained
 
     def close(self) -> None:
         with contextlib.suppress(Exception):
@@ -710,4 +732,7 @@ class IsolatedMutantWorker:
                 self._proc.stdin.close()
         if self._proc.poll() is None:
             self._reap()
+        # A worker that had already exited is not reaped above, so without this its stdout would
+        # stay open until garbage collection.
+        _close_pipes(self._proc)
         self._alive = False

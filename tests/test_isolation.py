@@ -897,10 +897,10 @@ def _counter_project(tmp_path):
     import sys
 
     (tmp_path / "cc.py").write_text(
-        "import os\n"
+        "import os, pathlib\n"
         "_P = os.path.join(os.path.dirname(__file__), 'ctr2')\n"
-        "_n = int(open(_P).read() or '0') if os.path.exists(_P) else 0\n"
-        "open(_P, 'w').write(str(_n + 1))\n"
+        "_n = int(pathlib.Path(_P).read_text() or '0') if os.path.exists(_P) else 0\n"
+        "pathlib.Path(_P).write_text(str(_n + 1))\n"
         "def g():\n"
         "    if _n % 2 == 0:\n"
         "        return 'even'\n"

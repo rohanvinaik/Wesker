@@ -704,7 +704,7 @@ def _parametrize_cases(func: Any) -> list[Any] | None:
                     )  # a single argname takes each value whole (even a tuple is ONE value)
                 else:
                     vals = tuple(v)
-                frags.append(dict(zip(names, vals)))
+                frags.append(dict(zip(names, vals, strict=False)))
             combined = [{**c, **f} for c in combined for f in frags]
     # BLE001: parametrize marks carry arbitrary user objects; one that cannot be
     # expanded falls back to the bare callable (the caller's `None` branch)

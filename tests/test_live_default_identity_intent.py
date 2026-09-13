@@ -16,7 +16,7 @@ short-circuit rests on and the observable skip.
 
 from __future__ import annotations
 
-import Wesker.ci as ci
+from Wesker import ci
 from Wesker.ci import (
     _LIVE_SUITE,
     discover_test_callables,

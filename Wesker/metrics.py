@@ -34,10 +34,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # Ensure scripts/ is on the path for wesker_engine/wesker_filter imports
-
-from Wesker.ci import profile_codebase  # noqa: E402
-from Wesker.self_profile import profiler_for_targets  # noqa: E402
-
+from Wesker.ci import profile_codebase
+from Wesker.self_profile import profiler_for_targets
 
 # ---------------------------------------------------------------------------
 # Project configuration — auto-discovered from pyproject.toml
@@ -84,7 +82,8 @@ def _load_config() -> dict:
                 import tomli as tomllib  # type: ignore[no-redef]  # ty: ignore[unresolved-import]
 
         data = tomllib.loads(pyproject.read_text())
-    except Exception:
+    # no TOML parser (3.10 without tomli), an unreadable file, or invalid TOML: defaults
+    except (ImportError, OSError, ValueError):
         return config
 
     # Project name
@@ -209,6 +208,7 @@ def _count_tests() -> int:
         capture_output=True,
         text=True,
         timeout=120,
+        check=False,
     )
     return sum(1 for line in result.stdout.splitlines() if "::" in line)
 
@@ -362,6 +362,7 @@ def _verify_mcdc_single(filepath: str, func_name: str) -> dict:
                 capture_output=True,
                 text=True,
                 timeout=60,
+                check=False,
             )
             killed = result.returncode != 0
             if killed:
@@ -417,7 +418,8 @@ def _discover_mcdc_targets(source_files: list[str]) -> list[tuple[str, str]]:
         try:
             source = Path(filepath).read_text()
             tree = ast.parse(source)
-        except Exception:
+        # unreadable, undecodable (a ValueError) or unparseable: not an MC/DC candidate
+        except (OSError, SyntaxError, ValueError):
             continue
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -465,8 +467,7 @@ def _write_metrics(metrics: dict) -> None:
     env_file = os.environ.get("GITHUB_ENV")
     if env_file:
         with open(env_file, "a") as f:
-            for k, v in metrics.items():
-                f.write(f"{k}={v}\n")
+            f.writelines(f"{k}={v}\n" for k, v in metrics.items())
     else:
         for k, v in metrics.items():
             print(f"  {k}={v}")

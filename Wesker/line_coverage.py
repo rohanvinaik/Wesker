@@ -23,8 +23,9 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Callable
 from types import CodeType
-from typing import Any, Callable
+from typing import Any
 
 from Wesker.interrupt import Abandoned, bounded_join
 
@@ -141,12 +142,12 @@ def _traced_in_thread(
         sys.settrace(dispatch)
         try:
             body()
-        # BLE001: a failing/raising/ABANDONED test still reached lines. `Abandoned` is named
+        # BLE001/S110: a failing/raising/ABANDONED test still reached lines. `Abandoned` is named
         # explicitly because it derives from BaseException on purpose (so a test's own
         # `except Exception` cannot swallow the stop) — catching it here is the point. Naming the
         # pair rather than BaseException lets a real KeyboardInterrupt/SystemExit through, which
         # should stop the run rather than be absorbed by a coverage worker (S5754).
-        except (Exception, Abandoned):  # noqa: BLE001
+        except (Exception, Abandoned):  # noqa: BLE001, S110
             pass
         finally:
             sys.settrace(previous)

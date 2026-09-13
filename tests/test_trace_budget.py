@@ -32,7 +32,10 @@ import time
 # (tests that pass while pinning nothing).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from Wesker.line_coverage import (  # noqa: E402
+from _trace_budget_target import spin
+
+from Wesker.ci import callable_test_id
+from Wesker.line_coverage import (
     _trace_one,
     _trace_one_multi,
     executable_lines,
@@ -40,16 +43,15 @@ from Wesker.line_coverage import (  # noqa: E402
     trace_suite,
 )
 
-from Wesker.ci import callable_test_id
-from _trace_budget_target import spin  # noqa: E402
-
 _FILE = spin.__code__.co_filename
 # Parse the WHOLE module, not inspect.getsource(spin): the tracer records real file line numbers,
 # so the AST must carry them too. Parsing the extracted source re-bases it at line 1 and the
 # `hits & exec_lines` intersection silently comes back EMPTY.
+with open(_FILE, encoding="utf-8") as _fh:
+    _SOURCE = _fh.read()
 _NODE = next(
     n
-    for n in ast.parse(open(_FILE).read()).body
+    for n in ast.parse(_SOURCE).body
     if isinstance(n, ast.FunctionDef) and n.name == "spin"
 )
 _LINES = executable_lines(_NODE)

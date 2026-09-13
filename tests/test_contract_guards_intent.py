@@ -27,7 +27,6 @@ from Wesker.engine import (
 )
 from Wesker.filter import _census_row
 
-
 # ── _stmt_label: the labeller and the analysis must admit the same statement kinds ──
 
 

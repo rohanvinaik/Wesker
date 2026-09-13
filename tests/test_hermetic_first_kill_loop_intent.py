@@ -21,9 +21,10 @@ import os
 import pytest
 
 Detective = pytest.importorskip("Detective")
-from Detective import engine as deng  # noqa: E402
-from Wesker import engine as weng  # noqa: E402
-from Wesker.ci import callable_test_id, run_with_live_suite  # noqa: E402
+from Detective import engine as deng
+
+from Wesker import engine as weng
+from Wesker.ci import callable_test_id, run_with_live_suite
 
 pytestmark = pytest.mark.skipif(
     not getattr(deng, "_WESKER_TARGET_FIRST", False),

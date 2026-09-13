@@ -33,11 +33,12 @@ from __future__ import annotations
 import os
 import re
 import sys
+from collections.abc import Callable, Sequence
 from importlib.abc import MetaPathFinder
 from importlib.machinery import ModuleSpec, SourceFileLoader
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, Sequence
+from typing import Any
 
 PUBLIC_PACKAGE = "Wesker"
 

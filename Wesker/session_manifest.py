@@ -26,11 +26,11 @@ from which files. Per-item outcomes belong to the run and are not here.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
 import os
 import sys
-import contextlib
 from dataclasses import dataclass, field
 from typing import Any
 

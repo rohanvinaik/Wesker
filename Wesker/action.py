@@ -70,6 +70,7 @@ def _git(args: list[str], cwd: str) -> str | None:
             capture_output=True,
             text=True,
             timeout=60,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -210,20 +211,26 @@ def _summary_markdown(report: dict, scope_note: str) -> str:
         "",
         "<details><summary>Why this number is comparable and a kill rate is not</summary>",
         "",
-        "A mutation score's denominator is however many mutants a run happened to sample — "
-        "change the budget and the number changes, so it cannot be compared across repos, "
-        "configs, or tools.",
+        (
+            "A mutation score's denominator is however many mutants a run happened to sample — "
+            "change the budget and the number changes, so it cannot be compared across repos, "
+            "configs, or tools."
+        ),
         "",
-        f"This denominator ({dof}) is derived from the AST. It is a property of the code: the "
-        "same on any machine, at any budget, today and tomorrow. That is what makes "
-        f"{spec}% mean something to someone who has never seen this repo.",
+        (
+            f"This denominator ({dof}) is derived from the AST. It is a property of the code: the "
+            "same on any machine, at any budget, today and tomorrow. That is what makes "
+            f"{spec}% mean something to someone who has never seen this repo."
+        ),
         "",
-        f"Selection reached {report.get('dof_pct', 0)}% of those dimensions using "
-        f"{mutants} mutants — {per_dim} per dimension. Because every mutant's cover set is a "
-        "singleton, greedy selection here is not merely within the usual `1 - 1/e` bound for "
-        "submodular covers — it is *exactly* optimal at `min(m, D)`. That is machine-checked "
-        "in Lean (`coverage_submodular`, `marginal_antitone`, `greedy_coverage_bound`), so the "
-        "cost of this measurement is provably minimal, not just empirically low.",
+        (
+            f"Selection reached {report.get('dof_pct', 0)}% of those dimensions using "
+            f"{mutants} mutants — {per_dim} per dimension. Because every mutant's cover set is a "
+            "singleton, greedy selection here is not merely within the usual `1 - 1/e` bound for "
+            "submodular covers — it is *exactly* optimal at `min(m, D)`. That is machine-checked "
+            "in Lean (`coverage_submodular`, `marginal_antitone`, `greedy_coverage_bound`), so the "
+            "cost of this measurement is provably minimal, not just empirically low."
+        ),
         "</details>",
         "",
     ]
@@ -233,9 +240,11 @@ def _summary_markdown(report: dict, scope_note: str) -> str:
             f"### {len(survivors)} unspecified "
             + ("dimension" if len(survivors) == 1 else "dimensions"),
             "",
-            "Each line below is a *proof obligation*, not an opinion: Wesker changed the code "
-            "and every test still passed. Write a test that fails against the change and it is "
-            "discharged — verifiably, by re-running.",
+            (
+                "Each line below is a *proof obligation*, not an opinion: Wesker changed the code "
+                "and every test still passed. Write a test that fails against the change and it is "
+                "discharged — verifiably, by re-running."
+            ),
             "",
             "| Location | Dimension | No test distinguishes |",
             "|---|---|---|",
@@ -261,8 +270,10 @@ def _summary_markdown(report: dict, scope_note: str) -> str:
             f"pipx run {_DETECTIVE_PKG} converge <file>::<function>",
             "```",
             "",
-            "It synthesizes a complete, minimal suite for the function and Wesker re-runs to "
-            "confirm the mutants die. No inference in the finding, none in the check.",
+            (
+                "It synthesizes a complete, minimal suite for the function and Wesker re-runs to "
+                "confirm the mutants die. No inference in the finding, none in the check."
+            ),
             "",
         ]
     else:
@@ -320,7 +331,7 @@ def _annotate(report: dict) -> None:
 # ── Entry point ──────────────────────────────────────────────────
 
 
-def _stream_reentry() -> "Callable[[], None]":
+def _stream_reentry() -> Callable[[], None]:
     """Snapshot the REAL stdout/stderr fds; return the hand that re-enters them.
 
     Self-profiling runs mutants OF the fd-capture machinery in-process
@@ -505,7 +516,9 @@ def _version() -> str:
         from importlib.metadata import version
 
         return version("Wesker")
-    except Exception:
+    # BLE001: the version is a label on the report, and describing the run must not
+    # fail the run
+    except Exception:  # noqa: BLE001
         return ""
 
 

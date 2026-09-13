@@ -24,10 +24,9 @@ from Wesker.engine import CategoryResult, ProfilingResult, _is_declared_failure
 
 # ── _is_declared_failure ─────────────────────────────────────────────
 def test_violated_raises_contract_is_a_declared_failure():
-    # B017,PT011: the exact type IS the test
-    with pytest.raises(BaseException) as exc:  # noqa: B017,PT011
-        with pytest.raises(ValueError):
-            pass  # nothing raised -> pytest declares failure
+    # BaseException is exact: pytest's `Failed` derives from it, and that type IS the test
+    with pytest.raises(BaseException) as exc, pytest.raises(ValueError):
+        pass  # nothing raised -> pytest declares failure
     assert _is_declared_failure(exc.value)
 
 

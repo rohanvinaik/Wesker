@@ -16,7 +16,7 @@ import textwrap
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from Wesker.line_coverage import (  # noqa: E402
+from Wesker.line_coverage import (
     _target_matcher,
     _trace_one,
     _trace_one_multi,

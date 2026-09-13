@@ -31,7 +31,7 @@ from Wesker.session_manifest import manifest_admissibility
 
 def _project(root: str, name: str) -> str:
     os.makedirs(root, exist_ok=True)
-    (root_file := os.path.join(root, f"test_{name}.py"))
+    root_file = os.path.join(root, f"test_{name}.py")
     with open(root_file, "w") as fh:
         fh.write(f"def test_{name}():\n    assert True\n")
     return os.path.realpath(root)
@@ -113,10 +113,9 @@ def test_an_exception_in_a_session_still_resets_the_scope():
     is the deterministic surface. (Standalone: the live path propagates the body error AND leaves
     the scope None, confirmed outside pytest.)"""
     assert current_measurement_scope() is None
-    with pytest.raises(ValueError, match="boom"):
-        with live_measurement_scope():
-            assert current_measurement_scope() is not None
-            raise ValueError("boom")
+    with pytest.raises(ValueError, match="boom"), live_measurement_scope():
+        assert current_measurement_scope() is not None
+        raise ValueError("boom")
     assert current_measurement_scope() is None
 
 

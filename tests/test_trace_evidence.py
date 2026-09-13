@@ -19,7 +19,6 @@ import pytest
 
 from Wesker.trace_evidence import build_trace_ledger, trace_admissibility
 
-
 # ── the pure decision: only green, contained, whole is admissible ─────────────────
 
 

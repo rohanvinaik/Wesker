@@ -15,9 +15,12 @@ from Wesker.session_manifest import PytestSessionManifest, capture_manifest
 
 def test_regime_digest_binds_the_captured_config_content():
     # Two manifests identical but for the config-content digest MUST differ.
-    common = dict(
-        pytest_version="8", rootpath="/r", inipath="/r/pytest.ini", plugins=("p",)
-    )
+    common = {
+        "pytest_version": "8",
+        "rootpath": "/r",
+        "inipath": "/r/pytest.ini",
+        "plugins": ("p",),
+    }
     a = PytestSessionManifest(inicontent_digest="aaaa", **common)
     b = PytestSessionManifest(inicontent_digest="bbbb", **common)
     assert a.regime_digest != b.regime_digest

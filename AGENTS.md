@@ -47,9 +47,9 @@ PYTHONPATH=$PP python3 -m pytest 2>&1 | tail -3   # Detective's suite vs LOCAL W
 Plus pinned ruff, never bare:
 
 ```bash
-uvx ruff@0.14.10 format . 2>&1 | tail -1 \
-  && uvx ruff@0.14.10 check . 2>&1 | tail -2 \
-  && uvx ruff@0.14.10 format --check . 2>&1 | tail -1
+uvx ruff@0.16.7 format . 2>&1 | tail -1 \
+  && uvx ruff@0.16.7 check . 2>&1 | tail -2 \
+  && uvx ruff@0.16.7 format --check . 2>&1 | tail -1
 ```
 
 ## Wesker-specific hazards

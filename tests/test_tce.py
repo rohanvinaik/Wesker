@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from Wesker.tce import bytecode_equivalent
 
-
 # ── proven equivalences: mutations the compiler folds away ──────────────────────
 
 

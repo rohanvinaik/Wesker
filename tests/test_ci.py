@@ -13,22 +13,21 @@ import ast
 import os
 import textwrap
 
-import Wesker.ci as ci
+from Wesker import ci
 from Wesker.ci import (
     _build_static_impact_map,
-    callable_base_name,
-    callable_case_id,
-    callable_node_id,
-    callable_origin,
-    callable_source,
     _discover_all_test_files,
     _discover_by_convention,
     _load_cached_state,
     _name_matches_convention,
     _pct_color,
+    callable_base_name,
+    callable_case_id,
+    callable_node_id,
+    callable_origin,
+    callable_source,
     walk_functions,
 )
-
 
 # ── _pct_color: threshold boundaries ─────────────────────────────
 

@@ -180,7 +180,9 @@ def test_a_thread_blocked_outside_the_interpreter_is_timed_out_but_not_contained
         try:
             entered.set()
             time.sleep(1.5)
-        except BaseException:  # noqa: BLE001
+        # BLE001/S110: the body swallows everything, the injected stop included; what the
+        # test measures is whether that stop can land at all
+        except BaseException:  # noqa: BLE001, S110
             pass
 
     t = threading.Thread(target=blocked, daemon=True)

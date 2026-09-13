@@ -22,17 +22,16 @@ import os
 import sys
 import textwrap
 import time
-from contextvars import ContextVar
 import unittest
-from pathlib import Path
 from collections.abc import Callable, Iterable
+from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
 from Wesker.engine import (
     run_function_converged,
 )
 from Wesker.filter import filter_categories, prioritize_categories
-
 
 # ── ANSI colors for terminal output ──────────────────────────────
 
@@ -82,8 +81,7 @@ def _name_matches_convention(
         or name == f"test_{base}.py"
         or name == f"test_{base_stripped}.py"
         # Prefix match
-        or name.startswith(f"test_{base}_")
-        or name.startswith(f"test_{base_stripped}_")
+        or name.startswith((f"test_{base}_", f"test_{base_stripped}_"))
         # Parent dir (extraction/det.py -> test_extraction.py)
         or (parent_qualified and name == f"test_{parent_dir}.py")
         # Contains-stem (test_prescriptive_deterministic.py)
@@ -109,8 +107,7 @@ def _discover_by_convention(project_root: str, source_file: str) -> list[str]:
     except ValueError:
         rel = base
     safe = rel.replace(os.sep, "_").replace("/", "_").replace(".", "_")
-    if safe.endswith("_py"):
-        safe = safe[:-3]
+    safe = safe.removesuffix("_py")
     generated_name = f"test_{safe}.py"
 
     # Parent-aware matching
@@ -149,11 +146,15 @@ def _discover_by_convention(project_root: str, source_file: str) -> list[str]:
                 partial_stems,
             )
 
-            # Suppress ambiguous bare-stem matches for common names in subdirs
-            if match and parent_qualified and base_stripped in ambiguous_stems:
-                # Only keep if it also matches parent dir or generated name
-                if not (parent_dir in name or name == generated_name):
-                    continue
+            # Suppress ambiguous bare-stem matches for common names in subdirs: keep one
+            # only if it also matches the parent dir or the generated name
+            if (
+                match
+                and parent_qualified
+                and base_stripped in ambiguous_stems
+                and not (parent_dir in name or name == generated_name)
+            ):
+                continue
 
             if match and path_str not in found:
                 found.append(path_str)
@@ -657,7 +658,7 @@ def partition_live_callables(
 # ── Test callable loading ────────────────────────────────────────
 
 
-def _parametrize_cases(func: Any) -> "list[Any] | None":
+def _parametrize_cases(func: Any) -> list[Any] | None:
     """Expand a ``@pytest.mark.parametrize``-decorated test into one bound, runnable callable per
     case — the legacy loader's parity with pytest for the parametrize forms it can resolve without a
     live session.
@@ -705,7 +706,9 @@ def _parametrize_cases(func: Any) -> "list[Any] | None":
                     vals = tuple(v)
                 frags.append(dict(zip(names, vals)))
             combined = [{**c, **f} for c in combined for f in frags]
-    except Exception:
+    # BLE001: parametrize marks carry arbitrary user objects; one that cannot be
+    # expanded falls back to the bare callable (the caller's `None` branch)
+    except Exception:  # noqa: BLE001
         return None
 
     cases: list[Any] = []
@@ -768,7 +771,9 @@ def load_test_callables(
                 mod = importlib.util.module_from_spec(spec)
                 sys.modules[mod_name] = mod
                 spec.loader.exec_module(mod)
-            except Exception:
+            # BLE001/S112: importing a test module runs arbitrary user code; a module
+            # that cannot be imported contributes no callables to this fallback loader
+            except Exception:  # noqa: BLE001, S112
                 continue
 
         for name in dir(mod):
@@ -789,10 +794,13 @@ def load_test_callables(
                     if mname.startswith("test_"):
                         try:
                             callables.append(getattr(obj(mname), mname))
-                        except Exception:
+                        # BLE001: instantiating a user TestCase runs its __init__; try
+                        # the no-argument form before giving up on the method
+                        except Exception:  # noqa: BLE001
                             try:
                                 callables.append(getattr(obj(), mname))
-                            except Exception:
+                            # BLE001/S110: neither form constructs; the method is skipped
+                            except Exception:  # noqa: BLE001, S110
                                 pass
     return callables
 
@@ -1137,7 +1145,9 @@ def discover_test_callables(
             collected = collect_pytest_callables(
                 project_root, paths=list(scoped) + extra
             )
-        except Exception:
+        # BLE001: collection runs the target's conftests and plugins; any failure
+        # falls through to the legacy loader below (unless the backend is pytest)
+        except Exception:  # noqa: BLE001
             collected = None
         if collected:
             return collected
@@ -1229,7 +1239,9 @@ def _load_cached_state(project_root: str) -> dict | None:
         return None
     try:
         return json.loads(report_path.read_text())
-    except Exception:
+    except (OSError, ValueError):
+        # An unreadable or corrupt cache is the same as no cache. ValueError covers both
+        # json.JSONDecodeError and UnicodeDecodeError.
         return None
 
 

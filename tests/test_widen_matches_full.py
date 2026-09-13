@@ -12,8 +12,7 @@ to handle, and the case a broken widen would report as a false survivor.
 import ast
 import time
 
-import Wesker.engine as engine
-
+from Wesker import engine
 from Wesker.engine import (
     _SESSION_BASELINE,
     LazySessionBaseline,

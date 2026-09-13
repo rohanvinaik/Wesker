@@ -21,9 +21,9 @@ from dataclasses import dataclass
 # reasoning that moved STMT onto _deletable_stmt_ids and SWAP onto
 # estimate_universe_size before this file stopped keeping signals at all).
 from Wesker.engine import (
+    _STATE_SUB_MODES,
     MutationCategory,
     _count_state_targets,
-    _STATE_SUB_MODES,
     count_swap_withheld,
     estimate_universe_size,
 )

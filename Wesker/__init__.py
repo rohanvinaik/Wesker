@@ -36,7 +36,9 @@ from .engine import (
 from .filter import CategoryPrior, filter_categories, prioritize_categories
 from .policy import MutationPolicy, mutation_policy
 
-__all__ = [
+# RUF022: grouped by kind, and the group comments carry meaning (the policy-id note);
+# an alphabetical sort would scatter the groups and orphan those comments
+__all__ = [  # noqa: RUF022
     # Enums
     "MutationCategory",
     # The versioned mutation policy (issue #8) — proof receipts key on

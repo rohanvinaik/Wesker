@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import textwrap
 
-import Wesker.ci as ci
+from Wesker import ci
 from Wesker.engine import (
     _SESSION_BASELINE,
     LazySessionBaseline,
@@ -188,8 +188,8 @@ def test_refreshing_one_file_keeps_a_same_named_test_in_another_module(
     target = _write(tmp_path, "test_written.py", "def test_shared():\n    pass\n")
 
     # A live callable from a DIFFERENT module that happens to share the name.
-    # D103: stands in for the other module's test
-    def test_shared():  # noqa: D103
+    # stands in for the other module's test
+    def test_shared():
         pass
 
     other = _write(tmp_path, "test_other.py", "def test_shared():\n    pass\n")

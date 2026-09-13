@@ -19,9 +19,10 @@ import os
 import pytest
 
 Detective = pytest.importorskip("Detective")
-from Detective import engine as deng  # noqa: E402
-from Wesker import line_coverage as lc  # noqa: E402
-from Wesker.ci import run_with_live_suite  # noqa: E402
+from Detective import engine as deng
+
+from Wesker import line_coverage as lc
+from Wesker.ci import run_with_live_suite
 
 pytestmark = pytest.mark.skipif(
     not getattr(deng, "_WESKER_TARGET_FIRST", False),

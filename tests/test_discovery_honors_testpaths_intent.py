@@ -17,8 +17,8 @@ without the fix.
 from __future__ import annotations
 
 from Wesker.ci import (
-    _discover_all_test_files,
     _DEFAULT_TEST_PATTERNS,
+    _discover_all_test_files,
     callable_origin,
     discover_test_callables,
     relevant_test_files,

@@ -33,9 +33,9 @@ import io
 import itertools
 import os
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from Wesker.session_manifest import PytestSessionManifest
@@ -289,8 +289,8 @@ def collect_pytest_callables(
                 from Wesker.session_manifest import capture_manifest
 
                 _LAST_MANIFEST.set(capture_manifest(session, config, items))
-            # BLE001: a manifest that raises breaks a working run
-            except Exception:  # noqa: BLE001
+            # BLE001/S110: a manifest that raises breaks a working run
+            except Exception:  # noqa: BLE001, S110
                 pass
 
     # Evict already-imported test modules whose source lives under any collection
@@ -330,18 +330,19 @@ def collect_pytest_callables(
             contextlib.redirect_stderr(io.StringIO()),
         ):
             pytest.main(args, plugins=[plugin])
-    except Exception:
+    # BLE001: collection imports the target's conftests, plugins and test modules; a
+    # collection that raises returns None (could not collect)
+    except Exception:  # noqa: BLE001
         return None
     finally:
-        try:
+        with contextlib.suppress(OSError):
             os.chdir(cwd)
-        except Exception:
-            pass
 
     if not plugin.items:
         return None
     try:
         callables = _build_callables(plugin.items)
-    except Exception:
+    # BLE001: binding collected items touches arbitrary user objects; same None
+    except Exception:  # noqa: BLE001
         return None
     return callables or None

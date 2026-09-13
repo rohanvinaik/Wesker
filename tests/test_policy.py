@@ -328,10 +328,12 @@ def test_augassign_removal_keeps_the_prior_value():
 
     ns_orig: dict = {}
     ns_mut: dict = {}
-    exec(src, ns_orig)
+    # S102: executing the original and mutated class is the observation under test
+    exec(src, ns_orig)  # noqa: S102
     mutated_cls = ast.parse(src)
     mutated_cls.body[0].body[1] = mutant.mutated_node
-    exec(compile(ast.fix_missing_locations(mutated_cls), "<m>", "exec"), ns_mut)
+    # S102: as above, for the mutant
+    exec(compile(ast.fix_missing_locations(mutated_cls), "<m>", "exec"), ns_mut)  # noqa: S102
     c_orig, c_mut = ns_orig["C"](), ns_mut["C"]()
     c_orig.bump(5)
     c_mut.bump(5)

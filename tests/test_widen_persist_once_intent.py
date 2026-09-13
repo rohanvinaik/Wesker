@@ -25,7 +25,7 @@ import ast
 import importlib.util
 import json
 
-import Wesker.trace_cache as trace_cache
+from Wesker import trace_cache
 from Wesker.engine import (
     _SESSION_BASELINE,
     LazySessionBaseline,

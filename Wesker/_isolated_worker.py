@@ -136,8 +136,8 @@ class _MutantPlugin:
         from Wesker.engine import (
             _execution_guard,
             _is_declared_failure,
-            _patch_mutant_into_test,
             _patch_module_qualified,
+            _patch_mutant_into_test,
             _unpatch_mutant,
         )
 

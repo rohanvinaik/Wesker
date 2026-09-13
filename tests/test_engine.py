@@ -21,7 +21,6 @@ import pytest
 from Wesker.engine import (
     _DEAD_DIM,
     MutationCategory,
-    _ValueMutator,
     _callee_name,
     _count_targets,
     _greedy_dimension_order,
@@ -30,6 +29,7 @@ from Wesker.engine import (
     _record_dimensions,
     _record_state_dimensions,
     _select_greedy,
+    _ValueMutator,
     generate_mutants,
     run_function_converged,
 )
@@ -472,7 +472,7 @@ def test_patch_module_qualified_patches_class_method_owner():
         )  # mutant on the class -> instance dispatch hits it (killable)
     finally:
         for owner, orig in saved:
-            setattr(owner, "flag", orig)
+            owner.flag = orig
     assert _make_owner().flag() is True  # cleanly restored
 
 
@@ -488,7 +488,7 @@ def test_patch_module_qualified_skips_inherited_method():
             proof, "flag", mutant, __file__, qualname="_SubNoOverride.flag"
         )
     for owner, orig in saved:  # cleanup if anything was (wrongly) patched
-        setattr(owner, "flag", orig)
+        owner.flag = orig
     assert saved == []  # nothing defines _SubNoOverride.flag directly
 
 

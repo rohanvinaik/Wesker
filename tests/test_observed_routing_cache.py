@@ -20,6 +20,8 @@ from Wesker.trace_cache import (
     observed_function_reach,
     save,
     targets_fingerprint,
+)
+from Wesker.trace_cache import (
     test_fingerprint as _test_fingerprint,
 )
 

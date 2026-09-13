@@ -47,8 +47,10 @@ def test_the_pick_witness_is_in_the_universe():
 
     ns_orig: dict = {}
     ns_mut: dict = {}
-    exec(compile(ast.Module([mutant.original_node], []), "<o>", "exec"), ns_orig)
-    exec(
+    # S102: executing the original and mutated definitions is the observation under test
+    exec(compile(ast.Module([mutant.original_node], []), "<o>", "exec"), ns_orig)  # noqa: S102
+    # S102: as above, for the mutant
+    exec(  # noqa: S102
         compile(
             ast.fix_missing_locations(ast.Module([mutant.mutated_node], [])),
             "<m>",

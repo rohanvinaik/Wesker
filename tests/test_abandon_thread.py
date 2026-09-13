@@ -61,11 +61,11 @@ def test_abandon_outranks_the_test_s_own_broad_except():
             try:
                 for _ in range(10**9):
                     pass
-            # BLE001: the point of the test: this must NOT stop it
-            except Exception:  # noqa: BLE001
+            # BLE001/S110: the point of the test: this must NOT stop it
+            except Exception:  # noqa: BLE001, S110
                 pass
-        # BLE001: mirrors _target's own outer catch
-        except BaseException:  # noqa: BLE001
+        # BLE001/S110: mirrors _target's own outer catch
+        except BaseException:  # noqa: BLE001, S110
             pass
 
     t = _spawn(_swallower)
@@ -110,7 +110,9 @@ def test_abandon_reports_false_for_a_thread_blocked_outside_the_interpreter():
         try:
             entered.set()
             time.sleep(3)  # C-level block: the GIL is released and no bytecode executes
-        except BaseException:  # noqa: BLE001
+        # BLE001/S110: the body swallows everything, the injected stop included; what the
+        # test measures is whether that stop can land at all
+        except BaseException:  # noqa: BLE001, S110
             pass
 
     t = threading.Thread(target=_blocked, daemon=True)

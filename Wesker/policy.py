@@ -120,9 +120,11 @@ _FINGERPRINT_CORPUS: tuple[str, ...] = (
     # Without a corpus entry reaching them the policy id would move while every
     # fingerprint count stayed identical, which is a version bump the corpus
     # cannot tell you anything about.
-    "def fp_bitwise(a, b, m):\n"
-    "    a <<= 1\n"
-    "    return (m @ m, a >> b, a & b, a | b, a ^ b, ~a, +a)\n",
+    (
+        "def fp_bitwise(a, b, m):\n"
+        "    a <<= 1\n"
+        "    return (m @ m, a >> b, a & b, a | b, a ^ b, ~a, +a)\n"
+    ),
     # SWAP: adjacent transposition, used-call unwrap, builtin dual (min),
     # provenance-resolved math dual (floor).
     "def fp_swap(xs):\n    import math\n    return math.floor(min(len(xs), 2)) + pow(len(xs), 2)\n",
@@ -133,32 +135,38 @@ _FINGERPRINT_CORPUS: tuple[str, ...] = (
     # three-argument call carries the (0, 2) question that policy 6 never asked;
     # the six-argument call exceeds C(6,2)=15 > 10, so it is also the corpus's
     # only witness that the budget WITHHOLDS rather than silently truncates.
-    "def fp_swap_wide(a, b, c, d, e, f):\n"
-    "    return g(a, b, c) + h(a, b, c, d, e, f)\n",
+    (
+        "def fp_swap_wide(a, b, c, d, e, f):\n"
+        "    return g(a, b, c) + h(a, b, c, d, e, f)\n"
+    ),
     # STATE (all three sub-modes) + TYPE + EXCEPTION (raise_type,
     # handler_swallow, handler_broaden).
-    "def fp_state_type_exc(self, xs):\n"
-    "    self.total = 0\n"
-    "    for x in xs:\n"
-    "        if isinstance(x, bool):\n"
-    "            continue\n"
-    "        if x is None:\n"
-    "            break\n"
-    "        try:\n"
-    "            self.total = int(x)\n"
-    "        except ValueError:\n"
-    "            self.total = -1\n"
-    "    if not xs:\n"
-    "        raise LookupError(xs)\n"
-    "    return self.total\n",
+    (
+        "def fp_state_type_exc(self, xs):\n"
+        "    self.total = 0\n"
+        "    for x in xs:\n"
+        "        if isinstance(x, bool):\n"
+        "            continue\n"
+        "        if x is None:\n"
+        "            break\n"
+        "        try:\n"
+        "            self.total = int(x)\n"
+        "        except ValueError:\n"
+        "            self.total = -1\n"
+        "    if not xs:\n"
+        "        raise LookupError(xs)\n"
+        "    return self.total\n"
+    ),
     # STMT: discarded-value call, subscript/attribute aliased writes, a
     # rebinding (deletable) after a first binding (not deletable).
-    "def fp_stmt(items, cfg):\n"
-    "    items.append(1)\n"
-    '    cfg["k"] = 2\n'
-    "    total = 3\n"
-    "    total = abs(total)\n"
-    "    return total\n",
+    (
+        "def fp_stmt(items, cfg):\n"
+        "    items.append(1)\n"
+        '    cfg["k"] = 2\n'
+        "    total = 3\n"
+        "    total = abs(total)\n"
+        "    return total\n"
+    ),
     # Async carries the same universe as sync.
     "async def fp_async(x):\n    return x + 1\n",
     # DATAFLOW (enrolled slice): return_sub over both visible candidates.
@@ -167,22 +175,26 @@ _FINGERPRINT_CORPUS: tuple[str, ...] = (
     # str × int-literal Mult carry NO arithmetic dimension; the one-sided
     # f-string Add and the name-name Adds still do (a name may carry
     # __radd__ — provable cases only).
-    "def fp_str_arith(parts, n):\n"
-    "    label = 'if ' + ' and '.join(parts) + ' then '\n"
-    "    bar = '-' * 3\n"
-    "    grown = f'{label}!' + label\n"
-    "    total = n + 1\n"
-    "    return label + bar\n",
+    (
+        "def fp_str_arith(parts, n):\n"
+        "    label = 'if ' + ' and '.join(parts) + ' then '\n"
+        "    bar = '-' * 3\n"
+        "    grown = f'{label}!' + label\n"
+        "    total = n + 1\n"
+        "    return label + bar\n"
+    ),
     # STATE remove_assign across all three write spellings (policy 3); the
     # valueless declaration is NOT a write and must stay out. The two-target
     # write (policy 4) carries one dimension PER attribute, each with its own
     # per-target mutant.
-    "def fp_state_spellings(self, v):\n"
-    "    self.plain = v\n"
-    "    self.annotated: int = v\n"
-    "    self.augmented += v\n"
-    "    self.left = self.right = v\n"
-    "    self.declared: int\n",
+    (
+        "def fp_state_spellings(self, v):\n"
+        "    self.plain = v\n"
+        "    self.annotated: int = v\n"
+        "    self.augmented += v\n"
+        "    self.left = self.right = v\n"
+        "    self.declared: int\n"
+    ),
 )
 
 
@@ -379,13 +391,19 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
         ),
         "observation": [
             "a mutant is killed when a covering test fails under it",
-            "assertion kills (value-specified) are distinguished from "
-            "crash/timeout kills (run-only), and an assertion kill takes "
-            "precedence over a crash kill for the same mutant",
-            "survivors probe synthesized boundary inputs for likely "
-            "equivalence; equivalence is reported, never silently claimed",
-            "covering-test scoping and categorical exclusion are "
-            "verdict-preserving reductions",
+            (
+                "assertion kills (value-specified) are distinguished from "
+                "crash/timeout kills (run-only), and an assertion kill takes "
+                "precedence over a crash kill for the same mutant"
+            ),
+            (
+                "survivors probe synthesized boundary inputs for likely "
+                "equivalence; equivalence is reported, never silently claimed"
+            ),
+            (
+                "covering-test scoping and categorical exclusion are "
+                "verdict-preserving reductions"
+            ),
         ],
         "purity_overlay": (
             "filter_categories(is_pure=True) suppresses the remove_assign "
@@ -394,38 +412,52 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
         ),
         "categories": _categories(two_sign),
         "exclusions": [
-            "first-order only: mutants are generated one at a time from the "
-            "original AST; kills do not certify compositions of operators "
-            "(see the composite-blind-spot witness in issue #11)",
-            "DATAFLOW's enrolled slice is returned-name substitution only: "
-            "general name-load substitution is implemented but not enrolled "
-            "(measured at +217% dimensions on Wesker itself — awaiting a "
-            "candidate restraint), and attribute selectors, subscript keys, "
-            "callable references, and receiver (self/cls) substitutions are "
-            "declared out of the supported slice, not silently covered "
-            "(issue #10's remaining subfamilies)",
-            "argument-order questions are budgeted per call site: every PAIR of "
-            "positional arguments is a question, asked nearest-first up to "
-            f"{SWAP_PAIR_BUDGET} (every pair through five positional arguments). A "
-            "wider call has its remaining pairs WITHHELD — counted by the operator "
-            "census and reported, never generated. 'never asked' and 'asked, and no "
-            "distinguishing input was found' are different states with different "
-            "remedies; neither may be read as verified",
-            "argument order WITHIN a starred expansion is not a target: f(a, *rest) "
-            "carries two argument expressions whatever `rest` holds at runtime, so "
-            "the pairs are over the AST's positional entries, not the call's eventual "
-            "arguments",
-            "no rotations or multi-position reorderings: catching one does not pin "
-            "the pairs it moves, and the pairs are the declared dimension",
+            (
+                "first-order only: mutants are generated one at a time from the "
+                "original AST; kills do not certify compositions of operators "
+                "(see the composite-blind-spot witness in issue #11)"
+            ),
+            (
+                "DATAFLOW's enrolled slice is returned-name substitution only: "
+                "general name-load substitution is implemented but not enrolled "
+                "(measured at +217% dimensions on Wesker itself — awaiting a "
+                "candidate restraint), and attribute selectors, subscript keys, "
+                "callable references, and receiver (self/cls) substitutions are "
+                "declared out of the supported slice, not silently covered "
+                "(issue #10's remaining subfamilies)"
+            ),
+            (
+                "argument-order questions are budgeted per call site: every PAIR of "
+                "positional arguments is a question, asked nearest-first up to "
+                f"{SWAP_PAIR_BUDGET} (every pair through five positional arguments). A "
+                "wider call has its remaining pairs WITHHELD — counted by the operator "
+                "census and reported, never generated. 'never asked' and 'asked, and no "
+                "distinguishing input was found' are different states with different "
+                "remedies; neither may be read as verified"
+            ),
+            (
+                "argument order WITHIN a starred expansion is not a target: f(a, *rest) "
+                "carries two argument expressions whatever `rest` holds at runtime, so "
+                "the pairs are over the AST's positional entries, not the call's eventual "
+                "arguments"
+            ),
+            (
+                "no rotations or multi-position reorderings: catching one does not pin "
+                "the pairs it moves, and the pairs are the declared dimension"
+            ),
             "sorted(reverse=) has no curated dual until a measured case wants it",
-            "bare re-raise carries no EXCEPTION target; an already-pass "
-            "handler is not a handler_swallow target; an untyped except: is "
-            "not a handler_broaden target",
-            "type-impossible ARITHMETIC swaps are not targets: Add on two "
-            "provably-str operands and Mult on str x int-literal can only "
-            "raise TypeError (reachability, not specification); provable "
-            "inference only — annotations are never trusted, and a one-sided "
-            "str Add stays in the universe",
+            (
+                "bare re-raise carries no EXCEPTION target; an already-pass "
+                "handler is not a handler_swallow target; an untyped except: is "
+                "not a handler_broaden target"
+            ),
+            (
+                "type-impossible ARITHMETIC swaps are not targets: Add on two "
+                "provably-str operands and Mult on str x int-literal can only "
+                "raise TypeError (reachability, not specification); provable "
+                "inference only — annotations are never trusted, and a one-sided "
+                "str Add stays in the universe"
+            ),
         ],
         "fingerprint_corpus": list(_FINGERPRINT_CORPUS),
         "fingerprint_counts": fingerprint,

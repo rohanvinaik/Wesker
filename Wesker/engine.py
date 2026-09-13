@@ -19,19 +19,12 @@ import math
 import threading
 import time
 import types
-from dataclasses import dataclass, field
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, TypeGuard
+from typing import TYPE_CHECKING, Any, ClassVar, TypeGuard
 
 from .interrupt import bounded_join
-from .line_coverage import admissible_coverage as _admissible_coverage
-from .line_coverage import arcs_from_trace as _arcs_from_trace
-from .line_coverage import coverage_from_trace as _coverage_from_trace
-from .line_coverage import executable_lines as _executable_lines
-from .line_coverage import failing_on_baseline as _failing_on_baseline
-from .line_coverage import trace_line_coverage as _trace_line_coverage
-from .line_coverage import trace_suite as _trace_suite
 from .isolation import (
     IsolatedMutantWorker,
     IsolatedRun,
@@ -45,16 +38,23 @@ from .isolation import (
     scope_fast_mode_standing,
     should_recycle,
 )
+from .line_coverage import admissible_coverage as _admissible_coverage
+from .line_coverage import arcs_from_trace as _arcs_from_trace
+from .line_coverage import coverage_from_trace as _coverage_from_trace
+from .line_coverage import executable_lines as _executable_lines
+from .line_coverage import failing_on_baseline as _failing_on_baseline
+from .line_coverage import trace_line_coverage as _trace_line_coverage
+from .line_coverage import trace_suite as _trace_suite
+from .memory_guard import memory_enforcement_standing
+from .memory_guard import over_budget as _over_budget
+from .memory_guard import reclaim as _reclaim
+from .memory_guard import resolve_budget as _resolve_budget
+from .memory_guard import run_baseline_bytes as _mem_baseline
 from .subsumption import distinct_obligations as _distinct_obligations
 from .subsumption import redundancy_groups
 from .swap_plan import SWAP_PAIR_BUDGET, swap_label, swap_plan
 from .tce import WARRANT_BYTECODE, nodes_equivalent
 from .trace_evidence import TraceEvidence, build_trace_ledger
-from .memory_guard import memory_enforcement_standing
-from .memory_guard import over_budget as _over_budget
-from .memory_guard import reclaim as _reclaim
-from .memory_guard import run_baseline_bytes as _mem_baseline
-from .memory_guard import resolve_budget as _resolve_budget
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -891,7 +891,8 @@ class _ValueMutator(_BaseMutator):
             # and `flag` is how they spend it. NaN never perturbs (x+d is NaN,
             # ==-invisible); a delta lost to float magnitude (1e20+0.1 == 1e20) or
             # landing on the collapse drops out rather than duplicating a mutant.
-            if v == v:
+            # PLR0124: `v == v` is False exactly for NaN, which never perturbs (see above)
+            if v == v:  # noqa: PLR0124
                 for delta, label in (
                     (1.0, "VALUE:float~pert+1"),
                     (-1.0, "VALUE:float~pert-1"),
@@ -931,7 +932,7 @@ class _BoundaryMutator(_BaseMutator):
 
     # Boundary / predicate flip — the always-present alternative for every
     # comparison operator.
-    _SWAP = {
+    _SWAP: ClassVar[dict[type, type]] = {
         ast.Lt: ast.LtE,
         ast.LtE: ast.Lt,
         ast.Gt: ast.GtE,
@@ -948,7 +949,7 @@ class _BoundaryMutator(_BaseMutator):
 
     # Direction reversal — a SECOND alternative on ordering comparisons only.
     # Distinct behavioral DOF from the boundary shift (`<` vs `>` vs `<=`).
-    _DIRECTION = {
+    _DIRECTION: ClassVar[dict[type, type]] = {
         ast.Lt: ast.Gt,
         ast.Gt: ast.Lt,
         ast.LtE: ast.GtE,
@@ -957,7 +958,7 @@ class _BoundaryMutator(_BaseMutator):
 
     # Equality collapse — a THIRD alternative on orderings: does the suite pin a RANGE,
     # or merely a point? Absent, an ordering whose tests only probe equality looks pinned.
-    _EQUALITY = {
+    _EQUALITY: ClassVar[dict[type, type]] = {
         ast.Lt: ast.Eq,
         ast.Gt: ast.Eq,
         ast.LtE: ast.Eq,
@@ -1073,7 +1074,7 @@ class _SwapMutator(_BaseMutator):
     # entry inflates every universe that calls it (measured before adding: the whole
     # table costs +0.33% universe on Detective, +0.46% on Wesker). Symmetric pairs;
     # `sorted(reverse=)` deliberately excluded until a measured case wants it.
-    _DUALS = {
+    _DUALS: ClassVar[dict[str, str]] = {
         "min": "max",
         "max": "min",
         "any": "all",
@@ -1639,7 +1640,7 @@ class _ArithmeticMutator(_BaseMutator):
     # using `@` or `<<` had a dimension no fault model covered and nothing said so. Each dual is
     # chosen to be BEHAVIOURALLY distinguishable rather than merely symmetric, because a swap that
     # is equivalent on its natural domain pads the unproven-equivalent bucket (issue #12).
-    _BIN_SWAP: dict[type, type] = {
+    _BIN_SWAP: ClassVar[dict[type, type]] = {
         ast.Add: ast.Sub,
         ast.Sub: ast.Add,
         ast.Mult: ast.Div,
@@ -1730,7 +1731,7 @@ class _LogicalMutator(_BaseMutator):
     mutation operator set.
     """
 
-    _BOOL_SWAP: dict[type, type] = {
+    _BOOL_SWAP: ClassVar[dict[type, type]] = {
         ast.And: ast.Or,
         ast.Or: ast.And,
     }
@@ -3089,19 +3090,19 @@ class SessionBaseline:
     """
 
     __slots__ = (
-        "traced",
-        "failing",
-        "inert",
-        "n_tests",
-        "truncated",
-        "inert_ids",
-        "uncontained",
         "arcs",
-        "replayed",
-        "identity_standing",
+        "failing",
         "identity_conflicts",
-        "proof_basis",
+        "identity_standing",
+        "inert",
+        "inert_ids",
+        "n_tests",
         "pending_persist",
+        "proof_basis",
+        "replayed",
+        "traced",
+        "truncated",
+        "uncontained",
     )
 
     def __init__(
@@ -3160,9 +3161,9 @@ class SessionBaseline:
         self,
         affected: set[str],
         removed_ids: set[int],
-        partial: "SessionBaseline",
+        partial: SessionBaseline,
         n_tests: int,
-    ) -> "SessionBaseline":
+    ) -> SessionBaseline:
         """This baseline with every test named in ``affected`` re-measured from ``partial``.
 
         Writing ONE test file invalidated the whole baseline, so the next read re-traced the
@@ -3238,13 +3239,13 @@ class LazySessionBaseline:
     """
 
     __slots__ = (
-        "_build",
-        "_value",
-        "_built",
-        "_budgets",
-        "_regime_digest",
-        "_pending",
         "_batched",
+        "_budgets",
+        "_build",
+        "_built",
+        "_pending",
+        "_regime_digest",
+        "_value",
     )
 
     def __init__(
@@ -3513,7 +3514,7 @@ class LazySessionBaseline:
             return False
         return True
 
-    def fork(self) -> "LazySessionBaseline":
+    def fork(self) -> LazySessionBaseline:
         """A fresh, UNBUILT holder over the same build closure, budgets, and regime — for a
         per-function seeded baseline that must not contaminate the session's shared holder (Fix B #1).
 
@@ -4604,7 +4605,8 @@ def _safe_code(obj: Any) -> Any:
     """
     try:
         return getattr(obj, "__code__", None)
-    except Exception:
+    # BLE001: a library proxy raises anything for `__code__` (see above)
+    except Exception:  # noqa: BLE001
         return None
 
 
@@ -4657,7 +4659,9 @@ def _patch_module_qualified(
             continue
         try:
             obj = getattr(mod, func_name, None)
-        except Exception:
+        # BLE001/S112: sys.modules holds arbitrary modules whose attribute access can
+        # raise anything; one that cannot be read is not the binding being patched
+        except Exception:  # noqa: BLE001, S112
             continue
         code = _safe_code(obj)
         if code is None:
@@ -4666,7 +4670,8 @@ def _patch_module_qualified(
             if _co_filename_matches(code.co_filename, source_path):
                 setattr(mod, func_name, mutated_obj)
                 saved.append((mod, obj))
-        except Exception:
+        # BLE001/S112: a module that refuses the patch is left as it is
+        except Exception:  # noqa: BLE001, S112
             continue
 
     # Class-method owner patch: resolve ``Class.method`` within the defining module and patch the
@@ -4685,7 +4690,9 @@ def _patch_module_qualified(
             try:
                 for part in owner_parts:
                     owner = getattr(owner, part)
-            except Exception:
+            # BLE001/S112: resolving the owner walks arbitrary module attributes; a path
+            # that raises does not lead to the defining owner
+            except Exception:  # noqa: BLE001, S112
                 continue
             if not isinstance(owner, type) or method not in getattr(
                 owner, "__dict__", {}
@@ -4701,7 +4708,8 @@ def _patch_module_qualified(
                         owner, method, _preserve_descriptor_shape(existing, mutated_obj)
                     )
                     saved.append((owner, existing))
-            except Exception:
+            # BLE001/S112: an owner class that refuses the patch is left as it is
+            except Exception:  # noqa: BLE001, S112
                 continue
     return saved
 
@@ -4720,7 +4728,9 @@ def _co_filename_matches(co_filename: str | None, source_path: str | None) -> bo
         a = os.path.abspath(co_filename).replace("\\", "/")
         if a == os.path.abspath(source_path).replace("\\", "/"):
             return True
-    except Exception:
+    # abspath raises TypeError for a non-path, ValueError for an embedded NUL, and
+    # OSError when a relative path meets a deleted working directory
+    except (OSError, TypeError, ValueError):
         return False
     rel = source_path.replace("\\", "/").lstrip("./")
     return bool(rel) and (a == rel or a.endswith("/" + rel))
@@ -5238,7 +5248,7 @@ def _held_patch_proof() -> _PatchProof:
     This also narrows the forging hole the probe measured. `_PatchProof()` can still be written
     out by hand, but every path this module offers requires actually holding the lock.
     """
-    if not _EXECUTION_LOCK._is_owned():  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]  # noqa: SLF001
+    if not _EXECUTION_LOCK._is_owned():  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         raise RuntimeError(
             "patch proof requested without holding the execution lock (#19): "
             "wrap the call in `with _execution_guard() as proof:`"
@@ -5402,14 +5412,14 @@ def _lock_owner_from_repr() -> int:
 
 def _note_lock_entry() -> None:
     """Record this thread as owner. Called with the lock ALREADY HELD."""
-    global _LOCK_OWNER_TID, _LOCK_DEPTH  # noqa: PLW0603
+    global _LOCK_OWNER_TID, _LOCK_DEPTH
     _LOCK_OWNER_TID = threading.get_ident()
     _LOCK_DEPTH += 1
 
 
 def _note_lock_exit() -> None:
     """Drop one level of ownership. Called with the lock STILL HELD, so this cannot race."""
-    global _LOCK_OWNER_TID, _LOCK_DEPTH  # noqa: PLW0603
+    global _LOCK_OWNER_TID, _LOCK_DEPTH
     _LOCK_DEPTH = max(0, _LOCK_DEPTH - 1)
     if _LOCK_DEPTH == 0:
         _LOCK_OWNER_TID = 0
@@ -5592,7 +5602,9 @@ def evaluate_mutant(
                 constructed=False,
                 elapsed_ms=_elapsed(start),
             )
-    except Exception:
+    # BLE001: compiling and executing the mutated definition runs its decorators and
+    # defaults (arbitrary user code); any failure means no mutant was constructed
+    except Exception:  # noqa: BLE001
         # Compile/exec of the mutated AST failed. Same category as above: no mutant exists,
         # so no test can have detected one.
         return MutantResult(
@@ -5788,7 +5800,9 @@ def evaluate_mutant(
         for _mod, _orig in module_saved:
             try:
                 setattr(_mod, func_name, _orig)
-            except Exception:
+            # BLE001/S110: one binding that refuses restoration must not skip the rest or
+            # mask the result being returned
+            except Exception:  # noqa: BLE001, S110
                 pass
 
 
@@ -5827,7 +5841,8 @@ def _outcome_on_original(
         try:
             live.append((target, _get_raw_attr(target, func_name)))
             setattr(target, func_name, saved)
-        except Exception:
+        # BLE001/S112: a target that cannot be read or rebound keeps its current binding
+        except Exception:  # noqa: BLE001, S112
             continue
     try:
         return _run_test_with_timeout(
@@ -5837,7 +5852,8 @@ def _outcome_on_original(
         for target, current in live:
             try:
                 setattr(target, func_name, current)
-            except Exception:
+            # BLE001/S110: re-installing one binding must not skip the rest
+            except Exception:  # noqa: BLE001, S110
                 pass
 
 
@@ -5918,11 +5934,15 @@ def _run_test_with_timeout(
                     test_fn()
         except AssertionError:
             result_box[0] = "assertion"
-        except Exception:
+        # BLE001: any non-assertion exception from the test is a crash kill; the breadth
+        # is the classification
+        except Exception:  # noqa: BLE001
             result_box[0] = "crash"
         except (KeyboardInterrupt, SystemExit):
             raise
-        except BaseException as exc:
+        # BLE001: interrupts re-raise above; what remains is read below, because a
+        # declared failure is not a crash
+        except BaseException as exc:  # noqa: BLE001
             # A test DECLARING failure is not a crash — see `_is_declared_failure`. Reading
             # it as one discards a real pin: `value_survivor_records` re-lists every
             # non-value kill, so a mutant killed by a `pytest.raises` contract came back as
@@ -5998,7 +6018,9 @@ def _mutant_change(mutant: Mutant) -> str:
     try:
         original = ast.unparse(mutant.original_node)
         mutated = ast.unparse(mutant.mutated_node)
-    except Exception:
+    # BLE001: ast.unparse raises whatever a malformed node trips; an edit that cannot be
+    # rendered falls back to the category description
+    except Exception:  # noqa: BLE001
         return ""
     if original == mutated:
         return ""
@@ -6029,7 +6051,8 @@ def _mutant_diff(mutant: Mutant) -> str:
     try:
         original = ast.unparse(mutant.original_node).strip()
         mutated = ast.unparse(mutant.mutated_node).strip()
-    except Exception:
+    # BLE001: as above, a node that cannot be unparsed has no diff to show
+    except Exception:  # noqa: BLE001
         return ""
     return f"- {original}\n+ {mutated}" if original != mutated else ""
 
@@ -6578,7 +6601,7 @@ def run_function_profiling(
                     qualname=qualname,
                     source_path=source_path,
                 )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # ONE EXCEPTION to "one bad mutant must never abort the run", and it is not a mutant
             # at all: an ORPHANED execution lock. That lock is process-global and its owner no
             # longer exists, so it is never coming back and EVERY remaining mutant fails the same
@@ -7276,11 +7299,14 @@ def check_equivalent(
             orig_result = mut_result = None
             try:
                 orig_result = orig_fn(*args)
-            except Exception as e:
+            # BLE001: the compared functions raise whatever they raise; the exception is
+            # the observation being compared
+            except Exception as e:  # noqa: BLE001
                 orig_exc = e
             try:
                 mut_result = mut_fn(*args)
-            except Exception as e:
+            # BLE001: the same observation, on the mutant
+            except Exception as e:  # noqa: BLE001
                 mut_exc = e
 
             # One raises and the other doesn't → NOT equivalent
@@ -7299,7 +7325,9 @@ def check_equivalent(
         # If ALL inputs raised, we have no evidence of equivalence.
         return successful_comparisons > 0
 
-    except Exception:
+    # BLE001: compiling and running the pair executes user code; any failure is no
+    # evidence of equivalence
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -7410,7 +7438,7 @@ def run_function_converged(
     # is always sound, just slower.
     _trace_truncated: set[str] = set()
     _baseline_uncontained: set[str] = set()
-    _tests_for, line_cov, exec_lines, failing = _build_test_scope(
+    _tests_for, line_cov, exec_lines, _failing = _build_test_scope(
         func_node,
         test_functions,
         original_func,
@@ -7430,7 +7458,7 @@ def run_function_converged(
     if _freshen_proof_covering(test_functions, line_cov, exec_lines, scope_tests):
         _trace_truncated = set()
         _baseline_uncontained = set()
-        _tests_for, line_cov, exec_lines, failing = _build_test_scope(
+        _tests_for, line_cov, exec_lines, _failing = _build_test_scope(
             func_node,
             test_functions,
             original_func,
@@ -7677,7 +7705,7 @@ def run_function_converged(
         _widen_holder.expand(_batch, persist=False)
         _wt: set[str] = set()
         _wu: set[str] = set()
-        _tests_for, line_cov, exec_lines, failing = _build_test_scope(
+        _tests_for, line_cov, exec_lines, _failing = _build_test_scope(
             func_node,
             test_functions,
             original_func,

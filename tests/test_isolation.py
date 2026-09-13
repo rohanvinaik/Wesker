@@ -27,7 +27,6 @@ from Wesker.isolation import (
     should_recycle,
 )
 
-
 # ── the pure decision ──────────────────────────────────────────────────────────
 
 
@@ -546,7 +545,7 @@ def test_a_mutant_construction_failure_cannot_certify_an_empty_universe(
     tmp_path, monkeypatch
 ):
     """Audit B/#18: excluded harness errors must refuse the aggregate certificate."""
-    import Wesker.engine as engine
+    from Wesker import engine
     from Wesker.ci import _PROJECT_ROOT
     from Wesker.filter import filter_categories
 

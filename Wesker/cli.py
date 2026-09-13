@@ -200,8 +200,8 @@ def main(argv: list[str] | None = None) -> int:
             from Wesker.memory_guard import telemetry
 
             print(f"[{telemetry()}]")
-        # BLE001: telemetry is advisory
-        except Exception:  # noqa: BLE001
+        # BLE001/S110: telemetry is advisory; a footer that fails is simply not printed
+        except Exception:  # noqa: BLE001, S110
             pass
 
     # Threshold gate

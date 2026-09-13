@@ -141,7 +141,8 @@ def test_scoped_and_unscoped_verdicts_agree():
     )
     node = _fn(src)
     ns: dict = {}
-    exec(compile(ast.parse(src), "<scoretest>", "exec"), ns)
+    # S102: the source is the literal above; executing it yields the function under test
+    exec(compile(ast.parse(src), "<scoretest>", "exec"), ns)  # noqa: S102
     original = ns["scoreit"]
 
     def test_flag_true():

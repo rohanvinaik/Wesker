@@ -41,11 +41,12 @@ import contextlib
 import io
 import os
 import sys
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from Wesker.interrupt import Abandoned
 
-__all__ = ["session_callables", "run_in_session"]
+__all__ = ["run_in_session", "session_callables"]
 
 try:  # pytest is an OPTIONAL dependency — this module degrades to a no-op without it.
     import pytest as _pytest
@@ -54,7 +55,9 @@ try:  # pytest is an OPTIONAL dependency — this module degrades to a no-op wit
     # and this real decorator as a conflicting reassignment. Both are "callable that returns
     # its argument"; only the fallback's shape is expressible here.
     _hookwrapper = _pytest.hookimpl(hookwrapper=True)  # type: ignore[assignment]
-except Exception:  # pragma: no cover — no pytest: run_in_session returns None anyway
+# BLE001: pytest is optional, and a broken install must degrade like an absent one
+# (no pytest: run_in_session returns None anyway)
+except Exception:  # pragma: no cover  # noqa: BLE001
 
     def _hookwrapper(fn):  # type: ignore[misc]
         return fn
@@ -283,7 +286,7 @@ class _CollectionErrorCapture:
     def __init__(self) -> None:
         self.errors: list[tuple[str, str]] = []
 
-    def pytest_collectreport(self, report: Any) -> None:  # noqa: ANN401
+    def pytest_collectreport(self, report: Any) -> None:
         if report.failed:
             longrepr = str(report.longrepr) if report.longrepr else "(no detail)"
             self.errors.append((report.nodeid or "(root)", longrepr[:800]))
@@ -372,8 +375,8 @@ def run_in_session(
                 box["manifest_token"] = _LAST_MANIFEST.set(
                     capture_manifest(session, config, items)
                 )
-            # BLE001: a manifest that raises breaks a working run
-            except Exception:  # noqa: BLE001
+            # BLE001/S110: a manifest that raises breaks a working run
+            except Exception:  # noqa: BLE001, S110
                 pass
             # Surface the collection errors this live session captured (a test that failed to COLLECT
             # is silently absent from the routed suite, so its target's COMPLETE claim is unsafe).
@@ -386,8 +389,8 @@ def run_in_session(
                 _LAST_COLLECTION_ERRORS.set(
                     tuple(nid for nid, _ in collect_errors.errors)
                 )
-            # BLE001: describing the run must not fail the run
-            except Exception:  # noqa: BLE001
+            # BLE001/S110: describing the run must not fail the run
+            except Exception:  # noqa: BLE001, S110
                 pass
 
         def pytest_runtestloop(self, session):  # type: ignore[no-untyped-def]
@@ -494,7 +497,9 @@ def run_in_session(
                 )
         else:
             rc = int(pytest.main(args, plugins=[_Driver(), capture, collect_errors]))
-    except Exception:
+    # BLE001: pytest.main runs the target's suite and plugins; a crash is recorded in
+    # `diagnostic` and returned as no result
+    except Exception:  # noqa: BLE001
         if diagnostic is not None:
             diagnostic["reason"] = "pytest_crashed"
         return None

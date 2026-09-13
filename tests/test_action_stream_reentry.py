@@ -36,6 +36,7 @@ def test_report_lines_survive_a_killed_stdout():
         capture_output=True,
         text=True,
         timeout=60,
+        check=False,
     )
     assert proc.returncode == 0, proc.stderr
     assert "::warning file=x.py,line=1::report-survives" in proc.stdout
@@ -53,7 +54,11 @@ print("after")
 sys.stderr.write("err-after\\n")
 """
     proc = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True, timeout=60
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
     )
     assert proc.returncode == 0, proc.stderr
     assert "before" in proc.stdout

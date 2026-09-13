@@ -33,7 +33,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-# Ensure scripts/ is on the path for wesker_engine/wesker_filter imports
 from Wesker.ci import profile_codebase
 from Wesker.self_profile import profiler_for_targets
 

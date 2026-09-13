@@ -5,7 +5,22 @@ on:
     branches: [main]
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_dispatch:
 
+# Least privilege. Nothing in this workflow writes to the repository; the SonarCloud job
+# authenticates with SONAR_TOKEN, not with this token.
+permissions:
+  contents: read
+
+# A newer push to the same ref makes an in-flight run's answer obsolete: cancel it rather than
+# spend an eight-cell matrix on a commit nobody will look at.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Actions are pinned to full commit SHAs, with the release they came from in the trailing comment.
+# A tag can be moved to point at different code; a commit cannot. Bumping one is a deliberate edit,
+# not something a run picks up on its own — the same reason uv is pinned below instead of "latest".
 jobs:
   test:
     # Matrix over the classifiers' claimed Pythons (3.10–3.13) and two OSes. Mutation runs use
@@ -18,13 +33,15 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          # Nothing in this job pushes, so the token is not left behind in .git/config.
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
         with:
-          version: "latest"
+          version: "0.12.13"
 
       - name: Install dependencies
         # --python overrides the repo .python-version pin so each cell resolves its own interpreter.
@@ -43,7 +60,7 @@ jobs:
         # Only the canonical cell feeds SonarCloud — avoids a matrix artifact-name collision, and
         # coverage is platform/Python-independent so one cell suffices.
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-report
           path: coverage.xml
@@ -59,11 +76,14 @@ jobs:
     # before publishing. A green job here is not a licence to skip the local run.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: astral-sh/setup-uv@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          version: "latest"
+          # check_sdist.py asks git what it tracks, which needs no credentials.
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+        with:
+          version: "0.12.13"
 
       - name: Build sdist and wheel
         run: uv build --out-dir dist
@@ -79,12 +99,14 @@ jobs:
     env:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          # The scanner reads history for blame and new-code dating; it never pushes.
+          persist-credentials: false
 
       - name: Download coverage report
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: coverage-report
 
@@ -92,4 +114,25 @@ jobs:
       # Quality Gate + Coverage badges the moment the secret is added.
       - name: SonarQube Scan
         if: env.SONAR_TOKEN != ''
-        uses: SonarSource/sonarqube-scan-action@v6
+        uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6.0.0
+
+  workflows:
+    # Static security audit of this repository's own workflows and action.yml: unpinned actions,
+    # token permissions, persisted credentials, template injection. The tool is pinned like
+    # everything else here, so a new zizmor release cannot fail a build that did not change.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+        with:
+          version: "0.12.13"
+
+      - name: Audit workflows with zizmor
+        env:
+          # Read-only token, so zizmor can also run its online audits (impostor commits,
+          # actions with known vulnerabilities).
+          GH_TOKEN: ${{ github.token }}
+        run: uvx zizmor@1.30.1 .

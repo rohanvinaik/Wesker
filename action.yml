@@ -89,7 +89,8 @@ runs:
   using: "composite"
   steps:
     - name: Set up Python
-      uses: actions/setup-python@v5
+      # Pinned to a full commit SHA (release in the comment): a tag can be moved, a commit cannot.
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
       with:
         python-version: ${{ inputs.python-version }}
 
@@ -125,15 +126,27 @@ runs:
     - name: Measure specification completeness
       id: run
       shell: bash
+      # Inputs arrive through env, the same way as the install step above. A `${{ inputs.* }}`
+      # written inside `run:` is spliced into the script as shell code before bash reads it, so a
+      # value containing a quote or `$(...)` would execute rather than be passed along.
+      env:
+        WESKER_BASE_REF: ${{ inputs.base-ref }}
+        WESKER_TARGETS: ${{ inputs.targets }}
+        WESKER_SARIF: ${{ inputs.sarif }}
+        WESKER_THRESHOLD: ${{ inputs.threshold }}
+        WESKER_ALLOW_TRUNCATION: ${{ inputs.allow-truncation }}
+        WESKER_BUDGET: ${{ inputs.budget }}
       run: |
-        ARGS=""
-        [ -n "${{ inputs.base-ref }}" ] && ARGS="$ARGS --base-ref ${{ inputs.base-ref }}"
-        [ -n "${{ inputs.targets }}" ] && ARGS="$ARGS --targets ${{ inputs.targets }}"
-        [ -n "${{ inputs.sarif }}" ] && ARGS="$ARGS --sarif ${{ inputs.sarif }}"
-        [ "${{ inputs.threshold }}" != "0" ] && ARGS="$ARGS --threshold ${{ inputs.threshold }}"
-        [ "${{ inputs.allow-truncation }}" = "true" ] && ARGS="$ARGS --allow-truncation"
-        ARGS="$ARGS --budget ${{ inputs.budget }}"
+        ARGS=()
+        [ -n "$WESKER_BASE_REF" ] && ARGS+=(--base-ref "$WESKER_BASE_REF")
+        # Unquoted on purpose: `targets` is a space-separated list, one argument per target.
+        # shellcheck disable=SC2206
+        [ -n "$WESKER_TARGETS" ] && ARGS+=(--targets $WESKER_TARGETS)
+        [ -n "$WESKER_SARIF" ] && ARGS+=(--sarif "$WESKER_SARIF")
+        [ "$WESKER_THRESHOLD" != "0" ] && ARGS+=(--threshold "$WESKER_THRESHOLD")
+        [ "$WESKER_ALLOW_TRUNCATION" = "true" ] && ARGS+=(--allow-truncation)
+        ARGS+=(--budget "$WESKER_BUDGET")
 
         # One run. It writes GITHUB_OUTPUT, GITHUB_STEP_SUMMARY, annotations, JSON and SARIF
         # itself — no shell-side JSON parsing, and nothing merges stderr into a report file.
-        python -m Wesker.action $ARGS
+        python -m Wesker.action "${ARGS[@]}"

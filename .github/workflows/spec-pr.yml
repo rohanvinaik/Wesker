@@ -6,6 +6,9 @@
 # That matters because Wesker is deliberately strict — it requires pytest and a suite that
 # passes — and finding that out on a throwaway PR is cheap, while finding it out on the badge
 # in your README is not.
+#
+# Actions are pinned to full commit SHAs (the release in the trailing comment): a tag can be moved
+# to point at different code, a commit cannot.
 name: Specification (pull request)
 
 on:
@@ -23,21 +26,26 @@ jobs:
     name: Unspecified behavior in this diff
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # The diff scope needs the merge base, which a shallow clone does not have.
           fetch-depth: 0
+          # The badge push below uses this checkout's credentials, so they are kept on purpose.
+          # No step uploads the working tree as an artifact.
+          persist-credentials: true # zizmor: ignore[artipacked]
 
       - name: Measure changed files
         id: spec
-        uses: ./
+        # `./` rather than the newer `$/` self-repository form: switching changes how the action is
+        # resolved at run time, which is a behaviour change to verify on a real run, not a lint fix.
+        uses: ./ # zizmor: ignore[self-repository]
         with:
           base-ref: ${{ github.event.pull_request.base.sha }}
           sarif: .wesker/wesker.sarif
 
       - name: Upload survivors as code-scanning alerts
         if: always() && hashFiles('.wesker/wesker.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@faaca9a8f6edddba5725ffe5adefdab6669a2eca # v3.38.0
         with:
           sarif_file: .wesker/wesker.sarif
           category: wesker
@@ -62,7 +70,7 @@ jobs:
 
       - name: Diff specification badge
         if: github.event.pull_request.head.repo.full_name == github.repository
-        uses: emibcn/badge-action@v2.0.2
+        uses: emibcn/badge-action@4209421db54c8764d8932070ffd0f81715a629bf # v2.0.2
         with:
           label: "Specification (diff)"
           label-color: "333"
@@ -75,6 +83,11 @@ jobs:
       # badge write is skipped, because a badge is the one part that needs to outlive the run.
       - name: Push the diff badge
         if: github.event.pull_request.head.repo.full_name == github.repository
+        # Step outputs reach the script through env, never spliced into it: a `${{ }}` inside
+        # `run:` becomes shell code before bash reads it.
+        env:
+          SPEC_PCT: ${{ steps.spec.outputs.spec-pct }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           cp .github/badges/specification-diff.svg /tmp/
 
@@ -103,5 +116,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "spec (diff) ${{ steps.spec.outputs.spec-pct }}% — PR #${{ github.event.pull_request.number }}"
+          git commit -m "spec (diff) ${SPEC_PCT}% — PR #${PR_NUMBER}"
           git push origin badges

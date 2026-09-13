@@ -9,6 +9,9 @@
 # should refuse to compromise is the place with no deadline: a truncated run is a sample of
 # whatever was cheap to reach, and a sample must never be badged as completeness. If this
 # fails on a budget, raise the budget — do not lower the claim.
+#
+# Actions are pinned to full commit SHAs (the release in the trailing comment): a tag can be moved
+# to point at different code, a commit cannot.
 name: Specification (full)
 
 on:
@@ -31,11 +34,17 @@ jobs:
       contents: write
       security-events: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The last step pushes the badge with this checkout's credentials, so they are kept on
+          # purpose. No step uploads the working tree as an artifact.
+          persist-credentials: true # zizmor: ignore[artipacked]
 
       - name: Measure the whole codebase
         id: spec
-        uses: ./
+        # `./` rather than the newer `$/` self-repository form: switching changes how the action is
+        # resolved at run time, which is a behaviour change to verify on a real run, not a lint fix.
+        uses: ./ # zizmor: ignore[self-repository]
         with:
           # Raised 30000 → 120000 when policy 2–5 grew the universe (~+270
           # targets; engine.py alone is 4,330 mutants and two of its functions
@@ -47,7 +56,7 @@ jobs:
 
       - name: Upload survivors as code-scanning alerts
         if: always() && hashFiles('.wesker/wesker.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@faaca9a8f6edddba5725ffe5adefdab6669a2eca # v3.38.0
         with:
           sarif_file: .wesker/wesker.sarif
           category: wesker
@@ -73,7 +82,7 @@ jobs:
       # not a measurement anyone installs twice. Grey reports; it does not scold. Green and
       # amber are kept for the genuinely rare cases where they mean something.
       - name: Specification completeness badge
-        uses: emibcn/badge-action@v2.0.2
+        uses: emibcn/badge-action@4209421db54c8764d8932070ffd0f81715a629bf # v2.0.2
         with:
           label: "Specification"
           label-color: "333"
@@ -87,6 +96,12 @@ jobs:
       # badge was already written and pushed. A green measurement reported as a red X.
       - name: Push badges to the badges branch
         if: github.ref == 'refs/heads/main'
+        # Step outputs reach the script through env, never spliced into it: a `${{ }}` inside
+        # `run:` becomes shell code before bash reads it.
+        env:
+          SPEC_PCT: ${{ steps.spec.outputs.spec-pct }}
+          DIMS_PINNED: ${{ steps.spec.outputs.dimensions-pinned }}
+          DIMS_TOTAL: ${{ steps.spec.outputs.dimensions-total }}
         run: |
           cp .github/badges/*.svg /tmp/
 
@@ -112,5 +127,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "spec ${{ steps.spec.outputs.spec-pct }}% (${{ steps.spec.outputs.dimensions-pinned }}/${{ steps.spec.outputs.dimensions-total }} dimensions pinned)"
+          git commit -m "spec ${SPEC_PCT}% (${DIMS_PINNED}/${DIMS_TOTAL} dimensions pinned)"
           git push origin badges

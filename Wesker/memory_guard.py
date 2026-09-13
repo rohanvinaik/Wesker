@@ -39,7 +39,7 @@ except ImportError:  # pragma: no cover — exercised only on Windows
     # `ImportError` typechecks cleanly but changes WHAT IS BEING ASKED — "is this Windows"
     # rather than "is this module importable" — and this is a memory SAFETY guard, so degrading
     # on a stripped or embedded build must stay driven by the import that actually failed.
-    resource = None  # type: ignore[assignment]  # ty: ignore[invalid-assignment]
+    resource = None  # type: ignore[assignment]
 
 _MB = 1024 * 1024
 _GB = 1024 * _MB

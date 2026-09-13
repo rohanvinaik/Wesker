@@ -1470,7 +1470,9 @@ class _OutputMutator(_BaseMutator):
         self._entered = False
         self._params: list[str] = []
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+    def visit_FunctionDef(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> ast.AST:
         if self._entered:
             # A nested function: its returns are its own codomain, not the target's.
             return node
@@ -1482,7 +1484,8 @@ class _OutputMutator(_BaseMutator):
         ]
         return self.generic_visit(node)
 
-    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+    # One body for both: it reads only `args`, which sync and async defs share.
+    visit_AsyncFunctionDef = visit_FunctionDef
 
     def _perturbed(self, value: ast.expr) -> ast.expr | None:
         """The replacement return-value node for this sub-mode, or None when the
@@ -2797,7 +2800,7 @@ def _has_own_yield(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     """True when the function's OWN body yields — its codomain is the yielded sequence. A yield
     inside a NESTED def/lambda is that scope's, not this function's, so nested scopes are not
     descended into."""
-    stack = list(func_node.body)
+    stack: list[ast.AST] = list(func_node.body)
     while stack:
         n = stack.pop()
         if isinstance(n, (ast.Yield, ast.YieldFrom)):

@@ -1,0 +1,96 @@
+name: Release
+
+# Fires when a GitHub release is PUBLISHED, not on a bare tag push. The release and its notes are
+# written by hand; this builds the tagged commit, signs exactly what it built, and attaches the files
+# and their signatures to that release. It does not publish to PyPI.
+on:
+  release:
+    types: [published]
+
+# Nothing by default; each job asks for what it uses.
+permissions: {}
+
+# One run per release. Unlike CI, never cancel an in-flight run: a half-attached release is worse
+# than a queued re-run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+# Actions are pinned to full commit SHAs, release in the trailing comment (see ci.yml).
+jobs:
+  build:
+    name: Build and check the distribution
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # A release event checks out the tagged commit. check_sdist.py asks git what it tracks,
+          # which needs no credentials.
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+        with:
+          version: "0.12.13"
+          # A release build restores nothing another run could have written.
+          enable-cache: false
+
+      - name: Tag matches the package version
+        # A tag and __version__ that disagree would sign and attach files whose version is not the
+        # one the release names. Refuse before building anything.
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 - <<'PY'
+          import ast, os, pathlib, sys
+          tree = ast.parse(pathlib.Path("Wesker/__init__.py").read_text(encoding="utf-8"))
+          version = next(
+              (
+                  n.value.value
+                  for n in tree.body
+                  if isinstance(n, ast.Assign)
+                  and any(isinstance(t, ast.Name) and t.id == "__version__" for t in n.targets)
+                  and isinstance(n.value, ast.Constant)
+              ),
+              None,
+          )
+          tag = os.environ["TAG"]
+          if version is None:
+              sys.exit("no literal __version__ in Wesker/__init__.py")
+          if tag.removeprefix("v") != version:
+              sys.exit(f"release tag {tag!r} does not match __version__ {version!r}")
+          print(f"release tag {tag} matches __version__ {version}")
+          PY
+
+      - name: Build sdist and wheel
+        run: uv build --out-dir dist
+
+      - name: Sdist carries only tracked files
+        run: python3 scripts/check_sdist.py
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  sign:
+    name: Sign and attach to the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # attach the files and their signatures to the release
+      id-token: write # Sigstore keyless signing: the certificate names this workflow; no stored key
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist/
+
+      - name: Sign with Sigstore and attach
+        uses: sigstore/gh-action-sigstore-python@790bc6befb9d733738f18d8f895854b453640ec9 # v3.5.0
+        with:
+          inputs: ./dist/*.tar.gz ./dist/*.whl
+          # On a published release, attach each file and its .sigstore.json bundle as assets.
+          release-signing-artifacts: true

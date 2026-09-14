@@ -46,17 +46,18 @@ jobs:
       - name: Install dependencies
         # --python overrides the repo .python-version pin so each cell resolves its own interpreter.
         # --locked installs exactly uv.lock and fails if pyproject.toml and the lock disagree. Every
-        # later step runs with --no-sync, so nothing is resolved, built or installed after this one.
+        # later step runs with --no-sync --no-build: nothing is resolved or installed after this step, and
+        # nothing could be built if something tried.
         run: uv sync --locked --python ${{ matrix.python-version }}
 
       - name: Lint
-        run: uv run --no-sync ruff check Wesker/ tests/
+        run: uv run --no-sync --no-build ruff check Wesker/ tests/
 
       - name: Format check
-        run: uv run --no-sync ruff format --check Wesker/ tests/
+        run: uv run --no-sync --no-build ruff format --check Wesker/ tests/
 
       - name: Test with coverage
-        run: uv run --no-sync pytest tests/ --cov=Wesker --cov-report=xml:coverage.xml -q
+        run: uv run --no-sync --no-build pytest tests/ --cov=Wesker --cov-report=xml:coverage.xml -q
 
       - name: Upload coverage report
         # Only the canonical cell feeds SonarCloud — avoids a matrix artifact-name collision, and

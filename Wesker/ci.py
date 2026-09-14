@@ -1854,6 +1854,91 @@ def is_truncated_measurement(coverage_depth: str, budget_exhausted: bool) -> boo
     return coverage_depth == "cut" or budget_exhausted
 
 
+def truncation_cause(
+    coverage_depth: str, budget_exhausted: bool, memory_standing: str
+) -> str:
+    """WHY one function's profile was cut, named for the remedy it needs (pure).
+
+    `is_truncated_measurement` answers whether a profile may be counted. A refusal built on that
+    alone can say how many functions were cut but not what to do about them, and the remedies
+    differ — one of them is not a budget at all:
+
+      "budget"         the function ran past its budget before its selected mutants were all
+                       evaluated. When the budget ran out, containment is not recorded separately,
+                       so this code makes no claim that the worker was contained.
+      "memory"         a mutant hit the isolated worker's address-space cap (W#21).
+      "uncontained"    a timed-out test could not be stopped — blocked outside the interpreter — and
+                       the profile stopped there (#14). More budget cannot fix it.
+      "not_truncated"  a measurement the rollup counts.
+
+    Decided from the fields `ProfilingResult.to_dict` emits, so the rollup reads the engine's own
+    record rather than re-deriving a narrower one.
+    """
+    if not is_truncated_measurement(coverage_depth, budget_exhausted):
+        return "not_truncated"
+    if budget_exhausted:
+        return "budget"
+    if memory_standing == "cut":
+        return "memory"
+    return "uncontained"
+
+
+# The remedy each cause needs, in the order a reader should act on them: a worker that could not be
+# stopped is the one no budget fixes, so it comes first.
+_TRUNCATION_REMEDIES = (
+    (
+        "uncontained",
+        (
+            "A timed-out test could not be stopped (it was blocked outside the interpreter), so "
+            "the profile stopped there. A larger budget will not help: bound the blocking call, "
+            "or run that test in a killable process."
+        ),
+    ),
+    (
+        "memory",
+        "A mutant hit the isolated worker's memory cap. Raise the worker's memory limit.",
+    ),
+    (
+        "budget",
+        (
+            "The function ran past its budget, which applies to each function separately. Raise "
+            "`budget`; a truncated run is a sample, never a completeness measurement."
+        ),
+    ),
+)
+
+
+def describe_truncation(truncated: list[dict], limit: int = 20) -> str:
+    """The cut functions, grouped by cause, each group under the remedy it needs (pure).
+
+    One renderer for both places a truncated run is reported, the Action's refusal and the CLI's
+    warning, so the two cannot describe the same cut differently. An empty list renders as "": a
+    report written before the functions were recorded carries only a count.
+    """
+    remedies = dict(_TRUNCATION_REMEDIES)
+    known = [cause for cause, _ in _TRUNCATION_REMEDIES]
+    recorded = {str(t.get("cause", "")) for t in truncated}
+    blocks: list[str] = []
+    for cause in known + sorted(recorded - set(known)):
+        group = [t for t in truncated if str(t.get("cause", "")) == cause]
+        if not group:
+            continue
+        header = (
+            remedies.get(cause) or "Cut, cause not recorded: " + (cause or "none") + "."
+        )
+        lines = [f"{header} [{len(group)}]"]
+        for t in group[:limit]:
+            seconds = float(t.get("elapsed_ms") or 0.0) / 1000
+            lines.append(
+                f"  {t.get('function_key') or '?'} — {seconds:.1f} s, "
+                f"{t.get('tested', 0)}/{t.get('universe', 0)} mutants evaluated"
+            )
+        if len(group) > limit:
+            lines.append(f"  … and {len(group) - limit} more")
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks)
+
+
 def profile_codebase(
     project_root: str,
     targets: list[str],
@@ -1892,6 +1977,7 @@ def profile_codebase(
     total_mutants = 0
     total_equivalent = 0
     total_truncated = 0
+    truncated_functions: list[dict] = []
     total_universe = 0
     total_dof = 0
     total_dof_covered = 0
@@ -1947,13 +2033,25 @@ def profile_codebase(
         # #14 (aggregation): consume the engine's COMPUTED signal, not a budget-only proxy. A run cut
         # for CONTAINMENT (an uncontained worker: coverage_depth="cut", budget_exhausted=False) is a
         # truncated measurement too — counting only budget_exhausted dropped it before the gate.
-        total_truncated += sum(
-            1
-            for r in results
-            if is_truncated_measurement(
-                r.get("coverage_depth", ""), bool(r.get("budget_exhausted"))
+        # Each cut is recorded with its cause, so a refusal can name the function and the remedy
+        # rather than only count them.
+        for r in results:
+            cause = truncation_cause(
+                r.get("coverage_depth", ""),
+                bool(r.get("budget_exhausted")),
+                str(r.get("memory_standing", "n/a")),
             )
-        )
+            if cause != "not_truncated":
+                truncated_functions.append(
+                    {
+                        "function_key": r.get("function_key", ""),
+                        "cause": cause,
+                        "elapsed_ms": r.get("elapsed_ms", 0.0),
+                        "tested": r.get("total_mutants", 0),
+                        "universe": r.get("universe_size", 0),
+                    }
+                )
+        total_truncated = len(truncated_functions)
 
         # Carry each survivor up with the function it came from. ``function_key`` is
         # "path::qualname", so the record is self-locating: file, line, and the dimension
@@ -2051,10 +2149,13 @@ def profile_codebase(
         "spec_pct": round(100 * total_dof_pinned / max(total_dof, 1)),
         "kill_pct": kill_pct,
         "total_functions": total_functions,
-        # Functions whose per-file budget ran out before every selected mutant was
-        # evaluated. Non-zero means ``kill_pct`` is a PARTIAL result: raise
-        # ``budget_ms_per_file`` before quoting it as a mutation score.
+        # Functions whose profile was cut: the budget ran out (it applies to each function,
+        # despite the parameter's name), a worker could not be stopped, or the memory cap was
+        # hit. Non-zero means ``kill_pct`` is a PARTIAL result.
         "total_truncated": total_truncated,
+        # Which functions, and why (`truncation_cause`), so a refusal names the function and the
+        # remedy instead of a count.
+        "truncated_functions": truncated_functions,
         "passes": passes,
         "elapsed_ms": round(elapsed),
         "per_file": per_file,

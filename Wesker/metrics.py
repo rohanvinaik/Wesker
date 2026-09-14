@@ -33,7 +33,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from Wesker.ci import profile_codebase
+from Wesker.ci import describe_truncation, profile_codebase
 from Wesker.self_profile import profiler_for_targets
 
 # ---------------------------------------------------------------------------
@@ -536,13 +536,18 @@ def main():
     if truncated:
         # A truncated run's unevaluated mutants are missing from BOTH sides of the
         # ratio, so the percentage below is a sample of whatever was cheap to reach —
-        # not a mutation score. Say so where the number is produced.
+        # not a mutation score. Say so where the number is produced, and name each cut
+        # function under the remedy its cause needs, in the Action refusal's own words.
         print(
-            f"  !! WARNING: {truncated} function(s) hit the per-file budget and were\n"
-            f"     only PARTIALLY evaluated — the kill rate below is a partial result.\n"
-            f"     Raise budget_ms_per_file before quoting it as a mutation score.",
+            f"  !! WARNING: {truncated} function(s) were only PARTIALLY evaluated — the\n"
+            f"     kill rate below is a partial result, not a mutation score.",
             file=sys.stderr,
         )
+        detail = describe_truncation(mutation.get("truncated_functions") or [])
+        if detail:
+            print(
+                "\n".join("     " + ln for ln in detail.splitlines()), file=sys.stderr
+            )
     equiv = mutation.get("total_equivalent", 0)
     universe = mutation.get("total_universe", 0)
     equiv_note = f" ({equiv} equivalent)" if equiv else ""

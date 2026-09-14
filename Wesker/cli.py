@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Minimum kill rate %% (exit 1 if below)",
     )
     parser.add_argument(
-        "--budget", type=float, default=10000, help="Per-file budget in ms"
+        "--budget", type=float, default=10000, help="Budget per function, in ms"
     )
     parser.add_argument(
         "--max-per-category",

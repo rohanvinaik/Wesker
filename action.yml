@@ -28,7 +28,7 @@ inputs:
     required: false
     default: ".wesker/wesker.sarif"
   budget:
-    description: "Per-file budget in ms. Raise it rather than accept a truncated (sampled) run."
+    description: "Budget per function, in ms. Raise it rather than accept a truncated (sampled) run."
     required: false
     default: "15000"
   allow-truncation:

@@ -162,18 +162,29 @@ def gate_suite_health(report: dict, max_inert_pct: int = 50) -> str | None:
 
 
 def gate_truncation(report: dict) -> str | None:
-    """Refuse to call a CUT measurement a completeness measurement — whether it was cut by the budget
-    or by a worker that could not be contained (Wesker #13/#14). ``total_truncated`` now counts both."""
+    """Refuse to call a CUT measurement a completeness measurement — cut by the budget, by a worker
+    that could not be stopped, or by the memory cap (Wesker #13/#14/W#21).
+
+    The refusal names each cut function under the remedy its cause needs. A count alone told the
+    maintainer that something was cut and not what: the remedies differ, and for a worker that
+    could not be stopped the budget the old message pointed at is the wrong fix. A report that
+    predates the per-function record falls back to naming both remedies.
+    """
     truncated = report.get("total_truncated", 0)
     if not truncated:
         return None
+    from Wesker.ci import describe_truncation
+
+    detail = describe_truncation(report.get("truncated_functions") or [])
     return (
-        f"{truncated} function(s) were only PARTIALLY evaluated — cut by the per-file budget, or by "
-        "a timed-out worker that could not be stopped (an uncontained, invalid measurement).\n"
+        f"{truncated} function(s) were only PARTIALLY evaluated.\n"
         "Their unevaluated mutants are missing from both sides of the ratio, so this is a sample, "
         "not a completeness measurement.\n"
-        "Raise `budget` (or set [tool.wesker] max_per_category); an uncontained worker needs the "
-        "target's blocking call bounded or run in a killable process."
+        + (
+            detail
+            or "Raise `budget` (or set [tool.wesker] max_per_category); an uncontained worker "
+            "needs the target's blocking call bounded or run in a killable process."
+        )
     )
 
 
@@ -390,7 +401,7 @@ def main(argv: list[str] | None = None) -> int:
         "--threshold", type=int, default=0, help="Fail if spec %% is below this"
     )
     parser.add_argument(
-        "--budget", type=float, default=15000, help="Per-file budget in ms"
+        "--budget", type=float, default=15000, help="Budget per function, in ms"
     )
     parser.add_argument(
         "--allow-truncation",

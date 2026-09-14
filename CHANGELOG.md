@@ -23,6 +23,13 @@ plumbing, how the published Action handles its inputs, and the documentation.
 - **The makereport hook no longer re-raises in its own teardown.** When the wrapped call raised — an
   abandoned test unwinding — the old-style wrapper re-raised it inside its teardown and pluggy emitted
   `PluggyTeardownRaisedWarning`. It now lets pluggy propagate the original exception. No verdict moves.
+- **A truncated run names what was cut, and why.** The Action refused a cut run with a count and two
+  possible remedies, and named no function; the report that could have been read is written only after
+  the gates pass. The refusal, and the CLI's warning, now list each cut function with its elapsed time
+  and the mutants it evaluated, under the remedy its cause needs. A worker that could not be stopped
+  comes first, because no budget fixes it. The report carries the list as `truncated_functions`.
+- `budget` is described as what it is, a budget per function. The action input, both `--budget` help
+  texts and `docs/usage.md` called it per-file.
 
 ### Security
 
@@ -30,8 +37,8 @@ plumbing, how the published Action handles its inputs, and the documentation.
   shell script, which was a template-injection path. Workflows pin actions to commit SHAs, run with
   read-only tokens, do not persist checkout credentials, and are audited by zizmor in CI; CodeQL runs on
   push, pull request and weekly.
-- CI installs with `uv sync --locked` and runs every later step with `--no-sync`, so nothing is resolved
-  or built after the install step; zizmor installs with `--no-build`. `spec-pr.yml` grants its write
+- CI installs with `uv sync --locked` and runs every later step with `--no-sync --no-build`, so nothing
+  is resolved, installed or built after the install step; zizmor installs with `--no-build`. `spec-pr.yml` grants its write
   permissions to its one job rather than to the whole workflow.
 - **Releases are signed.** Publishing a GitHub release builds the tagged commit, refuses when the tag is
   not `__version__`, checks the sdist against git, and attaches the files with their Sigstore bundles.

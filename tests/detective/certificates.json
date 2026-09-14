@@ -1,4 +1,26 @@
 {
+  "Wesker/action.py::gate_truncation": {
+    "cut_reasons": [
+      "mutant_not_entered"
+    ],
+    "function_digest": "14d312fb0786a0d8",
+    "refusal": "",
+    "standing": "ungateable"
+  },
+  "Wesker/ci.py::describe_truncation": {
+    "cut_reasons": [
+      "mutant_not_entered"
+    ],
+    "function_digest": "b8372515db83879f",
+    "refusal": "",
+    "standing": "ungateable"
+  },
+  "Wesker/ci.py::truncation_cause": {
+    "cut_reasons": [],
+    "function_digest": "de950fba332887e0",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/engine.py::_baseline_failures": {
     "cut_reasons": [],
     "function_digest": "9ed39ddb1a438d8f",

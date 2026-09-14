@@ -23,7 +23,7 @@ wesker [targets...] [options]      # no targets: the current directory, recursiv
   --threshold N            Exit 1 if kill rate < N%
   --mcdc FILE::FUNC ...    MC/DC verification on specific functions
   --json                   JSON output (for CI parsing)
-  --budget MS              Per-file time budget (default: 10000ms)
+  --budget MS              Time budget per function (default: 10000ms)
   --max-per-category N     Mutants per category per pass (default: derived per function from its
                            degrees of freedom; 0=exhaustive)
   --passes N               Convergence passes (default: 1; extra passes deepen within covered
@@ -129,7 +129,7 @@ including badge generation.
 |-------|---------|--|
 | `base-ref` | — | scope to files changed since this ref; omit for the whole codebase |
 | `targets` | auto | explicit files; otherwise discovered from `[tool.wesker]` or layout |
-| `budget` | `15000` | per-file budget, ms |
+| `budget` | `15000` | budget per function, ms |
 | `threshold` | — | fail if `spec-pct` is below this |
 | `sarif` | `.wesker/wesker.sarif` | where to write the SARIF report |
 | `allow-truncation` | `false` | report a budget-limited sample rather than failing |

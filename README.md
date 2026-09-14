@@ -136,7 +136,7 @@ Zero dependencies beyond the standard library and your test framework. Python 3.
 ```yaml
 - uses: actions/checkout@v4
   with: {fetch-depth: 0}
-- uses: rohanvinaik/Wesker@v1.1.0
+- uses: rohanvinaik/Wesker@v1.1.1
   with:
     base-ref: ${{ github.event.pull_request.base.sha }}
     sarif: .wesker/wesker.sarif

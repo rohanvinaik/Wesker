@@ -2,6 +2,50 @@
 
 Notable changes, newest first. Dates are the commit dates.
 
+## 1.1.1 — 2026-09-13
+
+A patch release. The mutation policy is unchanged (`7.a73c76cd1d65`): no question in the universe moved.
+What changed is how a survivor is judged equivalent, a descriptor leak and a warning in the pytest
+plumbing, how the published Action handles its inputs, and the documentation.
+
+### Correctness
+
+- **The equivalence probe can tell argument positions apart.** For a function of three or more
+  parameters every probe row repeated one value in every position — `(0, 0, 0)`, `(1, 1, 1)`, … — so a
+  SWAP mutant such as `pow(a, c)` → `pow(c, a)` agreed with the original on every row, was reported
+  "likely equivalent", and left the effective kill rate. The rows now add rotations in which every
+  position holds a different value, and keep the uniform rows a BOUNDARY mutant needs. This is the
+  equivalence-side twin of 1.1.0's generation-side fix. **Effective kill rates on functions of three or
+  more parameters can go down**: survivors that were being discounted as equivalent are now counted.
+- **Isolated workers close their pipes on every path.** Only `communicate()` closed a worker's pipes; a
+  worker reaped or closed any other way leaked the descriptor, which surfaced as
+  `ResourceWarning: unclosed file` in a consumer that treats warnings as errors.
+- **The makereport hook no longer re-raises in its own teardown.** When the wrapped call raised — an
+  abandoned test unwinding — the old-style wrapper re-raised it inside its teardown and pluggy emitted
+  `PluggyTeardownRaisedWarning`. It now lets pluggy propagate the original exception. No verdict moves.
+
+### Security
+
+- **`action.yml` passes its inputs through the environment** rather than expanding them into the step's
+  shell script, which was a template-injection path. Workflows pin actions to commit SHAs, run with
+  read-only tokens, do not persist checkout credentials, and are audited by zizmor in CI; CodeQL runs on
+  push, pull request and weekly.
+- **Releases are signed.** Publishing a GitHub release builds the tagged commit, refuses when the tag is
+  not `__version__`, checks the sdist against git, and attaches the files with their Sigstore bundles.
+- `SECURITY.md` (private reporting through the Security tab) and `CONTRIBUTING.md`.
+
+### Documentation
+
+- README: `--complete` never existed (exhaustive mode is `--max-per-category 0`); the default category
+  count; the equivalence inputs as they are; "fails loudly" describes the Action, not the CLI.
+  `docs/usage.md`: the real defaults of `--max-per-category` and `--passes`, the missing `--version` and
+  `--purge`, and a dead link. The Action examples pin `@v1.1.1`.
+
+### Housekeeping
+
+- ruff 0.16.7 with its default rules worked through rather than pinned away; ty clean; pytest runs with
+  warnings as errors.
+
 ## 1.1.0 — 2026-09-11
 
 **Mutation policy 6 → 7.** SWAP asks about every PAIR of positional arguments, not only adjacent

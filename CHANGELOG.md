@@ -28,6 +28,11 @@ plumbing, how the published Action handles its inputs, and the documentation.
   the gates pass. The refusal, and the CLI's warning, now list each cut function with its elapsed time
   and the mutants it evaluated, under the remedy its cause needs. A worker that could not be stopped
   comes first, because no budget fixes it. The report carries the list as `truncated_functions`.
+- **A worker that could not be stopped is named.** Under an uncontained cut the refusal now names the
+  test to bound or isolate, and the mutant it was running (or, for the baseline pass, the test whose
+  trace could not be stopped). `evaluate_mutant` and the isolated path record that test on the mutant's
+  result; both profiling paths carry the list as `containment_lost`, which `to_dict` emits and each
+  `truncated_functions` entry repeats. Before this, the engine knew both and reduced them to one bool.
 - `budget` is described as what it is, a budget per function. The action input, both `--budget` help
   texts and `docs/usage.md` called it per-file.
 

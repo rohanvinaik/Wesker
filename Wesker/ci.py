@@ -1908,12 +1908,45 @@ _TRUNCATION_REMEDIES = (
 )
 
 
+# What a baseline marker stands for when no single test could be named (see engine._containment_lost).
+_BASELINE_MARKERS = {
+    "session_baseline": "the session's baseline trace",
+    "baseline_sizing": "the baseline timing run",
+}
+
+
+def _describe_containment_lost(lost: list[dict], limit: int = 3) -> list[str]:
+    """The lines naming what could not be stopped for one cut function (pure).
+
+    A baseline entry names the test whose traced run outlived the stop; a mutation entry names the
+    test and the mutant it was running. At most ``limit`` entries, then a count of the rest.
+    """
+    lines: list[str] = []
+    for entry in lost[:limit]:
+        test = str(entry.get("test") or "")
+        if entry.get("phase") == "baseline":
+            where = _BASELINE_MARKERS.get(test) or (
+                (test or "an unnamed test") + ", in the baseline trace"
+            )
+            lines.append(f"    could not stop: {where}")
+        else:
+            lines.append(
+                f"    could not stop: {test or 'an unnamed test'}, running mutant "
+                f"{entry.get('mutant') or entry.get('mutant_id') or '?'} "
+                f"(line {entry.get('mutated_line', '?')})"
+            )
+    if len(lost) > limit:
+        lines.append(f"    … and {len(lost) - limit} more")
+    return lines
+
+
 def describe_truncation(truncated: list[dict], limit: int = 20) -> str:
     """The cut functions, grouped by cause, each group under the remedy it needs (pure).
 
     One renderer for both places a truncated run is reported, the Action's refusal and the CLI's
     warning, so the two cannot describe the same cut differently. An empty list renders as "": a
-    report written before the functions were recorded carries only a count.
+    report written before the functions were recorded carries only a count. Under each function,
+    `containment_lost` names what could not be stopped: the test, and the mutant it was running.
     """
     remedies = dict(_TRUNCATION_REMEDIES)
     known = [cause for cause, _ in _TRUNCATION_REMEDIES]
@@ -1933,6 +1966,7 @@ def describe_truncation(truncated: list[dict], limit: int = 20) -> str:
                 f"  {t.get('function_key') or '?'} — {seconds:.1f} s, "
                 f"{t.get('tested', 0)}/{t.get('universe', 0)} mutants evaluated"
             )
+            lines.extend(_describe_containment_lost(t.get("containment_lost") or []))
         if len(group) > limit:
             lines.append(f"  … and {len(group) - limit} more")
         blocks.append("\n".join(lines))
@@ -2049,6 +2083,7 @@ def profile_codebase(
                         "elapsed_ms": r.get("elapsed_ms", 0.0),
                         "tested": r.get("total_mutants", 0),
                         "universe": r.get("universe_size", 0),
+                        "containment_lost": list(r.get("containment_lost") or []),
                     }
                 )
         total_truncated = len(truncated_functions)

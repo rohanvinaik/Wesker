@@ -7,11 +7,19 @@
     "refusal": "",
     "standing": "ungateable"
   },
+  "Wesker/ci.py::_describe_containment_lost": {
+    "cut_reasons": [
+      "mutant_not_entered"
+    ],
+    "function_digest": "94070dfc7a7b802e",
+    "refusal": "",
+    "standing": "ungateable"
+  },
   "Wesker/ci.py::describe_truncation": {
     "cut_reasons": [
       "mutant_not_entered"
     ],
-    "function_digest": "b8372515db83879f",
+    "function_digest": "13c8098d2a47b147",
     "refusal": "",
     "standing": "ungateable"
   },

@@ -182,3 +182,83 @@ def test_the_rollup_records_each_cut_function_with_its_cause(tmp_path, monkeypat
         ("m.py::blocked", "uncontained"),
     ]
     assert report["truncated_functions"][0]["elapsed_ms"] == 130000.0
+
+
+def test_the_description_names_what_could_not_be_stopped():
+    """Under an uncontained cut, the refusal names the test to bound or isolate, and the mutant it
+    was running — the remedy the header gives cannot be applied to a count."""
+    cut = _cut("Wesker/interrupt.py::abandon", "uncontained", 7600.0, 5, 31)
+    cut["containment_lost"] = [
+        {"phase": "baseline", "test": "baseline_sizing"},
+        {"phase": "baseline", "test": "tests/test_x.py::test_hangs"},
+        {
+            "phase": "mutation",
+            "test": "tests/test_abandon_thread.py::test_abandon_stops_a_pure_python_runaway",
+            "mutant_id": "STMT_a0c536c6",
+            "mutant": "STMT_a0c536c6: delete statement",
+            "mutated_line": 78,
+        },
+    ]
+
+    text = ci.describe_truncation([cut])
+
+    assert "    could not stop: the baseline timing run" in text
+    assert (
+        "    could not stop: tests/test_x.py::test_hangs, in the baseline trace" in text
+    )
+    assert (
+        "    could not stop: tests/test_abandon_thread.py::test_abandon_stops_a_pure_python_runaway,"
+        " running mutant STMT_a0c536c6: delete statement (line 78)"
+    ) in text
+    # The stuck test sits under the function it belongs to.
+    assert text.index("Wesker/interrupt.py::abandon") < text.index("could not stop:")
+
+
+def test_what_could_not_be_stopped_is_capped_per_function():
+    cut = _cut("a.py::f", "uncontained")
+    cut["containment_lost"] = [
+        {"phase": "baseline", "test": f"tests/t.py::test_{i}"} for i in range(5)
+    ]
+
+    text = ci.describe_truncation([cut])
+
+    assert text.count("could not stop:") == 3
+    assert "    … and 2 more" in text
+
+
+def test_an_unnamed_stuck_test_is_still_listed():
+    cut = _cut("a.py::f", "uncontained")
+    cut["containment_lost"] = [
+        {
+            "phase": "mutation",
+            "test": "",
+            "mutant_id": "X_1",
+            "mutant": "",
+            "mutated_line": 3,
+        }
+    ]
+
+    assert "could not stop: an unnamed test, running mutant X_1 (line 3)" in (
+        ci.describe_truncation([cut])
+    )
+
+
+def test_the_rollup_carries_what_could_not_be_stopped(tmp_path, monkeypatch):
+    lost = [{"phase": "baseline", "test": "tests/t.py::test_hangs"}]
+    results = [
+        {
+            "function_key": "m.py::blocked",
+            "coverage_depth": "cut",
+            "budget_exhausted": False,
+            "memory_standing": "n/a",
+            "elapsed_ms": 900.0,
+            "total_mutants": 2,
+            "universe_size": 12,
+            "containment_lost": lost,
+        },
+    ]
+    monkeypatch.setattr(ci, "profile_file", lambda *args, **kwargs: results)
+
+    report = ci.profile_codebase(str(tmp_path), ["m.py"], verbose=False)
+
+    assert report["truncated_functions"][0]["containment_lost"] == lost

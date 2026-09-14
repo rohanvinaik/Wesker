@@ -202,6 +202,10 @@ class MutantResult:
     # kill still counts as a run-only timeout, but the measurement is UNCONTAINED: the runaway may
     # still be executing and mutating shared state, so a profile that contains it is not gateable.
     contained: bool = True  # all killers (full-matrix mode)
+    # WHICH test's timed-out worker could not be stopped, when `contained` is False: its id in the kill
+    # vocabulary (`ci.callable_test_id`), so a refusal can name the test to bound or isolate. None when
+    # every worker was stopped, or when no single test is known.
+    uncontained_test: str | None = None
     # --- execution phases (issue #18) -------------------------------------------------------
     # `killed` alone cannot say WHY. A mutant Wesker failed to build, and one a green suite
     # genuinely failed to detect, are different facts about different things — the first is a
@@ -483,6 +487,10 @@ class ProfilingResult:
     # "no test reaches this line", which turns a timing accident into a false completeness verdict
     # — the one thing a completeness tool must never do quietly.
     trace_truncated: list[str] = field(default_factory=list)
+    # What could not be stopped, named (`_containment_lost`): one entry per baseline test whose traced
+    # run outlived `abandon`, then one per mutant whose timed-out test did. Empty when every worker was
+    # stopped. `coverage_depth="cut"` says the measurement is invalid; this says what to bound or isolate.
+    containment_lost: tuple[dict, ...] = ()
     # --- DOF coverage: the claim a bounded run can actually make ------------------
     # ``universe_size`` counts mutation TARGETS; these count the distinct behavioral
     # DIMENSIONS those targets pin. Because each target's cover set is a singleton,
@@ -769,9 +777,41 @@ class ProfilingResult:
             d["executable_lines"] = self.executable_lines
         if self.failing_tests:
             d["failing_tests"] = self.failing_tests
+        if self.containment_lost:
+            d["containment_lost"] = [dict(e) for e in self.containment_lost]
         if self.test_routing:
             d["test_routing"] = dict(self.test_routing)
         return d
+
+
+def _containment_lost(
+    baseline: set[str], results: list[MutantResult]
+) -> tuple[dict, ...]:
+    """What could not be stopped during one profile, named: each baseline test whose traced run
+    outlived `abandon`, then each mutant whose timed-out test did.
+
+    `all_contained` reduces both to one bool. That is enough to refuse a gate and not enough to say
+    what to do: the remedy (bound that test's blocking call, or run it in a killable process) needs
+    the test, and the mutant it was running. Both profiling paths build their record here, so they
+    cannot name the same loss differently. A baseline name may be a marker rather than a test,
+    ``session_baseline`` or ``baseline_sizing``, when no single test is known.
+    """
+    lost: list[dict] = [
+        {"phase": "baseline", "test": name} for name in sorted(baseline)
+    ]
+    for r in results:
+        if r.contained:
+            continue
+        lost.append(
+            {
+                "phase": "mutation",
+                "test": r.uncontained_test or "",
+                "mutant_id": r.mutant.mutant_id,
+                "mutant": r.mutant.description,
+                "mutated_line": r.mutant.mutated_line,
+            }
+        )
+    return tuple(lost)
 
 
 # ── §6.4 Dispatch Table: Category → AST Transform ────────────────
@@ -5641,6 +5681,7 @@ def evaluate_mutant(
         )
         first_killer: str | None = None
         saw_uncontained = False  # a timed-out worker that could not be stopped (#14)
+        uncontained_test: str | None = None  # the first test whose worker that was
         # How many tests actually got to run against this mutant. `entered` is only
         # INTERPRETABLE when at least one did: with an empty scoped set — which is the normal
         # state of Detective's synthesis path, where the tests do not exist yet — the probe is
@@ -5662,6 +5703,7 @@ def evaluate_mutant(
                     killed=True,
                     killed_by="timeout",
                     contained=not saw_uncontained,
+                    uncontained_test=uncontained_test,
                     entered=(getattr(mutated_obj, "entered", None) if ran else None),
                     elapsed_ms=_elapsed(start),
                 )
@@ -5687,6 +5729,10 @@ def evaluate_mutant(
                     # timeout kill, but the measurement is uncontained — carry the fact so the
                     # profile refuses to gate on it (#14). Normalize to "timeout" for kill counting.
                     saw_uncontained = True
+                    if uncontained_test is None:
+                        from Wesker.ci import callable_test_id
+
+                        uncontained_test = callable_test_id(test_fn)
                     result = "timeout"
                 # A failure is only a KILL if the mutation CAUSED it. When the mutant
                 # could not be patched into the test's namespace, the unpatched path
@@ -5748,6 +5794,7 @@ def evaluate_mutant(
                             killed_by=result,
                             test_name=tname,
                             contained=not saw_uncontained,
+                            uncontained_test=uncontained_test,
                             entered=(
                                 getattr(mutated_obj, "entered", None) if ran else None
                             ),
@@ -5774,6 +5821,7 @@ def evaluate_mutant(
                 test_name=killers[0],
                 killed_by_tests=killers,
                 contained=not saw_uncontained,
+                uncontained_test=uncontained_test,
                 entered=(getattr(mutated_obj, "entered", None) if ran else None),
                 elapsed_ms=_elapsed(start),
             )
@@ -5785,6 +5833,7 @@ def evaluate_mutant(
                 killed_by=first_reason,
                 test_name=first_killer,
                 contained=not saw_uncontained,
+                uncontained_test=uncontained_test,
                 entered=(getattr(mutated_obj, "entered", None) if ran else None),
                 elapsed_ms=_elapsed(start),
             )
@@ -5799,6 +5848,7 @@ def evaluate_mutant(
             # by the `_outcome_on_original` attribution control, i.e. the `patched is False`
             # path this function's own comment names as every parametrized test.
             contained=not saw_uncontained,
+            uncontained_test=uncontained_test,
             entered=(getattr(mutated_obj, "entered", None) if ran else None),
             elapsed_ms=_elapsed(start),
         )
@@ -6219,6 +6269,7 @@ def _isolated_result(
             killed_by="timeout",
             contained=run.contained,
             test_name=run.test_name,
+            uncontained_test=None if run.contained else run.test_name,
             installed=run.installed,
             entered=entered,
             elapsed_ms=elapsed_ms,
@@ -6532,6 +6583,9 @@ def run_function_profiling(
     _survivor_mutants: dict[str, Mutant] = {}
     budget_exhausted = False
     all_contained = True  # #14: cleared if any timed-out worker could not be stopped
+    _uncontained_results: list[
+        MutantResult
+    ] = []  # named in the result by _containment_lost
     mem_budget = _resolve_budget(mem_budget_mb)
     # THE BASELINE IS WHAT MAKES THE BUDGET ABOUT THIS RUN (W#21). Captured before the loop:
     # `ru_maxrss` is a process LIFETIME peak and never falls, so an absolute comparison meant one
@@ -6647,6 +6701,7 @@ def run_function_profiling(
 
         if not result.contained:
             all_contained = False
+            _uncontained_results.append(result)
         cr = results_by_cat.setdefault(
             mutant.category, CategoryResult(category=mutant.category)
         )
@@ -7077,6 +7132,7 @@ def run_function_profiling(
         tests_discovered=len(test_functions),
         operator_census=_operator_census,
         trace_truncated=sorted(_trace_truncated),
+        containment_lost=_containment_lost(_baseline_uncontained, _uncontained_results),
     )
 
 
@@ -7918,4 +7974,5 @@ def run_function_converged(
         budget_exhausted=budget_exhausted,
         elapsed_ms=_elapsed(start),
         trace_truncated=sorted(_trace_truncated),
+        containment_lost=_containment_lost(_baseline_uncontained, list(seen.values())),
     )

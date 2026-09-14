@@ -80,6 +80,12 @@ class _ExcCapture:
     @_hookwrapper
     def pytest_runtest_makereport(self, item, call):  # type: ignore[no-untyped-def]
         outcome = yield
+        # The wrapped call RAISED (an abandoned test's `Abandoned` unwinding through makereport):
+        # there is no report to read, and `get_result()` would re-raise inside this old-style
+        # wrapper's teardown, which pluggy reports as PluggyTeardownRaisedWarning. Returning lets
+        # pluggy propagate the original exception unchanged.
+        if getattr(outcome, "excinfo", None) is not None:
+            return
         rep = outcome.get_result()
         if rep.when == "call" or (rep.failed and rep.when in ("setup", "teardown")):
             exc = getattr(call, "excinfo", None)

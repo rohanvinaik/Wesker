@@ -14,17 +14,20 @@ name: Specification (pull request)
 on:
   pull_request:
 
+# Read-only by default; the one job below asks for what it writes.
 permissions:
-  # write, so this workflow can publish its own badge to the badges branch.
-  contents: write
-  # Survivors are uploaded as code-scanning alerts: they land inline on the diff, in the
-  # Security tab, and anywhere else that reads code scanning.
-  security-events: write
+  contents: read
 
 jobs:
   spec_diff:
     name: Unspecified behavior in this diff
     runs-on: ubuntu-latest
+    permissions:
+      # write, so this workflow can publish its own badge to the badges branch.
+      contents: write
+      # Survivors are uploaded as code-scanning alerts: they land inline on the diff, in the
+      # Security tab, and anywhere else that reads code scanning.
+      security-events: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

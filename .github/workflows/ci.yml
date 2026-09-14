@@ -45,16 +45,18 @@ jobs:
 
       - name: Install dependencies
         # --python overrides the repo .python-version pin so each cell resolves its own interpreter.
-        run: uv sync --python ${{ matrix.python-version }}
+        # --locked installs exactly uv.lock and fails if pyproject.toml and the lock disagree. Every
+        # later step runs with --no-sync, so nothing is resolved, built or installed after this one.
+        run: uv sync --locked --python ${{ matrix.python-version }}
 
       - name: Lint
-        run: uv run ruff check Wesker/ tests/
+        run: uv run --no-sync ruff check Wesker/ tests/
 
       - name: Format check
-        run: uv run ruff format --check Wesker/ tests/
+        run: uv run --no-sync ruff format --check Wesker/ tests/
 
       - name: Test with coverage
-        run: uv run pytest tests/ --cov=Wesker --cov-report=xml:coverage.xml -q
+        run: uv run --no-sync pytest tests/ --cov=Wesker --cov-report=xml:coverage.xml -q
 
       - name: Upload coverage report
         # Only the canonical cell feeds SonarCloud — avoids a matrix artifact-name collision, and
@@ -135,4 +137,6 @@ jobs:
           # Read-only token, so zizmor can also run its online audits (impostor commits,
           # actions with known vulnerabilities).
           GH_TOKEN: ${{ github.token }}
-        run: uvx zizmor@1.30.1 .
+        # --no-build: zizmor installs from its published wheel; no source distribution is built, so
+        # no setup script runs.
+        run: uvx --no-build zizmor@1.30.1 .

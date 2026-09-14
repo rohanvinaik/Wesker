@@ -30,6 +30,9 @@ plumbing, how the published Action handles its inputs, and the documentation.
   shell script, which was a template-injection path. Workflows pin actions to commit SHAs, run with
   read-only tokens, do not persist checkout credentials, and are audited by zizmor in CI; CodeQL runs on
   push, pull request and weekly.
+- CI installs with `uv sync --locked` and runs every later step with `--no-sync`, so nothing is resolved
+  or built after the install step; zizmor installs with `--no-build`. `spec-pr.yml` grants its write
+  permissions to its one job rather than to the whole workflow.
 - **Releases are signed.** Publishing a GitHub release builds the tagged commit, refuses when the tag is
   not `__version__`, checks the sdist against git, and attaches the files with their Sigstore bundles.
 - `SECURITY.md` (private reporting through the Security tab) and `CONTRIBUTING.md`.
@@ -45,6 +48,8 @@ plumbing, how the published Action handles its inputs, and the documentation.
 
 - ruff 0.16.7 with its default rules worked through rather than pinned away; ty clean; pytest runs with
   warnings as errors.
+- The float-perturbation NaN guard reads `math.isnan(v)` rather than `v == v`. Same behaviour; the old
+  spelling reads as a typo to a reviewer and to SonarCloud alike.
 
 ## 1.1.0 — 2026-09-11
 

@@ -895,8 +895,7 @@ class _ValueMutator(_BaseMutator):
             # and `flag` is how they spend it. NaN never perturbs (x+d is NaN,
             # ==-invisible); a delta lost to float magnitude (1e20+0.1 == 1e20) or
             # landing on the collapse drops out rather than duplicating a mutant.
-            # PLR0124: `v == v` is False exactly for NaN, which never perturbs (see above)
-            if v == v:  # noqa: PLR0124
+            if not math.isnan(v):
                 for delta, label in (
                     (1.0, "VALUE:float~pert+1"),
                     (-1.0, "VALUE:float~pert-1"),

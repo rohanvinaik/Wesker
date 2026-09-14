@@ -2,11 +2,12 @@
 
 Notable changes, newest first. Dates are the commit dates.
 
-## 1.1.1 — 2026-09-13
+## 1.1.1 — 2026-09-14
 
 A patch release. The mutation policy is unchanged (`7.a73c76cd1d65`): no question in the universe moved.
 What changed is how a survivor is judged equivalent, a descriptor leak and a warning in the pytest
-plumbing, how the published Action handles its inputs, and the documentation.
+plumbing, what a truncated Action run tells you, how the published Action handles its inputs, and the
+documentation.
 
 ### Correctness
 
@@ -43,8 +44,8 @@ plumbing, how the published Action handles its inputs, and the documentation.
   read-only tokens, do not persist checkout credentials, and are audited by zizmor in CI; CodeQL runs on
   push, pull request and weekly.
 - CI installs with `uv sync --locked` and runs every later step with `--no-sync --no-build`, so nothing
-  is resolved, installed or built after the install step; zizmor installs with `--no-build`. `spec-pr.yml` grants its write
-  permissions to its one job rather than to the whole workflow.
+  is resolved, installed or built after the install step; zizmor installs with `--no-build`.
+  `spec-pr.yml` grants its write permissions to its one job rather than to the whole workflow.
 - **Releases are signed.** Publishing a GitHub release builds the tagged commit, refuses when the tag is
   not `__version__`, checks the sdist against git, and attaches the files with their Sigstore bundles.
 - `SECURITY.md` (private reporting through the Security tab) and `CONTRIBUTING.md`.

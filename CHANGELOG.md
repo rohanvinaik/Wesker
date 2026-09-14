@@ -57,6 +57,10 @@ plumbing, how the published Action handles its inputs, and the documentation.
   warnings as errors.
 - The float-perturbation NaN guard reads `math.isnan(v)` rather than `v == v`. Same behaviour; the old
   spelling reads as a typo to a reviewer and to SonarCloud alike.
+- The real-runaway `bounded_join` test now uses the engine's thread shape: the loop in a called function,
+  the handler in the thread target. On Python 3.13 an injected stop can skip a handler written in the
+  same frame as the loop (python/cpython#139622; 25 of 30 locally), which failed the test under
+  warnings-as-errors. The engine's own paths already had the safe shape and leaked nothing on 3.11–3.13.
 
 ## 1.1.0 — 2026-09-11
 

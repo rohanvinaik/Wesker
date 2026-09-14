@@ -121,13 +121,31 @@ def test_the_extra_unwind_allowance_is_granted_only_when_the_injection_did_not_l
 # --- the ordinary paths keep their meaning, on real threads --------------------------------------
 
 
+def _spin(flag: dict, stop: threading.Event) -> None:
+    """The runaway itself: pure Python, and it honours a stop flag so no test can leak it."""
+    i = 0
+    while not stop.is_set():
+        flag["n"] = i
+        i += 1
+
+
 def _runaway(flag: dict, stop: threading.Event) -> None:
-    """A pure-Python runaway that ALSO honours a stop flag, so no test can leak it."""
+    """The thread target, in the engine's shape: the loop runs in a CALLEE and the handler sits in
+    the target, as in `engine._run_test_with_timeout` and `line_coverage._traced_in_thread`.
+
+    Measured 2026-09-14, outside pytest, 30 injections each. On CPython 3.13.12 an injection landing
+    on `while not stop.is_set():` skipped a `try/except BaseException` written in the SAME frame as
+    that loop 25 times out of 30, and the exception left the thread uncaught; under pytest that is a
+    PytestUnhandledThreadExceptionWarning, which fails the run. A pure-bytecode loop in the same
+    frame: 0 of 30. 3.12.12 and 3.11.14: 0 of 30 in both shapes. With the loop in a callee and the
+    handler one frame up, 3.13 caught every injection, and the engine's own two paths driven with
+    the same runaway leaked nothing on any of the three. This matches the open upstream report
+    python/cpython#139622 ("Python 3.13: PyThreadState_SetAsyncExc might deliver the exception
+    outside of the thread"), whose reproducer is a while loop in the handler's own frame and which
+    notes that moving the loop into a called function makes it work.
+    """
     try:
-        i = 0
-        while not stop.is_set():
-            flag["n"] = i
-            i += 1
+        _spin(flag, stop)
     # BLE001: the injection unwinds through here
     except BaseException:  # noqa: BLE001
         flag["unwound"] = True
@@ -142,6 +160,8 @@ def test_a_timeout_abandons_a_real_runaway_and_reports_timed_out_and_contained()
     try:
         assert bounded_join(runaway, 0.1) == (True, True)
         assert not runaway.is_alive()
+        # The stop reached the target's handler: nothing escaped the thread uncaught.
+        assert flag.get("unwound") is True
     finally:
         stop.set()
 

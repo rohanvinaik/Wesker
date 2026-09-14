@@ -7156,20 +7156,25 @@ def greedy_coverage_guarantee(
 # ── Equivalence Detection ────────────────────────────────────────
 
 
-def _generate_boundary_inputs(
-    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
-) -> list[tuple]:
-    """Generate boundary test inputs based on parameter count.
+def boundary_input_rows(n_params: int) -> list[tuple]:
+    """The argument rows the equivalence probe runs a survivor and its original on (pure — pinned).
 
-    Uses a fixed set of boundary values: 0, 1, -1, 0.5, True, False, "", "x".
-    For multi-param functions, generates combinations of the first few values.
+    One parameter: the scalar grid ``0, 1, -1, 2, -2``, ``0.0, 1.0, -1.0, 0.5``, ``True``, ``False``.
+    Two: every pair drawn from ``0, 1, -1, 0.0, 1.0`` (25 rows, equal and unequal operands both).
+
+    Three or more: the uniform rows ``(v, v, …)`` for each of ``0, 1, -1, 0.0, 1.0``, PLUS the rotations
+    of ``0, 1, -1, 2, -2``, in which every position holds a different value. The rotations are the fix.
+    Before them every row repeated ONE value across all positions, so no row could tell two argument
+    positions apart: ``pow(a, c)`` and its SWAP mutant ``pow(c, a)`` agreed on every row, the mutant read
+    "likely equivalent", and it left the effective kill rate — the repeated-value blind spot the 1.1.0
+    policy change closed on the generation side, still open on the equivalence side. The uniform rows
+    stay because a BOUNDARY mutant (``a < c`` → ``a <= c``) is distinguished only where operands are
+    equal. With up to five arguments (the SWAP budget's own bound) every pair of positions differs in
+    some row; beyond five, positions five apart share values.
+
+    ``n_params <= 0`` is the zero-argument call.
     """
-    n_params = len(func_node.args.args)
-    # Skip 'self'/'cls' parameter — can't provide meaningful instance
-    if n_params > 0 and func_node.args.args[0].arg in ("self", "cls"):
-        n_params -= 1
-
-    if n_params == 0:
+    if n_params <= 0:
         return [()]
 
     int_vals = [0, 1, -1, 2, -2]
@@ -7179,15 +7184,27 @@ def _generate_boundary_inputs(
     if n_params == 1:
         return [(v,) for v in int_vals + float_vals + bool_vals]
 
-    if n_params == 2:
-        inputs = []
-        for a in int_vals[:3] + float_vals[:2]:
-            for b in int_vals[:3] + float_vals[:2]:
-                inputs.append((a, b))
-        return inputs[:25]
-
     base = int_vals[:3] + float_vals[:2]
-    return [tuple(base[i % len(base)] for _ in range(n_params)) for i in range(5)]
+    if n_params == 2:
+        return [(a, b) for a in base for b in base]
+
+    uniform = [tuple(v for _ in range(n_params)) for v in base]
+    rotated = [
+        tuple(int_vals[(i + j) % len(int_vals)] for j in range(n_params))
+        for i in range(len(int_vals))
+    ]
+    return uniform + rotated
+
+
+def _generate_boundary_inputs(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[tuple]:
+    """The equivalence probe's argument rows for ``func_node``: :func:`boundary_input_rows` over its
+    positional parameter count, not counting a leading ``self`` / ``cls`` (no receiver is synthesized)."""
+    n_params = len(func_node.args.args)
+    if n_params > 0 and func_node.args.args[0].arg in ("self", "cls"):
+        n_params -= 1
+    return boundary_input_rows(n_params)
 
 
 def form_b_equivalence(outcomes: list[str]) -> str:

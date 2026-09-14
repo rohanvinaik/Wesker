@@ -41,6 +41,9 @@ ON DISK under `.wesker/`, and `memory_guard.purge_caches` owns its lifecycle —
 `trace_cache.json` by name (it did NOT for this file's whole early life, so `purge` reported "clean"
 while a poisoned entry survived; that gap is closed). This is a regeneratable measurement, never a
 product, and a user who distrusts it deletes it.
+
+References (in the Detective repository, github.com/rohanvinaik/Detective):
+    §2.2, §4.6, §16, B3, D4, G1, X1  docs/TEST_BASIS.md
 """
 
 from __future__ import annotations

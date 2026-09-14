@@ -4,6 +4,10 @@ Implements §6.4 dispatch table: category→AST-transform mapping.
 Generates mutants by AST rewriting (no subprocess spawning), evaluates
 them by running targeted tests in the same process against a sandboxed
 namespace. Respects per-function time budgets.
+
+References (in the Detective repository, github.com/rohanvinaik/Detective):
+    §4.6, D4                                   docs/TEST_BASIS.md
+    §18, Q3, Fork 1, Fork 2 (§11, Def. 11.10)  docs/theory/NEGATIVE_SPECIFICATION.md
 """
 
 from __future__ import annotations
@@ -6525,7 +6529,7 @@ def run_function_profiling(
     kill_matrix: dict[str, list[str]] = {}
     survivor_records: list[dict] = []
     killed_records: list[dict] = []
-    # The Mutant objects of survivors, for the Fix B widen pass to re-evaluate against unknowns.
+    # The Mutant objects of survivors, for the target-first widen pass to re-evaluate against unknowns.
     _survivor_mutants: dict[str, Mutant] = {}
     budget_exhausted = False
     all_contained = True  # #14: cleared if any timed-out worker could not be stopped
@@ -6708,7 +6712,7 @@ def run_function_profiling(
                     "elapsed_ms": round(result.elapsed_ms, 1),
                 }
             )
-            # A survivor of the seed: the Fix B widen pass may kill it with an unknown test the seed
+            # A survivor of the seed: the target-first widen pass may kill it with an unknown test the seed
             # never traced. (Profiling runs no equivalence check, so every else-branch mutant is a
             # plain survivor eligible for the widen.)
             _survivor_mutants[mutant.mutant_id] = mutant
@@ -6732,7 +6736,7 @@ def run_function_profiling(
     if progress is not None:
         progress(total_m, total_m, _elapsed(start))
 
-    # ── LAZY WIDENING (Fix B) ──────────────────────────────────────────────────────────────
+    # ── LAZY WIDENING (target-first) ───────────────────────────────────────────────────────
     # The loop ran against the SEEDED baseline (candidate tests only). Before conceding a survivor,
     # widen with `widen_tests` and re-evaluate the survivors against it. `seed(A)+expand(B)` is
     # byte-identical to a full trace over `A∪B`, so a survivor can only move survivor->killed here
@@ -6749,7 +6753,7 @@ def run_function_profiling(
         scope_tests and exec_lines and not set(exec_lines).issubset(_covered_lines)
     )
     _widen_holder = _SESSION_BASELINE.get()
-    # ── ITEM-INCREMENTAL WIDEN (Fix B / #15 C) ──────────────────────────────────────────────────
+    # ── ITEM-INCREMENTAL WIDEN (target-first / #15 C) ───────────────────────────────────────────
     # Trace the routed unknowns ONE micro-batch at a time in the order the caller handed them (a
     # stratum order — most-likely reacher first), re-evaluating the open obligations after each and
     # STOPPING the instant they discharge. `next_routing_action` is the pinned stop rule: the
@@ -7479,7 +7483,7 @@ def run_function_converged(
     kill_matrix: dict[str, list[str]] = {}
     survivor_records: list[dict] = []
     killed_records: list[dict] = []
-    # The Mutant OBJECTS of the true survivors (not equivalents), for the Fix B widen pass to
+    # The Mutant OBJECTS of the true survivors (not equivalents), for the target-first widen pass to
     # re-evaluate against unknowns. Keyed by id so the widen can drop one as it moves to killed.
     _survivor_mutants: dict[str, Mutant] = {}
     uncontained_stop = (
@@ -7632,7 +7636,7 @@ def run_function_converged(
             elif result.equivalent:
                 record["equivalent"] = True
                 survivor_records.append(record)
-                # A seed-declared equivalent may be a FALSE equivalent (#Fix B): `check_equivalent`
+                # A seed-declared equivalent may be a FALSE equivalent (target-first): `check_equivalent`
                 # ran against a mutant with an EMPTY seed covering set, so its boundary inputs never
                 # exercised a branch an unknown test reaches. The widen re-evaluates it too — a
                 # TRULY equivalent mutant stays equivalent (no test kills it), which is why this is
@@ -7657,7 +7661,7 @@ def run_function_converged(
         if uncontained_stop:
             break
 
-    # ── LAZY WIDENING (Fix B) ──────────────────────────────────────────────────────────────
+    # ── LAZY WIDENING (target-first) ───────────────────────────────────────────────────────
     # The loop above ran against the SEEDED baseline (candidate tests only, when the caller seeded
     # the holder). A surviving mutant may be killed by an UNKNOWN test the seed never traced, so
     # before conceding a survivor, widen the baseline with `widen_tests` and re-evaluate ONLY the
@@ -7670,7 +7674,7 @@ def run_function_converged(
     # so the re-derived scope below rebuilds the FULL baseline — still a complete basis, never a
     # seed-only false survivor.
     _widen_holder = _SESSION_BASELINE.get()
-    # ── ITEM-INCREMENTAL WIDEN (Fix B / #15 C) — see run_function_profiling for the full rationale.
+    # ── ITEM-INCREMENTAL WIDEN (target-first / #15 C) — see run_function_profiling for the full rationale.
     # Converged's obligation is `_survivor_mutants`, which already carries the PROVISIONALLY-EQUIVALENT
     # mutants re-added above: an empty/partial seed can misclassify a mutant equivalent, so the widen
     # must re-observe them too — a truly-equivalent one keeps the obligation open (forcing the full

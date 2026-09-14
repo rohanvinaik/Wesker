@@ -3,10 +3,14 @@
 In-process AST mutation engine with:
 - 3-layer test discovery (convention → static impact → full fallback)
 - Real equivalent mutant detection via boundary input evaluation
-- Categorical profiling (VALUE, BOUNDARY, SWAP, STATE, TYPE, ARITHMETIC, LOGICAL)
+- Categorical profiling (VALUE, BOUNDARY, ARITHMETIC, LOGICAL, SWAP, STATE, TYPE, STMT, EXCEPTION,
+  DATAFLOW; OUTPUT only under the two-sign policy)
 - Clean, progressive terminal output
 
 Zero external dependencies beyond the test framework.
+
+References (in the Detective repository, github.com/rohanvinaik/Detective):
+    §4.5, D3  docs/TEST_BASIS.md
 """
 
 from __future__ import annotations
@@ -1673,7 +1677,7 @@ def run_with_live_suite(
                     resolved,
                     # Every routed phase reports itself. The callback resets after each completed
                     # batch, so a seed and a later widen are two honest progress phases rather than
-                    # a fast mutant "done" line followed by minutes of silence (#15/Fix B).
+                    # a fast mutant "done" line followed by minutes of silence (#15, target-first).
                     trace_progress=trace_progress,
                     # The persistent cache lives under the CONSUMER's `.wesker/`, so the root has
                     # to reach it — this closure is the only place that has both. `fresh` bypasses

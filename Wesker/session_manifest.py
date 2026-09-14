@@ -22,6 +22,9 @@ records the mapping so that conflict is detectable rather than assumed absent.
 
 NOT A PROOF OF EXECUTION. This describes COLLECTION: what pytest selected, under what regime,
 from which files. Per-item outcomes belong to the run and are not here.
+
+References (in the Detective repository, github.com/rohanvinaik/Detective):
+    §2.2  docs/TEST_BASIS.md
 """
 
 from __future__ import annotations

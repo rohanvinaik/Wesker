@@ -469,10 +469,6 @@ def main(argv: list[str] | None = None) -> int:
     Path(".wesker").mkdir(exist_ok=True)
     Path(".wesker/mutation_report.json").write_text(json.dumps(report, indent=2))
     if args.sarif:
-        # Kept inside the workspace. `--sarif` names an output file, and an output file that
-        # can be `../../../anywhere` is a path-traversal write with `parents=True` behind it —
-        # this runs on a CI runner with a checkout and a token, so "the caller chose the path"
-        # is not a reason to skip the check.
         # ALLOWLIST. `--sarif` names an output file, and an output file that can be
         # `../../../anywhere` is a path-traversal write with `parents=True` behind it. This
         # runs on a CI runner with a checkout and a token, so "the caller chose the path" is

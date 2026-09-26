@@ -164,7 +164,7 @@ def _reset_item(item: Any) -> None:
         init()
 
 
-def _cheap_failure_repr(excinfo: Any, style: Any = None) -> str:
+def _cheap_failure_repr(excinfo: Any, *_args: Any, **_kwargs: Any) -> str:
     """The failure text a MEASUREMENT session's reports carry: the exception's type and message, and
     no traceback (EP-C1 — Detective docs/ENGINEERING_PASS_2026-09-26.md).
 
@@ -177,9 +177,10 @@ def _cheap_failure_repr(excinfo: Any, style: Any = None) -> str:
     1.415 GB allocated). A value computed for no consumer.
 
     Swapping it keeps pytest's report construction — outcome, captured sections, the xfail wrapper's
-    rewrites — exactly as it is; only the formatting nobody reads is skipped. ``style`` is accepted so
-    the same function serves ``_repr_failure_py``'s signature. Never raises: an exception whose
-    ``__str__`` fails still yields its type name.
+    rewrites — exactly as it is; only the formatting nobody reads is skipped. Whatever formatting
+    options pytest passes (``_repr_failure_py``'s ``style=``) are accepted and ignored, so one function
+    serves both entry points. Never raises: an exception whose ``__str__`` fails still yields its type
+    name.
     """
     try:
         return f"{excinfo.typename}: {excinfo.value}"

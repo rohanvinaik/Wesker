@@ -164,6 +164,45 @@ def _reset_item(item: Any) -> None:
         init()
 
 
+def _cheap_failure_repr(excinfo: Any, style: Any = None) -> str:
+    """The failure text a MEASUREMENT session's reports carry: the exception's type and message, and
+    no traceback (EP-C1 — Detective docs/ENGINEERING_PASS_2026-09-26.md).
+
+    Every killed mutant is a failing test to pytest, and ``runtestprotocol`` builds a ``TestReport``
+    for each; pytest's own ``repr_failure`` formats a source-annotated traceback for it, re-parsing the
+    source of every traceback entry with ``ast``. Nothing in this session reads that text: the runner
+    :func:`_make_item_callable` builds consumes ``report.failed`` and :class:`_ExcCapture`'s raw
+    exception, and ``log=False`` means no reporter ever sees the report. Measured on a converge of an
+    18-line function: the formatting was ~45% of the run's CPU and 99% of its AST allocation (945 MB of
+    1.415 GB allocated). A value computed for no consumer.
+
+    Swapping it keeps pytest's report construction — outcome, captured sections, the xfail wrapper's
+    rewrites — exactly as it is; only the formatting nobody reads is skipped. ``style`` is accepted so
+    the same function serves ``_repr_failure_py``'s signature. Never raises: an exception whose
+    ``__str__`` fails still yields its type name.
+    """
+    try:
+        return f"{excinfo.typename}: {excinfo.value}"
+    # BLE001: the text of a report nobody reads must never be what fails the run it describes
+    except Exception:  # noqa: BLE001
+        return str(getattr(excinfo, "typename", "failure"))
+
+
+def _install_cheap_failure_repr(item: Any) -> None:
+    """Point this item's two failure-formatting entry points at :func:`_cheap_failure_repr` (EP-C1).
+
+    pytest routes a call-phase failure through ``item.repr_failure(excinfo)`` and a setup/teardown
+    failure through ``item._repr_failure_py(excinfo, style=...)`` (``_pytest.reports.
+    _format_failed_longrepr``, pytest 9.1.1). Instance attributes shadow the methods for THIS item
+    only, and the items are this module's own measurement session, whose loop the driver replaces —
+    pytest never renders their reports. Best-effort: an item that refuses the assignment keeps
+    pytest's formatting, which is slower and never wrong.
+    """
+    with contextlib.suppress(Exception):
+        item.repr_failure = _cheap_failure_repr
+        item._repr_failure_py = _cheap_failure_repr
+
+
 def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
     """Wrap a LIVE pytest item as a zero-arg callable that raises on failure.
 
@@ -199,6 +238,9 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
     import types
 
     from _pytest.runner import runtestprotocol
+
+    # EP-C1: failure reports in this session are read for `failed` and the raw exception only.
+    _install_cheap_failure_repr(item)
 
     def run(  # type: ignore[no-untyped-def]
         *, _item=item, _cap=capture, _rtp=runtestprotocol, _reset=_reset_item

@@ -23,13 +23,14 @@ concurrency:
 # not something a run picks up on its own — the same reason uv is pinned below instead of "latest".
 jobs:
   test:
-    # Matrix over the classifiers' claimed Pythons (3.10–3.13) and two OSes. Mutation runs use
-    # in-process pytest sessions and subprocess isolation — the surface that varies across
-    # versions/platforms — so a single ubuntu/one-Python job left the claims unverified.
+    # Matrix over the classifiers' claimed Pythons (3.12–3.14 — 3.14 is the standard, 3.12 the floor
+    # because it is where `sys.monitoring` arrives) and two OSes. Mutation runs use in-process pytest
+    # sessions and subprocess isolation — the surface that varies across versions/platforms — so a
+    # single ubuntu/one-Python job left the claims unverified.
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.12", "3.13", "3.14"]
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
@@ -62,7 +63,7 @@ jobs:
       - name: Upload coverage report
         # Only the canonical cell feeds SonarCloud — avoids a matrix artifact-name collision, and
         # coverage is platform/Python-independent so one cell suffices.
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.14'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-report

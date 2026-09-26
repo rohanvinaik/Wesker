@@ -6,7 +6,7 @@
   <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/ci.yml"><img src="https://github.com/rohanvinaik/Wesker/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://sonarcloud.io/summary/new_code?id=rohanvinaik_Wesker"><img src="https://sonarcloud.io/api/project_badges/measure?project=rohanvinaik_Wesker&amp;metric=alert_status" alt="Quality Gate"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-3367d6.svg" alt="License: MIT"></a>
-  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-3367d6.svg" alt="Python 3.10+"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12+-3367d6.svg" alt="Python 3.12+"></a>
 </p>
 
 `10 semantic categories · 1.00 mutants per behavioral dimension · Zero dependencies · Fully deterministic`
@@ -131,7 +131,7 @@ wesker src/                    # profile a directory
 wesker src/ --threshold 90     # fail CI below 90%
 ```
 
-Zero dependencies beyond the standard library and your test framework. Python 3.10+. As a GitHub Action, one step, and survivors land on the diff as code-scanning alerts:
+Zero dependencies beyond the standard library and your test framework. Python 3.12+. As a GitHub Action, one step, and survivors land on the diff as code-scanning alerts:
 
 ```yaml
 - uses: actions/checkout@v4

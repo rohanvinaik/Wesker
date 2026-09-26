@@ -71,18 +71,12 @@ def _load_config() -> dict:
     if not pyproject.exists():
         return config
 
-    try:
-        if sys.version_info >= (3, 11):
-            import tomllib
-        else:
-            try:
-                import tomllib  # ty: ignore[unresolved-import] — 3.11+, tomli fallback below
-            except ImportError:
-                import tomli as tomllib  # type: ignore[no-redef]  # ty: ignore[unresolved-import]
+    import tomllib
 
+    try:
         data = tomllib.loads(pyproject.read_text())
-    # no TOML parser (3.10 without tomli), an unreadable file, or invalid TOML: defaults
-    except (ImportError, OSError, ValueError):
+    # an unreadable file, or invalid TOML: defaults
+    except (OSError, ValueError):
         return config
 
     # Project name

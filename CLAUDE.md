@@ -40,8 +40,8 @@ Wesker's own suite is **not sufficient**. It has been fully green through a regr
 only the cross-repo run caught. After any Wesker change, run both:
 
 ```bash
-cd /Users/rohanvinaik/tools/Wesker && python3 -m pytest -q 2>&1 | tail -3
-PYTHONPATH=$PP python3 -m pytest 2>&1 | tail -3   # Detective's suite vs LOCAL Wesker
+cd /Users/rohanvinaik/tools/Wesker && PYTHONPATH=$PP .venv/bin/python -m pytest -q 2>&1 | tail -3
+cd /Users/rohanvinaik/tools/Detective && PYTHONPATH=$PP .venv/bin/python -m pytest 2>&1 | tail -3   # Detective's suite vs LOCAL Wesker
 ```
 
 Plus pinned ruff, never bare:

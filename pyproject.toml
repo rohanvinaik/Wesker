@@ -12,17 +12,16 @@ dynamic = ["version"]
 description = "In-process AST mutation testing for Python. Zero dependencies."
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 authors = [{ name = "Rohan Vinaik" }]
 keywords = ["mutation-testing", "testing", "ast", "code-quality", "ci"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Testing",
     "Topic :: Software Development :: Quality Assurance",
 ]
@@ -150,3 +149,10 @@ disable = [
     "C0415",                    # import-outside-toplevel — deliberate lazy / cycle-avoiding imports
     "W0621",                    # redefined-outer-name — CLI shadow patterns
 ]
+
+# The project's interpreter is a uv-MANAGED CPython, never whatever else is active (Detective EP-C4).
+# With conda's base environment active, uv resolves the `.python-version` pin to conda's interpreter,
+# whose auto-loaded pytest plugins change what a suite does. Managed builds are the same bytes on every
+# machine and CI runner; uv-only dev metadata, not part of the wheel.
+[tool.uv]
+python-preference = "only-managed"

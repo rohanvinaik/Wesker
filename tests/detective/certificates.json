@@ -46,6 +46,12 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/monitoring.py::step_cap": {
+    "cut_reasons": [],
+    "function_digest": "dc7a6a6011901325",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/policy.py::_fingerprint_counts": {
     "cut_reasons": [],
     "function_digest": "c9f6a705ec9f2619",

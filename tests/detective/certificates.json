@@ -46,6 +46,12 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/monitoring.py::step_budget_verdict": {
+    "cut_reasons": [],
+    "function_digest": "d8eca6039415c200",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/monitoring.py::step_cap": {
     "cut_reasons": [],
     "function_digest": "dc7a6a6011901325",

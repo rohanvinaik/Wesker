@@ -5305,30 +5305,46 @@ def _holder_shape(value: Any, target: Any) -> str:
             return "captured" if any(item is target for item in held) else ""
         if isinstance(value, type) or not callable(value):
             return ""
-        inner = _own_attr(value, "__wrapped__")
-        for _ in range(16):
-            if inner is None:
-                break
-            if inner is target:
-                return "wrapper"
-            inner = _own_attr(inner, "__wrapped__")
-        if isinstance(value, types.FunctionType):
-            for cell in value.__closure__ or ():
-                try:
-                    if cell.cell_contents is target:
-                        return "wrapper"
-                except ValueError:  # an empty cell
-                    continue
-            defaults = (
-                *(value.__defaults__ or ()),
-                *(value.__kwdefaults__ or {}).values(),
-            )
-            if any(item is target for item in defaults):
-                return "captured"
+        return _callable_shape(value, target)
     # BLE001: an object that cannot be inspected holds nothing this scan can name
     except Exception:  # noqa: BLE001
         return ""
-    return ""
+
+
+def _wraps(value: Any, target: Any) -> bool:
+    """Whether ``value``'s ``__wrapped__`` chain reaches ``target`` (#18), read from the instance
+    dictionaries `functools.wraps` writes, never through ``__getattr__``. Bounded: a chain is
+    acyclic only by convention."""
+    inner = _own_attr(value, "__wrapped__")
+    for _ in range(16):
+        if inner is None:
+            return False
+        if inner is target:
+            return True
+        inner = _own_attr(inner, "__wrapped__")
+    return False
+
+
+def _cell_holds(cell: Any, target: Any) -> bool:
+    """Whether one closure cell holds ``target`` (#18); an empty cell holds nothing."""
+    try:
+        return cell.cell_contents is target
+    except ValueError:
+        return False
+
+
+def _callable_shape(value: Any, target: Any) -> str:
+    """`_holder_shape` for a plain callable (#18): ``"wrapper"`` when it calls ``target`` from
+    inside — its ``__wrapped__`` chain, or a closure cell — and ``"captured"`` when a function holds
+    it as a default argument, bound at definition, i.e. at import."""
+    if _wraps(value, target):
+        return "wrapper"
+    if not isinstance(value, types.FunctionType):
+        return ""
+    if any(_cell_holds(cell, target) for cell in value.__closure__ or ()):
+        return "wrapper"
+    defaults = (*(value.__defaults__ or ()), *(value.__kwdefaults__ or {}).values())
+    return "captured" if any(item is target for item in defaults) else ""
 
 
 def _holder_children(value: Any) -> list[tuple[str, Any]]:

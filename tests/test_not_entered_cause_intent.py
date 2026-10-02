@@ -361,6 +361,79 @@ def test_the_scan_names_each_holder_where_it_lives(project):
     )
 
 
+_SHAPES = """\
+import functools
+
+
+def target(x):
+    return x + 1
+
+
+def _deco_without_wraps(f):
+    def inner(*args):
+        return f(*args)
+
+    return inner
+
+
+closed_over = _deco_without_wraps(target)
+
+
+def with_default(x, fn=target):
+    return fn(x)
+
+
+bound_partial = functools.partial(target, 1)
+
+
+class Holder:
+    handler = target
+    static = staticmethod(target)
+
+
+class Owner:
+    def meth(self):
+        return 1
+"""
+
+
+@pytest.fixture
+def shapes(tmp_path, monkeypatch):
+    (tmp_path / "neshapes.py").write_text(_SHAPES)
+    sys.modules.pop("neshapes", None)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    try:
+        yield importlib.import_module("neshapes"), str(tmp_path / "neshapes.py")
+    finally:
+        sys.modules.pop("neshapes", None)
+
+
+def test_each_reference_shape_is_named_where_it_lives(shapes):
+    """A decorator written without `functools.wraps` (a closure), a default bound at definition, a
+    partial, and class attributes — each holds the original where the install, which rebinds module
+    attributes by name, never looks."""
+    mod, path = shapes
+    holders, scan = _original_holders(mod.target, "target", "target", path)
+    assert scan == "complete"
+    assert sorted((h["where"], h["kind"]) for h in holders) == [
+        ("neshapes.Holder.handler", "captured"),
+        ("neshapes.Holder.static", "captured"),
+        ("neshapes.bound_partial", "captured"),
+        ("neshapes.closed_over", "wrapper"),
+        ("neshapes.with_default", "captured"),
+    ]
+
+
+def test_a_method_on_its_own_class_is_rebound_not_held(shapes):
+    """For a method target the owner class's attribute IS rebound by the install's owner patch, so
+    it must not be named as a holder of the original."""
+    mod, path = shapes
+    assert _original_holders(mod.Owner.meth, "meth", "Owner.meth", path) == (
+        [],
+        "complete",
+    )
+
+
 def test_the_scan_unwraps_the_wrapper_a_caller_may_hand_it(project):
     """Detective loads a target by module attribute, i.e. the decorator's wrapper; the references
     that matter are to the function the mutant replaces, and the answer must not depend on which

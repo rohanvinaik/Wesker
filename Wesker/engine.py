@@ -4132,6 +4132,64 @@ def _baseline_failures(
     return inert, compromised
 
 
+def attribution_standing(inert: bool, screened: bool) -> str:
+    """Whether ONE pool test may be credited with a kill (#31, pure — pinned).
+
+    ``_tests_for``'s whole-pool fallback ran every test not KNOWN to fail on the original — and "not
+    known to fail" collapsed two different facts into one truthy check: "the baseline ran it and it
+    passed" and "the baseline never ran it". Since Detective ``071fc73`` the pool is the CONSULTED
+    set, and a widen-admitted test sits in it before the widen traces it, so it reached the fallback
+    unscreened. Measured: a test asserting ``scale(3) == 7`` against a function returning 6 was
+    credited with killing both def-line mutants of the ``factor=2`` default — by assertion, on a
+    result reporting itself gateable — because the baseline had never asked whether it passes.
+
+    * ``barred``     — the baseline ran it and it does not pass on the original (Filter 1): it fails
+      whatever the mutant does, so it can distinguish nothing. Checked first — a known failure is the
+      most definite thing known about a test.
+    * ``unscreened`` — the baseline never ran it this session, so it MAY fail on the original. It may
+      not run against a mutant until it is screened; where a mutant needed it (a whole-pool fallback),
+      it is that mutant's typed-unknown remainder, reported by name — never silently "no test".
+    * ``usable``     — screened and passing on the original: its failure under a mutant is a kill.
+    """
+    if inert:
+        return "barred"
+    if not screened:
+        return "unscreened"
+    return "usable"
+
+
+def mutant_scope_route(
+    scope_tests: bool,
+    has_line_data: bool,
+    mutated_line: int | None,
+    line_in_body: bool,
+) -> str:
+    """Which tests may run against ONE mutant, and if not the covering ones, WHY (#31, pure — pinned).
+
+    Test-impact scoping runs a mutant against the tests that EXECUTE its line. Where the engine
+    cannot say which those are, it falls back to the whole pool of USABLE tests
+    (:func:`attribution_standing`) — the conservative direction, since missing coverage must not
+    manufacture a survivor. The fallback's cause is named rather than folded, because each has a
+    different remedy and the report carries it beside a survivor's typed-unknown remainder:
+
+    * ``unscoped``        — the caller turned scoping off (the A/B path): the pool, by request.
+    * ``no_line_data``    — no traced coverage at all for this function.
+    * ``no_mutated_line`` — the mutator could not report where it fired.
+    * ``off_body_line``   — the line is outside the traced body: a default, an annotation or a
+      decorator on the ``def`` line (#30) — "no data", never "no test".
+    * ``covering``        — the tests whose trace executed the mutated line.
+    """
+    if not scope_tests:
+        return "unscoped"
+    if not has_line_data:
+        return "no_line_data"
+    if mutated_line is None:
+        return "no_mutated_line"
+    if not line_in_body:
+        return "off_body_line"
+    return "covering"
+
+
 def _build_test_scope(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     test_functions: list[Callable[..., None]],
@@ -4147,6 +4205,7 @@ def _build_test_scope(
     arcs_out: dict[str, list[tuple[int, int]]] | None = None,
     outcomes_out: dict[str, str] | None = None,
     reach_out: dict[str, str] | None = None,
+    unscreened_out: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[
     Callable[[Mutant], list[Callable[..., None]]],
     dict[str, list[int]],
@@ -4162,7 +4221,10 @@ def _build_test_scope(
        test is dropped from the kill loop entirely (see ``_baseline_failures``). This
        is the honesty guard: without it, one unrunnable test manufactures a 100% kill
        rate. It applies to the scoped AND unscoped paths — they share this resolver,
-       so a defect here cannot hide on one side.
+       so a defect here cannot hide on one side. And it needs the baseline to have RUN
+       the test (#31, :func:`attribution_standing`): a test in the pool the session
+       baseline never screened — a widen-admitted test before the widen traces it — may
+       fail on the original too, so it runs against NO mutant until it is screened.
 
     2. SCOPING. A test can only kill a mutant if it EXECUTES the mutated line, so
        evaluating each mutant against just the tests covering that line yields
@@ -4194,6 +4256,13 @@ def _build_test_scope(
     ``outcomes_out`` receives each screened test's TYPED baseline outcome and ``reach_out`` the
     tests whose reach was incompletely observed (#17), from whichever of the three sources
     decided this scope — so the ledger a caller builds reads the same baseline the scope did.
+
+    ``unscreened_out`` (#31) is kept current by the RESOLVER: each time it routes a mutant to the
+    whole-pool fallback (:func:`mutant_scope_route`) while unscreened pool tests exist, it records
+    ``{mutant_id: {"scope": route, "unscreened_tests": [...]}}`` — the tests that mutant's verdict
+    was NOT measured against, by name — and drops the entry once a later scope has screened them
+    or the mutant routes to its covering tests. A survivor carries it into its record, so "no test
+    killed this" never silently stands for "these consulted tests were never run".
     """
     exec_lines = sorted(_executable_lines(func_node))
     # Resolving the holder is what BUILDS the baseline (see `LazySessionBaseline`). Reaching
@@ -4204,6 +4273,11 @@ def _build_test_scope(
     # Typed outcomes of the screened tests, and the tests whose reach was not fully observed (#17).
     _typed: dict[str, str] = {}
     _reach: dict[str, str] = {}
+    # The tests the baseline SCREENED (#31), when only some of the pool were: the session baseline,
+    # which a target-first driver seeds with its candidates and widens later. None everywhere else —
+    # the per-function probe runs over this very pool (or, with no genuine original, there is no
+    # baseline at all), so no pool test is screened while another is not.
+    _screened: set[str] | None = None
     if precomputed_line_data is not None:
         # An adaptive-probe caller already ran this baseline over the same tests+function;
         # reuse it so a probe + follow-up run don't trace twice. Deterministic, so the
@@ -4240,6 +4314,7 @@ def _build_test_scope(
         inert = session.inert
         _typed = dict(session.outcomes or {})
         _reach = dict(session.incomplete_reach)
+        _screened = set(session.outcomes) if session.outcomes is not None else None
         if truncated is not None:
             truncated |= (
                 session.truncated
@@ -4279,10 +4354,25 @@ def _build_test_scope(
     if reach_out is not None:
         reach_out.update(_reach)
 
-    # Filter 1 — bar tests that cannot distinguish anything from the kill loop.
-    usable = (
-        [t for t in test_functions if id(t) not in inert] if inert else test_functions
-    )
+    from Wesker.ci import (
+        callable_test_id,
+    )  # local: `ci` imports this module at module scope
+
+    # Filter 1 — bar tests that cannot distinguish anything from the kill loop, and hold back the
+    # ones the baseline never ran (#31). `usable` is exactly "screened and passing on the original":
+    # it used to be "not KNOWN to fail", which let an unscreened test that fails on the original
+    # through the whole-pool fallback below, credited with every mutant it "killed".
+    _tid = {id(t): callable_test_id(t) for t in test_functions}
+    _standing = {
+        id(t): attribution_standing(
+            id(t) in inert, _screened is None or _tid[id(t)] in _screened
+        )
+        for t in test_functions
+    }
+    usable = [t for t in test_functions if _standing[id(t)] == "usable"]
+    unscreened_ids = [
+        _tid[id(t)] for t in test_functions if _standing[id(t)] == "unscreened"
+    ]
 
     # Keyed by TEST ID, because `line_cov` is (issue #16) — `trace_suite` and
     # `trace_line_coverage` both key on `ci.callable_test_id`, and this table is what those
@@ -4293,13 +4383,9 @@ def _build_test_scope(
     #
     # The list value is retained though a TestId now identifies ONE item: a backend that
     # yields the same id twice must not lose an owner, and the cost is a one-element list.
-    from Wesker.ci import (
-        callable_test_id,
-    )  # local: `ci` imports this module at module scope
-
     tests_by_name: dict[str, list[Callable[..., None]]] = {}
     for _tf in usable:
-        tests_by_name.setdefault(callable_test_id(_tf), []).append(_tf)
+        tests_by_name.setdefault(_tid[id(_tf)], []).append(_tf)
     covering_by_line: dict[int, list[Callable[..., None]]] = {}
     if scope_tests and line_cov:
         for tname, lines in line_cov.items():
@@ -4331,13 +4417,49 @@ def _build_test_scope(
     exec_line_set = set(exec_lines)
 
     def _tests_for(mutant: Mutant) -> list[Callable[..., None]]:
-        if not scope_tests or not line_cov or mutant.mutated_line is None:
-            return usable  # cannot scope safely — run the full usable set
-        if mutant.mutated_line not in exec_line_set:
-            return usable  # no data for this line — cannot scope safely
-        return covering_by_line.get(mutant.mutated_line, [])
+        route = mutant_scope_route(
+            scope_tests,
+            bool(line_cov),
+            mutant.mutated_line,
+            mutant.mutated_line in exec_line_set,
+        )
+        if route == "covering":
+            if unscreened_out is not None:
+                unscreened_out.pop(mutant.mutant_id, None)
+            return covering_by_line.get(mutant.mutated_line, [])
+        # Cannot scope this mutant: every SCREENED usable test runs (#31). What the pool holds that
+        # the baseline never screened is this mutant's typed-unknown remainder, recorded by name.
+        if unscreened_out is not None:
+            if unscreened_ids:
+                unscreened_out[mutant.mutant_id] = {
+                    "scope": route,
+                    "unscreened_tests": list(unscreened_ids),
+                }
+            else:
+                unscreened_out.pop(mutant.mutant_id, None)
+        return usable
 
     return _tests_for, line_cov, exec_lines, failing
+
+
+def _carry_unscreened(
+    survivor_records: list[dict], unscreened: dict[str, dict[str, Any]]
+) -> None:
+    """Stamp each survivor with its mutant's CURRENT typed-unknown remainder, or clear a stale one (#31).
+
+    ``unscreened`` is the map ``_build_test_scope``'s resolver keeps current
+    (``{mutant_id: {"scope": route, "unscreened_tests": [...]}}``). Applied once the widen is over, so
+    a survivor names exactly the consulted tests its verdict was never measured against — and one the
+    widen went on to screen carries nothing. Both profiling paths call it, so they cannot report the
+    remainder differently.
+    """
+    for record in survivor_records:
+        entry = unscreened.get(record.get("mutant_id", ""))
+        if entry:
+            record.update(entry)
+        else:
+            record.pop("scope", None)
+            record.pop("unscreened_tests", None)
 
 
 def dimension_budget(
@@ -6635,6 +6757,9 @@ def run_function_profiling(
     # — read for the ledger only when no session baseline exists (the session's own are read below).
     _scope_outcomes: dict[str, str] = {}
     _scope_reach: dict[str, str] = {}
+    # Each fallback-routed mutant's typed-unknown remainder (#31), kept current by every resolver this
+    # run builds — initial, freshened, and each widen step — and stamped on the survivors at the end.
+    _unscreened: dict[str, dict[str, Any]] = {}
     _tests_for, line_cov, exec_lines, failing = _build_test_scope(
         func_node,
         test_functions,
@@ -6650,6 +6775,7 @@ def run_function_profiling(
         _arc_cov,
         outcomes_out=_scope_outcomes,
         reach_out=_scope_reach,
+        unscreened_out=_unscreened,
     )
     # Before the mutation loop: re-observe this function's covering tests fresh, so a warm run's
     # replayed reach is promoted back to admissible and the certificate rests on this session (#20).
@@ -6674,7 +6800,54 @@ def run_function_profiling(
             trace_session_budget_s,
             _baseline_uncontained,
             _arc_cov,
+            unscreened_out=_unscreened,
         )
+
+    # #31 — SCREEN ON DEMAND where this run cannot widen. In-process, an unscreened consulted test is
+    # screened by the item-incremental widen below (a survivor keeps it going until the test is
+    # traced), so holding it back from the fallback costs nothing in the end. The ISOLATED mode never
+    # widens (`not isolated` there): its seed's unknowns would stay unscreened, and so unknown, for
+    # EVERY mutant they could kill. Measured: `detective audit` (isolated only) of a private helper
+    # tested solely through its public caller — an EMPTY seed, the caller tests all widen-admitted —
+    # fell from 8/13 value-pinned to 0/13. So here they are screened up front, once, through the same
+    # `expand` the widen uses (seed(A) + expand(B) is a full trace over A∪B), and the scope re-derived
+    # from it — the isolated run then rests on the basis an exhaustive widen reaches in-process.
+    if isolated and widen_tests:
+        _iso_holder = _SESSION_BASELINE.get()
+        _iso_sb = session_baseline()
+        if (
+            _iso_holder is not None
+            and _iso_sb is not None
+            and _iso_sb.outcomes is not None
+        ):
+            from Wesker.ci import callable_test_id as _ctid_screen
+
+            _screen = [
+                t for t in widen_tests if _ctid_screen(t) not in _iso_sb.outcomes
+            ]
+            if _screen:
+                _iso_holder.expand(_screen, persist=False)
+                _iso_holder.flush()
+                # Re-derive from the screened basis with FRESH containers, as the freshen path does —
+                # an `expand` that degraded invalidated the holder, and this read then rebuilds it whole.
+                _trace_truncated = set()
+                _baseline_uncontained = set()
+                _arc_cov = {}
+                _tests_for, line_cov, exec_lines, failing = _build_test_scope(
+                    func_node,
+                    test_functions,
+                    original_func,
+                    scope_tests,
+                    None,
+                    qualname,
+                    trace_budget_s,
+                    _trace_truncated,
+                    trace_progress,
+                    trace_session_budget_s,
+                    _baseline_uncontained,
+                    _arc_cov,
+                    unscreened_out=_unscreened,
+                )
 
     # Live baseline for the adaptive per-mutant allowance (#13): time the ORIGINAL over the tests
     # once, untraced (the mutant loop is untraced too). None → fall back to the configured cap.
@@ -6989,6 +7162,7 @@ def run_function_profiling(
             trace_session_budget_s,
             _wu,
             _wa,
+            unscreened_out=_unscreened,
         )
         _trace_truncated |= _wt
         _baseline_uncontained |= _wu
@@ -7070,6 +7244,9 @@ def run_function_profiling(
     # widen's cells, never a prior run's. Routing evidence for a SIBLING is what is written here.
     if _widen_holder is not None:
         _widen_holder.flush()
+    # A survivor whose fallback held back unscreened pool tests names them (#31): "survived" here
+    # means "survived the SCREENED tests", and the remainder is unknown, never "no test".
+    _carry_unscreened(survivor_records, _unscreened)
 
     per_cat = list(results_by_cat.values())
     total = sum(cr.total for cr in per_cat)
@@ -7645,6 +7822,8 @@ def run_function_converged(
     # is always sound, just slower.
     _trace_truncated: set[str] = set()
     _baseline_uncontained: set[str] = set()
+    # Each fallback-routed mutant's typed-unknown remainder (#31) — see `run_function_profiling`.
+    _unscreened: dict[str, dict[str, Any]] = {}
     _tests_for, line_cov, exec_lines, _failing = _build_test_scope(
         func_node,
         test_functions,
@@ -7657,6 +7836,7 @@ def run_function_converged(
         trace_progress,
         trace_session_budget_s,
         _baseline_uncontained,
+        unscreened_out=_unscreened,
     )
     # Before the mutation loop: re-observe this function's covering tests fresh (same seam as the
     # profiling path), so a warm run's replayed reach is promoted back to admissible (#20). If it
@@ -7677,6 +7857,7 @@ def run_function_converged(
             trace_progress,
             trace_session_budget_s,
             _baseline_uncontained,
+            unscreened_out=_unscreened,
         )
 
     seen: dict[str, MutantResult] = {}
@@ -7924,6 +8105,7 @@ def run_function_converged(
             trace_progress,
             trace_session_budget_s,
             _wu,
+            unscreened_out=_unscreened,
         )
         _trace_truncated |= _wt
         _baseline_uncontained |= _wu
@@ -7992,6 +8174,8 @@ def run_function_converged(
     # One save for the whole widen — see the same site in `run_function_profiling`.
     if _widen_holder is not None:
         _widen_holder.flush()
+    # The same typed-unknown remainder on each survivor as the profiling path (#31).
+    _carry_unscreened(survivor_records, _unscreened)
 
     # Aggregate by category
     results_by_cat: dict[MutationCategory, CategoryResult] = {}

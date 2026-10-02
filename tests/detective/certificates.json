@@ -35,9 +35,21 @@
     "refusal": "",
     "standing": "incomplete"
   },
+  "Wesker/engine.py::attribution_standing": {
+    "cut_reasons": [],
+    "function_digest": "339b4798004ecef6",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/engine.py::execution_lock_disposition": {
     "cut_reasons": [],
     "function_digest": "30afa2daf0abb2dc",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/engine.py::mutant_scope_route": {
+    "cut_reasons": [],
+    "function_digest": "d02323b2c55a8319",
     "refusal": "",
     "standing": "complete"
   },

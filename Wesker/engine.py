@@ -245,8 +245,25 @@ class MutantResult:
     # it out of the denominator under the refusal's own name.
     refusal: str = ""
     refused_test: str | None = None
+    # How many of the tests handed to `evaluate_mutant` STARTED, in order (#18): the tests that
+    # ran are `test_functions[:tests_run]`. A cause named for `not_entered` is a claim about THOSE
+    # tests, not the whole scope — the allowance can end the scan before a test that reaches the
+    # function gets its turn, which is the measured `step_budget_verdict` shape. -1 = not recorded
+    # (a construction site that ran no test loop, e.g. the isolated path's results).
+    tests_run: int = -1
 
 
+# THE `entered=None` RULE (#18), stated beside the dispositions it decides between. A mutant
+# evaluated against NO tests — the normal state of Detective's synthesis path, where the tests do
+# not exist yet — never reaches the entry probe, so `entered` is None: NOT OBSERVED, which is not
+# `False`. Such a mutant is scored a plain survivor (`survived_after_entry`), exactly as before #18.
+# Reading that silence as "installed but bypassed" would send every mutant of an untested function
+# to `not_entered`, empty the denominator, and report a function with no tests at all as fully
+# specified — a false COMPLETE, the one outcome this engine must never produce. `not_entered`
+# therefore requires a POSITIVE observation: at least one test ran and the probe never fired. WHY
+# it never fired is then named per mutant by `not_entered_cause`, from the tests that ran and what
+# holds the original (`unscored_records`).
+#
 # Dispositions that belong in the mutation-score denominator. A mutant only measures the SUITE
 # once it was built, installed, and entered; before that, an outcome measures the harness.
 SCORED_DISPOSITIONS = ("killed_after_entry", "survived_after_entry")
@@ -303,6 +320,82 @@ def mutant_disposition(
     if not contained:
         return "cut"
     return "killed_after_entry" if killed else "survived_after_entry"
+
+
+def baseline_reach(
+    ran: list[str], line_coverage: dict[str, list[int]], truncated: list[str]
+) -> str:
+    """Whether the tests that RAN against a mutant reached its function on the unmutated baseline.
+
+    (#18, pure — pinned) The first of the two facts `not_entered_cause` decides from. ``ran`` is the
+    TestIds that actually started against the mutant (`MutantResult.tests_run` — the allowance can
+    end the scan before a test that reaches the function gets its turn), ``line_coverage`` the
+    baseline's per-TestId lines of this function (an entry per TRACED test, empty when it reached
+    none), ``truncated`` the TestIds whose trace was cut.
+
+      reached   -- at least one of them executed a line of the function on the original. A cut
+                   trace's lines are real lines, so a truncated test can establish this.
+      unreached -- every one of them was traced IN FULL and none executed any line of it: nothing
+                   called the function by any route, so no holder can explain the silence.
+      unknown   -- none reached it, and at least one was never traced or its trace was cut. Absence
+                   of a line nobody recorded is not evidence.
+
+    An empty ``ran`` is ``unknown``: "every test that ran" over no tests is vacuously true, and
+    vacuous truth is exactly the false "no test reaches it" this exists to stop.
+    """
+    if not ran:
+        return "unknown"
+    complete = True
+    for test_id in ran:
+        lines = line_coverage.get(test_id)
+        if lines:
+            return "reached"
+        if lines is None or test_id in truncated:
+            complete = False
+    return "unreached" if complete else "unknown"
+
+
+def not_entered_cause(reach: str, holders: list[str]) -> str:
+    """WHY an installed mutant was never entered, named where it can be decided (#18, pure — pinned).
+
+    `not_entered` used to carry ONE sentence whatever the cause — "the namespace holds the mutant
+    while the caller holds the original (the decorator/registry capture)" — and in the field the
+    named mechanism was absent: plain functions with no decorator, whose mutants ran against tests
+    that never reached them (Detective #77). An operator told to "route a test through the patched
+    name" for a function no test calls has no next step, and one told it about a registry that does
+    not exist repairs nothing. So the cause is DECIDED, from two observed facts:
+
+    ``reach`` is `baseline_reach`'s answer for the tests that ran; ``holders`` the kinds of
+    module-level reference to the original that the install does not rebind (`_original_holders`:
+    ``"wrapper"``, ``"captured"``, ``"alias"``).
+
+      not_reached          -- reach is ``unreached``: nothing called the function by any route, so
+                              no holder explains anything. Route a test to it.
+      decorator_wrapper    -- a wrapper bound in a module calls the original from inside; callers
+                              through it run the original whatever the namespace holds.
+      captured_at_import   -- a module-level constant or registry holds the original (a container
+                              element, an object's or class's field, a default, a partial).
+      pre_bound_reference  -- a module binds the original under another name (``from m import fn
+                              as alias``); the install rebinds by NAME.
+      holder_not_found     -- the tests reached the function, yet no module-level holder was found:
+                              the reference lives where the bounded scan does not look.
+      no_reach_data        -- no holder, and no complete trace to say whether the tests reached it.
+
+    A holder is named even when reach is ``unknown``: it is a fact about the process whatever the
+    trace says. Among several, the wrapper is first — it is what EVERY caller through the module
+    attribute gets — then the captured copy, then the alias.
+    """
+    if reach == "unreached":
+        return "not_reached"
+    if "wrapper" in holders:
+        return "decorator_wrapper"
+    if "captured" in holders:
+        return "captured_at_import"
+    if "alias" in holders:
+        return "pre_bound_reference"
+    if reach == "reached":
+        return "holder_not_found"
+    return "no_reach_data"
 
 
 def merge_unscored(counts: list[dict[str, int]]) -> tuple[int, dict[str, int]]:
@@ -609,6 +702,22 @@ class ProfilingResult:
         return _distinct_obligations(self.kill_matrix, self.total_survived)
 
     @property
+    def not_entered_causes(self) -> dict[str, int]:
+        """How many `not_entered` mutants each named cause accounts for (#18).
+
+        The per-cause view of ``unscored_by["not_entered"]``, DERIVED from `unscored_records` so the
+        two cannot disagree — and derived rather than stored, so a cached result recomputes it. A
+        record without a cause (a construction that did not classify) counts as ``unclassified``
+        rather than vanishing from the total.
+        """
+        causes: dict[str, int] = {}
+        for record in self.unscored_records:
+            if record.get("disposition") == "not_entered":
+                cause = str(record.get("cause") or "unclassified")
+                causes[cause] = causes.get(cause, 0) + 1
+        return causes
+
+    @property
     def value_killed(self) -> int:
         """Mutants whose return value is pinned — assertion kills only."""
         return sum(cr.value_killed for cr in self.per_category)
@@ -781,6 +890,10 @@ class ProfilingResult:
         # other record views, so a reader can act on a named mutant rather than a tally.
         if self.unscored_records:
             d["unscored_records"] = self.unscored_records
+        # WHY each installed mutant was never entered, counted per named cause (#18) — the view a
+        # renderer needs to say the right repair instead of one sentence for every cause.
+        if self.not_entered_causes:
+            d["not_entered_causes"] = self.not_entered_causes
         if self.line_coverage:
             d["line_coverage"] = self.line_coverage
         # The proof view alongside the observed one (#17), never instead of it. A consumer
@@ -872,6 +985,44 @@ def _unscored_record(result: MutantResult, disposition: str) -> dict:
     if result.refused_test:
         record["test"] = result.refused_test
     return record
+
+
+def _not_entered_detail(
+    result: MutantResult,
+    scoped: list[Callable[..., None]],
+    line_coverage: dict[str, list[int]],
+    truncated: set[str],
+    holders: list[dict[str, str]],
+    holder_scan: str,
+) -> dict[str, Any]:
+    """The cause of one `not_entered` mutant, and the facts it was decided from (#18).
+
+    ``scoped`` is the list the mutant was evaluated against; the tests that RAN are its first
+    `tests_run` (the whole list when that was not recorded — an over-approximation that can only
+    turn ``unreached`` into ``reached``/``unknown``, never invent ``not_reached``). ``holders`` and
+    ``holder_scan`` are the function's `_original_holders` scan, computed once per profile by the
+    caller; the scan's status travels with the cause, so a ``holder_not_found`` over a scan the
+    budget cut reads as what it is.
+
+    ``ended_by`` is added when the scan of tests ended on a kill — a ``timeout`` there means the
+    allowance ran out before a test that reaches the function got its turn, which a reader would
+    otherwise have to infer from the cause alone.
+    """
+    from Wesker.ci import callable_test_id
+
+    ran = scoped if result.tests_run < 0 else scoped[: result.tests_run]
+    reach = baseline_reach(
+        [callable_test_id(t) for t in ran], line_coverage, sorted(truncated)
+    )
+    detail: dict[str, Any] = {
+        "cause": not_entered_cause(reach, [h["kind"] for h in holders]),
+        "reach": reach,
+        "holders": [dict(h) for h in holders],
+        "holder_scan": holder_scan,
+    }
+    if result.killed and result.killed_by:
+        detail["ended_by"] = result.killed_by
+    return detail
 
 
 # ── §6.4 Dispatch Table: Category → AST Transform ────────────────
@@ -5092,6 +5243,304 @@ def _co_filename_matches(co_filename: str | None, source_path: str | None) -> bo
     return bool(rel) and (a == rel or a.endswith("/" + rel))
 
 
+# The holder scan's bounds (#18). It looks for references to the ORIGINAL that installing a mutant
+# never rebinds, in module-level state only — where import-time captures live — and at most two
+# levels below a module global: an object's field (`LENS = Lens(..., vote=fn)`) and a field inside a
+# container (`MEMBERS = {name: Lens(..., read=fn)}`), the shapes measured in the field (Detective
+# #77). A closure built at runtime, instance state, or deeper data is out of reach by design; the
+# scan reports what it found, and `holder_not_found` says it found nothing — never that nothing is.
+_HOLDER_SCAN_DEPTH = 2
+_HOLDER_SCAN_WIDTH = 256  # items read from any one container, class, or object
+_HOLDER_SCAN_BUDGET = 500_000  # values examined over the whole scan
+_HOLDER_REPORT_LIMIT = 8  # holders reported per function
+
+
+def _own_attr(obj: Any, name: str) -> Any:
+    """``obj.__dict__[name]``, or None — read without running any ``__getattr__`` (#18).
+
+    The scan walks every module in the process, and some hand back a proxy for ANY attribute name
+    (the hazard `_safe_code` documents). Reading the instance dictionary directly can only find what
+    was actually stored there — which is exactly where `functools.wraps` puts ``__wrapped__``.
+    """
+    try:
+        namespace = object.__getattribute__(obj, "__dict__")
+    # BLE001: an object whose dictionary cannot be read holds nothing this scan can name
+    except Exception:  # noqa: BLE001
+        return None
+    return namespace.get(name) if isinstance(namespace, dict) else None
+
+
+def _unwrapped_original(original_func: Any) -> Any:
+    """The plain function a mutant stands in for: descriptors peeled, ``__wrapped__`` followed (#18).
+
+    A caller may hand the engine the decorator's WRAPPER (Detective loads a target by module
+    attribute); the references that matter are to the function the mutant replaces. None when no
+    code object is reachable — there is then nothing a holder could hold.
+    """
+    current = _unwrap_descriptor(original_func)
+    for _ in range(16):
+        inner = _own_attr(current, "__wrapped__")
+        if inner is None:
+            break
+        current = _unwrap_descriptor(inner)
+    return current if _safe_code(current) is not None else None
+
+
+def _holder_shape(value: Any, target: Any) -> str:
+    """How calling or reading ``value`` reaches ``target`` (#18).
+
+    ``""`` when it does not. ``"self"`` when it IS the original, or a bound/descriptor form of it.
+    ``"wrapper"`` when it calls the original from inside — a ``__wrapped__`` chain, or a closure over
+    it (a decorator written without `functools.wraps`). ``"captured"`` when it holds the original
+    as bound data: a default argument, a `functools.partial`. Identity only (``is``), never ``==``:
+    a user ``__eq__`` must not run, and must not be able to forge a match.
+    """
+    if value is target:
+        return "self"
+    try:
+        if isinstance(value, (staticmethod, classmethod, types.MethodType)):
+            return "self" if value.__func__ is target else ""
+        if isinstance(value, functools.partial):
+            held = (value.func, *value.args, *value.keywords.values())
+            return "captured" if any(item is target for item in held) else ""
+        if isinstance(value, type) or not callable(value):
+            return ""
+        inner = _own_attr(value, "__wrapped__")
+        for _ in range(16):
+            if inner is None:
+                break
+            if inner is target:
+                return "wrapper"
+            inner = _own_attr(inner, "__wrapped__")
+        if isinstance(value, types.FunctionType):
+            for cell in value.__closure__ or ():
+                try:
+                    if cell.cell_contents is target:
+                        return "wrapper"
+                except ValueError:  # an empty cell
+                    continue
+            defaults = (
+                *(value.__defaults__ or ()),
+                *(value.__kwdefaults__ or {}).values(),
+            )
+            if any(item is target for item in defaults):
+                return "captured"
+    # BLE001: an object that cannot be inspected holds nothing this scan can name
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
+def _holder_children(value: Any) -> list[tuple[str, Any]]:
+    """The ``(label, item)`` pairs one level inside ``value`` the holder scan reads (#18).
+
+    Container elements, a class's own attributes, an object's fields — never a module (modules are
+    scanned on their own) and never a callable's internals (its references are its SHAPE, read by
+    `_holder_shape`). Bounded by `_HOLDER_SCAN_WIDTH` per value, and read without running any code
+    the scanned objects define: containers through their BASE type's iteration (a subclass may
+    override ``items``/``__iter__``), objects through their dictionaries and declared dataclass
+    fields — never a ``__getattr__``, and never an arbitrary iterable (a generator would be spent).
+    """
+    if value is None or isinstance(
+        value, (str, bytes, bytearray, int, float, complex, types.ModuleType)
+    ):
+        return []
+    width = _HOLDER_SCAN_WIDTH
+    try:
+        if isinstance(value, dict):
+            return [
+                (f"[{key!r}]" if type(key) in (str, int) else "[…]", item)
+                for key, item in itertools.islice(dict.items(value), width)
+            ]
+        if isinstance(value, (list, tuple)):
+            base = list if isinstance(value, list) else tuple
+            return [
+                (f"[{i}]", item)
+                for i, item in enumerate(itertools.islice(base.__iter__(value), width))
+            ]
+        if isinstance(value, (set, frozenset)):
+            base_set = set if isinstance(value, set) else frozenset
+            return [
+                ("{…}", item)
+                for item in itertools.islice(base_set.__iter__(value), width)
+            ]
+        if isinstance(value, type):
+            return [
+                (f".{name}", item)
+                for name, item in itertools.islice(vars(value).items(), width)
+                if not name.startswith("__")
+            ]
+        if callable(value):
+            return []
+        try:
+            namespace = object.__getattribute__(value, "__dict__")
+        except AttributeError:
+            namespace = None
+        if isinstance(namespace, dict):
+            return [
+                (f".{name}", item)
+                for name, item in itertools.islice(namespace.items(), width)
+            ]
+        import dataclasses
+
+        if dataclasses.is_dataclass(value):
+            return [
+                (f".{f.name}", object.__getattribute__(value, f.name))
+                for f in dataclasses.fields(value)[:width]
+            ]
+    # BLE001: a value that cannot be walked holds nothing this scan can name
+    except Exception:  # noqa: BLE001
+        return []
+    return []
+
+
+def _install_rebinds(value: Any, source_path: str | None) -> bool:
+    """Whether `_patch_module_qualified` rebinds a module binding of ``value`` under the target's
+    name (#18): exactly its own rule — a code object whose file is the target's source."""
+    code = _safe_code(value)
+    return code is not None and _co_filename_matches(code.co_filename, source_path)
+
+
+def _walk_holders(
+    value: Any,
+    target: Any,
+    where: str,
+    depth: int,
+    found: list[dict[str, str]],
+    budget: list[int],
+    reached: tuple[str, str, str | None],
+) -> None:
+    """One level of the holder scan below a module global (#18).
+
+    Anything inside a container, a class or an object that reaches the original is a CAPTURED copy:
+    the install rebinds module attributes and the owner class's method, never data. The one exception
+    is that owner: ``reached`` is (owner qualname, method name, source path), and the method the
+    owner patch DOES rebind is skipped, exactly as `_patch_module_qualified` would rebind it.
+    """
+    owner, func_name, source_path = reached
+    for label, item in _holder_children(value):
+        budget[0] -= 1
+        if budget[0] <= 0 or len(found) >= _HOLDER_REPORT_LIMIT:
+            return
+        if _holder_shape(item, target):
+            if (
+                isinstance(value, type)
+                and owner
+                and label == f".{func_name}"
+                and getattr(value, "__qualname__", None) == owner
+                and _install_rebinds(_unwrap_descriptor(item), source_path)
+            ):
+                continue
+            found.append({"kind": "captured", "where": where + label})
+        elif depth < _HOLDER_SCAN_DEPTH:
+            _walk_holders(
+                item, target, where + label, depth + 1, found, budget, reached
+            )
+
+
+def _holder_scan_order(home: Any, modules: list[Any], root: str) -> list[Any]:
+    """The order the holder scan reads modules in, most likely holders first (#18).
+
+    The target's own module (registries usually sit beside the function), then the modules whose
+    file is under the project ``root``, then everything else — each group NEWEST first. Grouping by
+    root matters under the budget: a project module that imports a library inserts it, and all its
+    submodules, AFTER itself, so newest-first alone reads a library's internals before the project
+    code that captured the target.
+    """
+    import os
+
+    prefix = os.path.join(os.path.abspath(root), "") if root else ""
+
+    def _in_project(mod: Any) -> bool:
+        path = _own_attr(mod, "__file__")
+        if not prefix or not isinstance(path, str):
+            return False
+        try:
+            return os.path.abspath(path).startswith(prefix)
+        # abspath raises for a non-path, an embedded NUL, or a deleted working directory
+        except (OSError, TypeError, ValueError):
+            return False
+
+    rest = [m for m in reversed(modules) if m is not home and m is not None]
+    ordered = [home] if home is not None else []
+    return (
+        ordered
+        + [m for m in rest if _in_project(m)]
+        + [m for m in rest if not _in_project(m)]
+    )
+
+
+def _original_holders(
+    original_func: Any,
+    func_name: str | None,
+    qualname: str | None,
+    source_path: str | None,
+) -> tuple[list[dict[str, str]], str]:
+    """Module-level references to the ORIGINAL that installing a mutant does not rebind (#18).
+
+    The install rebinds by NAME and by CODE FILE: every module binding of ``func_name`` whose code
+    lives in the target's source (`_patch_module_qualified`), the owner class's method, and each
+    test's own binding. A test that reaches the original anyway reaches it through something else,
+    and this names what, in module-level state:
+
+      alias    -- a module binds the original under ANOTHER name (``from m import fn as alias``).
+      wrapper  -- a callable bound in a module calls it from inside, and is not one the install
+                  rebinds (a decorator's wrapper, whose code lives in the decorator's file).
+      captured -- a container element, an object's or class's field, a default argument or a
+                  partial holds it, within `_HOLDER_SCAN_DEPTH` levels of a module global.
+
+    Each holder carries ``where`` it lives (``pkg.mod.NAME.field``), so a reader can go to it.
+    Modules are read in `_holder_scan_order`. Returns ``(holders, scan)``: ``scan`` is ``complete``
+    when every module was read, ``limit_reached`` when `_HOLDER_REPORT_LIMIT` holders were found
+    first, ``budget_cut`` when `_HOLDER_SCAN_BUDGET` values ran out — said, so that "no holder
+    found" over a cut scan is never read as "no holder". Private self-profile copies are skipped,
+    as the install skips them.
+    """
+    target = _unwrapped_original(original_func)
+    if target is None or not func_name:
+        return [], "complete"
+    import sys
+
+    from Wesker.ci import _PROJECT_ROOT
+    from Wesker.self_profile import PRIVATE_PREFIX
+
+    owner = qualname.rsplit(".", 1)[0] if qualname and "." in qualname else ""
+    reached = (owner, func_name, source_path)
+    found: list[dict[str, str]] = []
+    budget = [_HOLDER_SCAN_BUDGET]
+    home = sys.modules.get(str(getattr(target, "__module__", "") or ""))
+    for mod in _holder_scan_order(
+        home, list(sys.modules.values()), _PROJECT_ROOT.get() or ""
+    ):
+        try:
+            mod_name = object.__getattribute__(mod, "__name__")
+            items = list(object.__getattribute__(mod, "__dict__").items())
+        # BLE001/S112: sys.modules holds arbitrary objects; one that cannot be read holds nothing
+        except Exception:  # noqa: BLE001, S112
+            continue
+        if not isinstance(mod_name, str) or _is_private_copy(mod_name, PRIVATE_PREFIX):
+            continue
+        for name, value in items:
+            budget[0] -= 1
+            if len(found) >= _HOLDER_REPORT_LIMIT:
+                return found, "limit_reached"
+            if budget[0] <= 0:
+                return found, "budget_cut"
+            shape = _holder_shape(value, target)
+            if shape:
+                if name == func_name and _install_rebinds(value, source_path):
+                    continue
+                kind = "alias" if shape == "self" else shape
+                found.append({"kind": kind, "where": f"{mod_name}.{name}"})
+            else:
+                _walk_holders(
+                    value, target, f"{mod_name}.{name}", 1, found, budget, reached
+                )
+    if len(found) >= _HOLDER_REPORT_LIMIT:
+        return found, "limit_reached"
+    return found, ("budget_cut" if budget[0] <= 0 else "complete")
+
+
 def _patch_mutant_into_test(
     _proof: _PatchProof,
     test_fn: Callable[..., None],
@@ -6102,6 +6551,7 @@ def evaluate_mutant(
                     contained=not saw_uncontained,
                     uncontained_test=uncontained_test,
                     entered=(getattr(mutated_obj, "entered", None) if ran else None),
+                    tests_run=ran,
                     elapsed_ms=_elapsed(start),
                 )
             # Strategy: monkey-patch the mutated function into the test's namespace
@@ -6206,6 +6656,7 @@ def evaluate_mutant(
                             entered=(
                                 getattr(mutated_obj, "entered", None) if ran else None
                             ),
+                            tests_run=ran,
                             elapsed_ms=_elapsed(start),
                         )
                     elif first_reason is None:
@@ -6231,6 +6682,7 @@ def evaluate_mutant(
                 contained=not saw_uncontained,
                 uncontained_test=uncontained_test,
                 entered=(getattr(mutated_obj, "entered", None) if ran else None),
+                tests_run=ran,
                 elapsed_ms=_elapsed(start),
             )
         if first_reason is not None:
@@ -6243,6 +6695,7 @@ def evaluate_mutant(
                 contained=not saw_uncontained,
                 uncontained_test=uncontained_test,
                 entered=(getattr(mutated_obj, "entered", None) if ran else None),
+                tests_run=ran,
                 elapsed_ms=_elapsed(start),
             )
         # THE survivor return, and the one #18 exists for: "no test detected this" and "no test
@@ -6258,6 +6711,7 @@ def evaluate_mutant(
             contained=not saw_uncontained,
             uncontained_test=uncontained_test,
             entered=(getattr(mutated_obj, "entered", None) if ran else None),
+            tests_run=ran,
             # Nothing killed it, but a test that might have was refused (#28): not a survivor.
             refusal=refusal,
             refused_test=refused_test,
@@ -7076,6 +7530,8 @@ def run_function_profiling(
     # The open obligations among them that are currently REFUSED (#28): accounted unscored under
     # this disposition, but re-evaluated by the widen like a survivor, since an unknown may kill them.
     _refused_open: dict[str, str] = {}
+    # What holds the original, scanned ONCE per profile and only if some mutant is not entered (#18).
+    _holders: tuple[list[dict[str, str]], str] | None = None
     budget_exhausted = False
     all_contained = True  # #14: cleared if any timed-out worker could not be stopped
     _uncontained_results: list[
@@ -7138,10 +7594,13 @@ def run_function_profiling(
         allowance_ms = _adaptive_allowance(
             baseline_ms, per_mutant_timeout_ms, remaining_ms
         )
+        # The list this mutant is evaluated against, kept: a `not_entered` cause is a claim about
+        # the tests that actually RAN from it (#18), not about whatever `_tests_for` returns later.
+        _scoped = _tests_for(mutant)
         if isolated:
             assert _iso_ctx is not None
             result, _iso_worker, _iso_run = _evaluate_isolated(
-                _iso_worker, mutant, _tests_for(mutant), _iso_ctx, per_mutant_timeout_ms
+                _iso_worker, mutant, _scoped, _iso_ctx, per_mutant_timeout_ms
             )
             if _iso_run is not None:
                 _mem_cut = _mem_cut or _iso_run.memory_cut
@@ -7150,7 +7609,7 @@ def run_function_profiling(
             if not isolated:
                 result = evaluate_mutant(
                     mutant,
-                    _tests_for(mutant),
+                    _scoped,
                     original_func,
                     timeout_ms=allowance_ms,
                     qualname=qualname,
@@ -7219,7 +7678,22 @@ def run_function_profiling(
         if disposition not in SCORED_DISPOSITIONS:
             cr.unscored += 1
             cr.unscored_by[disposition] = cr.unscored_by.get(disposition, 0) + 1
-            unscored_records.append(_unscored_record(result, disposition))
+            _record = _unscored_record(result, disposition)
+            if disposition == "not_entered":
+                # WHY, by name (#18): from the tests that ran and what holds the original.
+                if _holders is None:
+                    _holders = _original_holders(
+                        original_func,
+                        getattr(func_node, "name", None),
+                        qualname,
+                        source_path,
+                    )
+                _record.update(
+                    _not_entered_detail(
+                        result, _scoped, line_cov, _trace_truncated, *_holders
+                    )
+                )
+            unscored_records.append(_record)
             if result.refusal:
                 # Still an OPEN OBLIGATION for the widen (#28): an unknown it traces may kill this
                 # mutant outright, as the full run over A∪B would — stopping the widen because the
@@ -8131,6 +8605,8 @@ def run_function_converged(
     kill_matrix: dict[str, list[str]] = {}
     survivor_records: list[dict] = []
     killed_records: list[dict] = []
+    # The scoped list each not-entered mutant ran against (#18), for its cause at aggregation.
+    _unentered_scope: dict[str, list[Callable[..., None]]] = {}
     # The Mutant OBJECTS of the true survivors (not equivalents), for the target-first widen pass to
     # re-evaluate against unknowns. Keyed by id so the widen can drop one as it moves to killed.
     _survivor_mutants: dict[str, Mutant] = {}
@@ -8182,6 +8658,10 @@ def run_function_converged(
                 record_all_killers=full_matrix,
                 source_path=source_path,
             )
+            if result.entered is False:
+                # Kept for the cause (#18): which tests RAN is a prefix of THIS list, and the widen
+                # rebuilds `_tests_for` before the aggregation below reads the result.
+                _unentered_scope[mutant.mutant_id] = scoped
 
             # Integrated equivalence: check survivors immediately
             if not result.killed:
@@ -8215,6 +8695,7 @@ def run_function_converged(
                         # this reconstruction already had to be taught about for entry.
                         refusal=result.refusal,
                         refused_test=result.refused_test,
+                        tests_run=result.tests_run,
                         elapsed_ms=result.elapsed_ms,
                     )
 
@@ -8481,6 +8962,8 @@ def run_function_converged(
     all_contained = not _baseline_uncontained
     # #28: built from the FINAL `seen`, widen included.
     unscored_records: list[dict] = []
+    # What holds the original, scanned ONCE and only if some mutant is not entered (#18).
+    _holders: tuple[list[dict[str, str]], str] | None = None
     for result in seen.values():
         if not result.contained:
             all_contained = False
@@ -8501,7 +8984,26 @@ def run_function_converged(
         if disposition not in SCORED_DISPOSITIONS:
             cr.unscored += 1
             cr.unscored_by[disposition] = cr.unscored_by.get(disposition, 0) + 1
-            unscored_records.append(_unscored_record(result, disposition))
+            _record = _unscored_record(result, disposition)
+            if disposition == "not_entered":
+                # WHY, by name (#18) — one helper with the profiling path.
+                if _holders is None:
+                    _holders = _original_holders(
+                        original_func,
+                        getattr(func_node, "name", None),
+                        qualname,
+                        source_path,
+                    )
+                _record.update(
+                    _not_entered_detail(
+                        result,
+                        _unentered_scope.get(result.mutant.mutant_id, []),
+                        line_cov,
+                        _trace_truncated,
+                        *_holders,
+                    )
+                )
+            unscored_records.append(_record)
         elif result.killed:
             cr.total += 1
             cr.killed += 1

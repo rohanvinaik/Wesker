@@ -47,6 +47,12 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/engine.py::baseline_reach": {
+    "cut_reasons": [],
+    "function_digest": "617f43ba6edc8de8",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/engine.py::execution_lock_disposition": {
     "cut_reasons": [],
     "function_digest": "30afa2daf0abb2dc",
@@ -68,6 +74,12 @@
   "Wesker/engine.py::nested_acquire_disposition": {
     "cut_reasons": [],
     "function_digest": "f14735507b4d2b3a",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/engine.py::not_entered_cause": {
+    "cut_reasons": [],
+    "function_digest": "b1adc1eb3e795eb9",
     "refusal": "",
     "standing": "complete"
   },

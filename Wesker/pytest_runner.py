@@ -190,6 +190,20 @@ def _cheap_failure_repr(excinfo: Any, *_args: Any, **_kwargs: Any) -> str:
         return str(getattr(excinfo, "typename", "failure"))
 
 
+class _ItemStatus:
+    """pytest's category for the LAST run of one live item (#17) — the wrapper's per-item state.
+
+    One holder per wrapper, bound as a keyword-only default exactly like ``_cap`` (the rebound
+    wrapper may close over nothing), and exposed on the callable as ``__wesker_item_status__`` for
+    ``ci.callable_item_status``. ``value`` is ``unobserved`` until a run has produced reports.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value = "unobserved"
+
+
 def _reports_status(reports: list[Any]) -> str:
     """pytest's terminal category for one run of an item, from the reports it produced (#17).
 
@@ -277,7 +291,7 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
     # for a pass, a skip AND an expected failure alike — that is what keeps a skip from reading as a
     # kill under a mutant — so the distinction the baseline needs travels beside the return, never in
     # it. Reset at the start of every run, so a stopped run reads `unobserved`, not a stale verdict.
-    status_box = ["unobserved"]
+    status = _ItemStatus()
 
     def run(  # type: ignore[no-untyped-def]
         *,
@@ -285,14 +299,14 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
         _cap=capture,
         _rtp=runtestprotocol,
         _reset=_reset_item,
-        _status=status_box,
+        _status=status,
         _classify=_reports_status,
     ) -> None:
         _cap.last.pop(_item.nodeid, None)
-        _status[0] = "unobserved"
+        _status.value = "unobserved"
         _reset(_item)
         reports = _rtp(_item, nextitem=None, log=False)
-        _status[0] = _classify(reports)
+        _status.value = _classify(reports)
         if not any(r.failed for r in reports):
             return
         exc = _cap.last.get(_item.nodeid)
@@ -317,7 +331,7 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
         run = rebound  # ty: ignore[invalid-assignment]
     run.__name__ = name
     run.__qualname__ = str(getattr(item, "nodeid", name))
-    run.__wesker_item_status__ = status_box  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+    run.__wesker_item_status__ = status  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     if mod is not None:
         # inspect.getmodule() fallback in _patch_mutant_into_test keys off __module__.
         run.__module__ = getattr(mod, "__name__", run.__module__)

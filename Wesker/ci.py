@@ -927,10 +927,8 @@ def callable_item_status(call: Any) -> str:
     function, a legacy closure — carries none and reads ``unobserved``, which leaves the engine's own
     run code to decide (``trace_evidence.baseline_outcome``).
     """
-    box = getattr(call, "__wesker_item_status__", None)
-    if isinstance(box, list) and box and isinstance(box[0], str):
-        return box[0]
-    return "unobserved"
+    value = getattr(getattr(call, "__wesker_item_status__", None), "value", None)
+    return value if isinstance(value, str) else "unobserved"
 
 
 def callable_base_name(call: Any) -> str:

@@ -45,6 +45,7 @@ from collections.abc import Callable
 from typing import Any
 
 from Wesker.interrupt import Abandoned
+from Wesker.trace_evidence import item_run_status
 
 __all__ = ["run_in_session", "session_callables"]
 
@@ -189,6 +190,33 @@ def _cheap_failure_repr(excinfo: Any, *_args: Any, **_kwargs: Any) -> str:
         return str(getattr(excinfo, "typename", "failure"))
 
 
+def _reports_status(reports: list[Any]) -> str:
+    """pytest's terminal category for one run of an item, from the reports it produced (#17).
+
+    The accessor half of :func:`Wesker.trace_evidence.item_run_status`, which holds the decision:
+    this only turns each phase's report into the token that decision reads — the report outcome,
+    rewritten to ``xfailed`` / ``xpassed`` when pytest's skipping plugin marked it ``wasxfail``.
+    Never raises: a report shape this does not recognise yields ``unobserved``, which leaves the
+    engine's own channel to decide, exactly as before this existed.
+    """
+    try:
+        phases = {"setup": "", "call": "", "teardown": ""}
+        for rep in reports:
+            when = getattr(rep, "when", "")
+            if when not in phases:
+                continue
+            outcome = str(getattr(rep, "outcome", ""))
+            if hasattr(rep, "wasxfail"):
+                outcome = {"skipped": "xfailed", "passed": "xpassed"}.get(
+                    outcome, outcome
+                )
+            phases[when] = outcome
+        return item_run_status(phases["setup"], phases["call"], phases["teardown"])
+    # BLE001: describing a run must never be what fails it
+    except Exception:  # noqa: BLE001
+        return "unobserved"
+
+
 def _install_cheap_failure_repr(item: Any) -> None:
     """Point this item's two failure-formatting entry points at :func:`_cheap_failure_repr` (EP-C1).
 
@@ -242,13 +270,27 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
 
     # EP-C1: failure reports in this session are read for `failed` and the raw exception only.
     _install_cheap_failure_repr(item)
+    # pytest's category for the LAST run of this item (#17), exposed on the callable as
+    # `__wesker_item_status__` (read through `ci.callable_item_status`). The wrapper returns normally
+    # for a pass, a skip AND an expected failure alike — that is what keeps a skip from reading as a
+    # kill under a mutant — so the distinction the baseline needs travels beside the return, never in
+    # it. Reset at the start of every run, so a stopped run reads `unobserved`, not a stale verdict.
+    status_box = ["unobserved"]
 
     def run(  # type: ignore[no-untyped-def]
-        *, _item=item, _cap=capture, _rtp=runtestprotocol, _reset=_reset_item
+        *,
+        _item=item,
+        _cap=capture,
+        _rtp=runtestprotocol,
+        _reset=_reset_item,
+        _status=status_box,
+        _classify=_reports_status,
     ) -> None:
         _cap.last.pop(_item.nodeid, None)
+        _status[0] = "unobserved"
         _reset(_item)
         reports = _rtp(_item, nextitem=None, log=False)
+        _status[0] = _classify(reports)
         if not any(r.failed for r in reports):
             return
         exc = _cap.last.get(_item.nodeid)
@@ -273,6 +315,7 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
         run = rebound  # ty: ignore[invalid-assignment]
     run.__name__ = name
     run.__qualname__ = str(getattr(item, "nodeid", name))
+    run.__wesker_item_status__ = status_box  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     if mod is not None:
         # inspect.getmodule() fallback in _patch_mutant_into_test keys off __module__.
         run.__module__ = getattr(mod, "__name__", run.__module__)

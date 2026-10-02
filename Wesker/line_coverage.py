@@ -104,16 +104,74 @@ def executable_lines(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[i
     return lines
 
 
+def _child_tracer(dispatch: Callable, window: list[bool]) -> Callable:
+    """``dispatch`` for threads a traced test STARTS, live only while its window is open (#17).
+
+    ``sys.settrace`` is per-thread, so a test that hands the target to a thread it starts (a
+    worker, a server, a pool it creates) used to be traced in its own thread only: the child's
+    lines never reached the map, the test's reach read as EMPTY — an admissible negative — and
+    scoping never ran it against the mutants it kills (measured: 0/5 killed on a function a
+    start-and-join test pins completely). ``threading.settrace`` installs this in every thread
+    started while the window is open, so those lines are OBSERVED, attributed to the test that
+    caused them. Gated on ``window``: once the test's run is over, a child that outlived it stops
+    contributing, at the next event, to a map its caller is already reading.
+    """
+    gates: dict[Any, Callable] = {}
+
+    def _gate(local: Callable) -> Callable:
+        def gated(frame, event, arg):
+            if not window[0]:
+                return None
+            return gated if local(frame, event, arg) is not None else None
+
+        return gated
+
+    def child(frame, event, arg):
+        if not window[0]:
+            return None
+        local = dispatch(frame, event, arg)
+        if local is None:
+            return None
+        gated = gates.get(local)
+        if gated is None:
+            gated = gates[local] = _gate(local)
+        return gated
+
+    return child
+
+
+def _close_window(window: list[bool], child: Callable, previous: Any) -> None:
+    """Stop following a traced test's threads, and hand ``threading``'s hook back (#17).
+
+    Restores only when the hook is still OURS: windows nest (a traced test that runs the engine
+    traces its own tests inside this one), and an inner window closing after an outer one must not
+    reinstall a hook the outer already retired. Idempotent — called from the worker's ``finally``
+    and again by the joiner, which is the only one left to do it when the worker could not be
+    stopped.
+    """
+    window[0] = False
+    if threading.gettrace() is child:
+        threading.settrace(previous)
+
+
 def _traced_in_thread(
     body: Callable[[], None],
     dispatch: Callable,
     budget_s: float | None,
+    reach: list[str] | None = None,
 ) -> tuple[bool, bool]:
     """Run ``body`` under ``dispatch`` in a worker thread, bounded by ``budget_s``.
 
     Returns ``(cut, contained)``. ``contained`` is False when the budget fired and the worker
     could NOT be confirmed stopped — issue #19, the baseline-trace half of the containment
     boundary #14 closed for the mutation runner.
+
+    THREADS THE TEST STARTS ARE TRACED TOO (#17), through :func:`_child_tracer`, for as long as the
+    test runs. What cannot be observed is said, never left as an absence: a thread started during
+    the run that is still alive when it ends may yet run target code no one sees, so ``reach`` (a
+    caller's box) receives ``incomplete_thread`` and the item's missing lines read UNKNOWN, never
+    "not reached". A thread that existed before the run and is handed work (a module-level pool) is
+    beyond what this per-run window can see — the boundary #32's process-wide monitoring revisits.
 
     `abandon` already reports honestly whether the thread is gone; this function used to throw
     that answer away and return a bare `True`, so a worker blocked in a subprocess, socket or C
@@ -136,10 +194,17 @@ def _traced_in_thread(
     never merely left running, which would leak a live thread per cut test.
     """
     done = threading.Event()
+    window = [True]
+    child = _child_tracer(dispatch, window)
+    previous_child_hook = threading.gettrace()
 
     def _worker() -> None:
         previous = sys.gettrace()
+        # Identity, not `ident`: an ident is reused once its thread dies, so a thread started in the
+        # window could wear the ident of one that was alive when it opened.
+        alive_before = set(threading.enumerate())
         sys.settrace(dispatch)
+        threading.settrace(child)
         try:
             body()
         # BLE001/S110: a failing/raising/ABANDONED test still reached lines. `Abandoned` is named
@@ -150,7 +215,13 @@ def _traced_in_thread(
         except (Exception, Abandoned):  # noqa: BLE001, S110
             pass
         finally:
+            _close_window(window, child, previous_child_hook)
             sys.settrace(previous)
+            if reach is not None and any(
+                t not in alive_before and t is not threading.current_thread()
+                for t in threading.enumerate()
+            ):
+                reach.append("incomplete_thread")
             done.set()
 
     thread = threading.Thread(target=_worker, daemon=True)
@@ -159,7 +230,13 @@ def _traced_in_thread(
     # actually LANDED travels with the result instead of being discarded (#19). `bounded_join`
     # stops the worker on EVERY exit from the wait, this thread's own abandonment included: a
     # trace_suite run from inside a test that another baseline is tracing is the nested case.
-    return bounded_join(thread, budget_s if budget_s and budget_s > 0 else None)
+    try:
+        return bounded_join(thread, budget_s if budget_s and budget_s > 0 else None)
+    finally:
+        # The worker's own `finally` closed the window — unless it could not be stopped, in which
+        # case nothing else ever will, and every thread the process starts from here on would be
+        # traced into a measurement that is over.
+        _close_window(window, child, previous_child_hook)
 
 
 def _target_matcher(target_files: set[str]) -> Callable[[str], str | None]:
@@ -208,6 +285,7 @@ def _trace_one(
     target_file: str,
     exec_lines: set[int],
     budget_s: float | None = None,
+    reach: list[str] | None = None,
 ) -> tuple[set[int], bool, bool]:
     """Lines within ``exec_lines`` that ``test_fn()`` executes in ``target_file``, and whether the
     budget CUT this test (the trace's own report — never inferred from a clock by the caller).
@@ -229,6 +307,9 @@ def _trace_one(
 
     BOUNDARY: see :mod:`Wesker.interrupt`. A test blocked outside the interpreter cannot be
     preempted in-process, and is reported as not-cut rather than pretended away.
+
+    ``reach`` is :func:`_traced_in_thread`'s box: it receives ``incomplete_thread`` when a thread
+    the test started outlived its run (#17).
     """
     hits: set[int] = set()
     match = _target_matcher({target_file})
@@ -250,7 +331,7 @@ def _trace_one(
                 return local
         return None
 
-    truncated, contained = _traced_in_thread(test_fn, dispatch, budget_s)
+    truncated, contained = _traced_in_thread(test_fn, dispatch, budget_s, reach)
     return hits & exec_lines, truncated, contained
 
 
@@ -302,6 +383,7 @@ def _trace_one_multi(
     target_files: set[str],
     budget_s: float | None = None,
     capture_arcs: bool = False,
+    reach: list[str] | None = None,
 ) -> tuple[dict[str, set[int]], bool, bool, dict[str, set[tuple[int, int]]]]:
     """Every line ``test_fn()`` executes in ANY of ``target_files``: ``({file: lines}, cut, contained, {file: arcs})``.
 
@@ -324,6 +406,10 @@ def _trace_one_multi(
     callback work on the engine's hottest path; a caller that needs branch obligations opts in and
     pays for a fresh trace (arc runs bypass the line cache), while ordinary profiling is untouched.
     The arc map is empty when ``capture_arcs`` is False.
+
+    Threads the test starts are traced into the same maps while it runs (#17); ``reach`` receives
+    ``incomplete_thread`` when one outlived the run. The maps returned are SNAPSHOTS: such a thread
+    stops contributing at its next event, and the caller must not iterate a map it may still touch.
     """
     hits: dict[str, set[int]] = {}
     arcs: dict[str, set[tuple[int, int]]] = {}
@@ -365,8 +451,13 @@ def _trace_one_multi(
                 return local
         return None
 
-    truncated, contained = _traced_in_thread(test_fn, dispatch, budget_s)
-    return hits, truncated, contained, arcs
+    truncated, contained = _traced_in_thread(test_fn, dispatch, budget_s, reach)
+    return (
+        {f: set(lines) for f, lines in dict(hits).items()},
+        truncated,
+        contained,
+        {f: set(edges) for f, edges in dict(arcs).items()},
+    )
 
 
 def trace_suite(
@@ -381,6 +472,7 @@ def trace_suite(
     arcs_out: dict[str, dict[str, set[tuple[int, int]]]] | None = None,
     replayed: set[str] | None = None,
     within_run: dict[str, dict[str, Any]] | None = None,
+    incomplete_reach: dict[str, str] | None = None,
 ) -> dict[str, dict[str, set[int]]]:
     """Trace the WHOLE suite ONCE: ``{test_id: {file: lines}}``.
 
@@ -449,6 +541,11 @@ def trace_suite(
     ONCE instead of re-tracing it every pass, with no loss of proof admissibility. It must be created
     fresh per session (never a module global), or it degrades to exactly the stale cross-run cache
     the ``fresh`` bypass exists to refuse. Like ``cache``, a CUT trace is never stored in it.
+
+    ``incomplete_reach`` (#17) collects ``{test_id: code}`` for every item whose reach the tracer
+    could not fully observe (``incomplete_thread``: a thread it started outlived its run). Such a
+    trace is stored in neither cache, for the reason a cut one is not: a replayed cell carries no
+    such qualification, so a warm run would read the item's unobserved lines as never reached.
     """
     # Local imports: `ci` and `trace_cache` both import lazily in the other direction, and
     # the identity accessor must be the CONTRACT one — a raw attribute read here is exactly
@@ -518,21 +615,26 @@ def trace_suite(
             # not the loop. Wrapped around the loop it also swallows `progress`, which reports on
             # stderr: the callback fires, writes into the StringIO, and the phase stays silent
             # exactly as if nothing were reporting at all.
+            reach: list[str] = []
             with (
                 contextlib.redirect_stdout(io.StringIO()),
                 contextlib.redirect_stderr(io.StringIO()),
             ):
                 per_file, was_cut, contained, arc_file = _trace_one_multi(
-                    test_fn, target_files, budget_s, capture_arcs=True
+                    test_fn, target_files, budget_s, capture_arcs=True, reach=reach
                 )
             # See `trace_line_coverage`: an unstoppable worker is not an ordinary cut (#19).
             if not contained and uncontained is not None:
                 uncontained.add(name)
-            if fp is not None and not was_cut:
+            if reach and incomplete_reach is not None:
+                incomplete_reach[name] = reach[0]
+            if fp is not None and not was_cut and not reach:
                 # NOT when cut: a truncated trace is under-counted, and downstream that is
                 # indistinguishable from "no test reaches this line". Storing it would make one
-                # slow afternoon a permanent false gap. One cell serves both stores: the disk cache
-                # (cross-run routing evidence) and the within-session memo (this run's later passes).
+                # slow afternoon a permanent false gap. NOT when its reach is incomplete either
+                # (#17): the cell has no field to say so, so a replay would turn "not observed" into
+                # "not reached". One cell serves both stores: the disk cache (cross-run routing
+                # evidence) and the within-session memo (this run's later passes).
                 cell = {
                     f: {
                         "lines": sorted(per_file[f]),
@@ -704,6 +806,7 @@ def trace_line_coverage(
     progress: Callable[[int, int, float], None] | None = None,
     session_budget_s: float | None = None,
     uncontained: set[str] | None = None,
+    incomplete_reach: dict[str, str] | None = None,
 ) -> dict[str, list[int]]:
     """Map each test id to the target lines it covers, over the UNMUTATED function.
 
@@ -723,7 +826,7 @@ def trace_line_coverage(
     bound), and ``progress(done, total, elapsed_ms)`` reports per test in the same shape the
     mutation loop uses — this pass runs BEFORE the first mutant, so without it the engine is
     silent through the part that costs the most. See :func:`trace_suite`, which does both the same
-    way for the suite-global pass.
+    way for the suite-global pass — and collects ``incomplete_reach`` the same way (#17).
     """
     code = getattr(original_func, "__code__", None)
     target_file = getattr(code, "co_filename", None)
@@ -752,15 +855,18 @@ def trace_line_coverage(
         # engine's output. Wraps the TEST, not the loop: around the loop it ALSO swallows
         # `progress` (which reports on stderr), so the callback fires into a StringIO and the
         # phase stays as silent as if nothing were reporting — the bug this progress exists to fix.
+        reach: list[str] = []
         with (
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
         ):
             covered, was_cut, contained = _trace_one(
-                test_fn, target_file, exec_lines, budget_s
+                test_fn, target_file, exec_lines, budget_s, reach
             )
         if was_cut and truncated is not None:
             truncated.add(name)
+        if reach and incomplete_reach is not None:
+            incomplete_reach[name] = reach[0]
         # A cut that could not be STOPPED is a different fact from a cut (#19): the worker is
         # still running, so every later measurement in this process shares it. Reported by name
         # for the same reason `truncated` is — silently folding it in makes a live runaway

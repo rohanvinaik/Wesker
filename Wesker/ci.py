@@ -867,6 +867,10 @@ branch on the shape. The contract every shape satisfies:
     The USER's underlying test function. ``inspect.getsource``/``unwrap`` follow it, and
     content-hashing consumers (trace cache, Detective's verdict cache) depend on it. Read
     it through :func:`callable_source`, never directly.
+``__wesker_item_status__`` (optional, live pytest items only)
+    pytest's terminal category for the callable's LAST run (#17): a skip and an expected
+    failure return normally, so this is the only place they differ from a pass. Read it
+    through :func:`callable_item_status`, never directly.
 Invocation
     Zero-argument call, raising on test failure. Parametrized bindings are already bound.
 
@@ -911,6 +915,22 @@ def callable_source(call: Any) -> Any:
     ``__wrapped__`` read.
     """
     return getattr(call, "__wrapped__", call)
+
+
+def callable_item_status(call: Any) -> str:
+    """pytest's terminal category for the LAST run of a live-item callable, or ``unobserved``.
+
+    Accessor of :data:`DISCOVERED_CALLABLE_CONTRACT` — the STATUS axis (#17). The live-session
+    wrapper returns normally for a pass, a skip and an expected failure alike, so the category rides
+    beside the return on ``__wesker_item_status__`` (``pytest_runner._make_item_callable``). Read it
+    right after the run it describes: the next run overwrites it. Any other callable shape — a plain
+    function, a legacy closure — carries none and reads ``unobserved``, which leaves the engine's own
+    run code to decide (``trace_evidence.baseline_outcome``).
+    """
+    box = getattr(call, "__wesker_item_status__", None)
+    if isinstance(box, list) and box and isinstance(box[0], str):
+        return box[0]
+    return "unobserved"
 
 
 def callable_base_name(call: Any) -> str:

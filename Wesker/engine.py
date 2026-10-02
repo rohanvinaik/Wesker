@@ -58,7 +58,7 @@ from .subsumption import distinct_obligations as _distinct_obligations
 from .subsumption import redundancy_groups
 from .swap_plan import SWAP_PAIR_BUDGET, swap_label, swap_plan
 from .tce import WARRANT_BYTECODE, nodes_equivalent
-from .trace_evidence import TraceEvidence, build_trace_ledger
+from .trace_evidence import TraceEvidence, baseline_outcome, build_trace_ledger
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -470,11 +470,11 @@ class ProfilingResult:
     admissible_line_coverage: dict[str, list[int]] = field(default_factory=dict)
     # The per-TestId outcome-qualified baseline ledger (#17): the typed source the two coverage
     # views above derive from, WITHOUT loss through early unioning. Each entry names the item's
-    # baseline outcome, whether its trace was truncated or the measurement uncontained, and whether
-    # it may therefore discharge a statement obligation. `observed_union` / `admissible_union` are
-    # the named views over it. Arc/branch obligations are a follow-up — the tracer records
-    # statements today, so this ledger is statement-level with the outcome qualification the proof
-    # view was missing.
+    # typed baseline outcome (passed/failed/skipped/xfailed/error), whether its trace was truncated
+    # or the measurement uncontained, whether its reach was fully observed, its branch edges (arcs,
+    # on the session-baseline path), and whether it may therefore discharge a statement or arc
+    # obligation. `observed_union` / `admissible_union` / `admissible_arc_union` are the named views
+    # over it.
     trace_evidence: tuple[TraceEvidence, ...] = ()
     survivor_records: list[dict] = field(default_factory=list)
     killed_records: list[dict] = field(default_factory=list)
@@ -764,8 +764,10 @@ class ProfilingResult:
                     "test_id": ev.test_id,
                     "lines": list(ev.lines),
                     "baseline_passed": ev.baseline_passed,
+                    "baseline_outcome": ev.baseline_outcome,
                     "truncated": ev.truncated,
                     "contained": ev.contained,
+                    "reach": ev.reach,
                     "admissible": ev.admissible,
                     "reason": ev.reason,
                     "provenance": ev.provenance,
@@ -3092,6 +3094,9 @@ class PendingPersist:
     outcomes: tuple[str, ...]
     outcome_fps: dict[str, str]
     ids: frozenset[str]
+    #: Each measured TestId's TYPED baseline outcome (#17), persisted beside `failing`/`inert` so a
+    #: warm build can reuse it without re-admitting a skipped test as green.
+    outcome_status: dict[str, str] = field(default_factory=dict)
 
     def merged(self, other: PendingPersist) -> PendingPersist:
         return PendingPersist(
@@ -3101,6 +3106,7 @@ class PendingPersist:
             self.outcomes + other.outcomes,
             {**self.outcome_fps, **other.outcome_fps},
             self.ids | other.ids,
+            {**self.outcome_status, **other.outcome_status},
         )
 
 
@@ -3140,9 +3146,11 @@ class SessionBaseline:
         "failing",
         "identity_conflicts",
         "identity_standing",
+        "incomplete_reach",
         "inert",
         "inert_ids",
         "n_tests",
+        "outcomes",
         "pending_persist",
         "proof_basis",
         "replayed",
@@ -3162,6 +3170,8 @@ class SessionBaseline:
         uncontained: set[str] | None = None,
         arcs: dict[str, dict[str, set[tuple[int, int]]]] | None = None,
         replayed: set[str] | None = None,
+        outcomes: dict[str, str] | None = None,
+        incomplete_reach: dict[str, str] | None = None,
     ) -> None:
         self.traced = traced
         # Cells a `persist=False` build held back from the trace cache (see `PendingPersist`); None
@@ -3193,6 +3203,17 @@ class SessionBaseline:
         # can go stale under a fixture/config change) while routing still uses it. Empty on a cold
         # cache or the pre-#20 path — nothing replayed means every trace is fresh and admissible.
         self.replayed = replayed or set()
+        # Each test's TYPED baseline outcome (#17, `trace_evidence.baseline_outcome`), for EVERY test
+        # this baseline ran on the original: `inert_ids` says "did not pass", this says how — and a
+        # skipped or expected-failure test, which `inert_ids` cannot see, is not `passed` here. Its
+        # KEYS are therefore the tests this baseline SCREENED, which is what `_build_test_scope`'s
+        # whole-pool fallback admits (#31). None — never an empty dict — when the baseline was built
+        # without recording outcomes (a hand construction): then it cannot name who was screened.
+        self.outcomes: dict[str, str] | None = outcomes
+        # Tests whose reach the tracer could not fully observe, with the code saying why (#17 —
+        # `incomplete_thread`: a thread the test started outlived its traced run). Their missing
+        # lines are UNKNOWN to the proof ledger, never "not reached". Absent = complete.
+        self.incomplete_reach = incomplete_reach or {}
         # The live collection's OWN module-identity standing, conflicting names, and node-ID proof
         # basis (#58), captured ONCE under the session scope by `build_session_baseline`, where the
         # manifest is admissible. Defaulted here so a baseline built by any other path reads as
@@ -3259,6 +3280,21 @@ class SessionBaseline:
             # like the other id-keyed sets. `partial.replayed` is a fresh miss (empty), so this just
             # drops the re-measured names from the replay set, promoting them back to admissible (#20).
             {n for n in self.replayed if n not in affected} | partial.replayed,
+            # Typed outcomes splice by `affected` too (#17): a rewritten test's old outcome drops
+            # with its old trace. If EITHER side recorded none, the splice cannot name the screened
+            # set exactly, so it says so (None) rather than under-report it (#31).
+            (
+                {
+                    **{n: o for n, o in self.outcomes.items() if n not in affected},
+                    **partial.outcomes,
+                }
+                if self.outcomes is not None and partial.outcomes is not None
+                else None
+            ),
+            {
+                **{n: c for n, c in self.incomplete_reach.items() if n not in affected},
+                **partial.incomplete_reach,
+            },
         )
 
 
@@ -3716,7 +3752,7 @@ def build_session_baseline(
     silent hang, not a slow answer. ``None`` = unbounded = the historical behavior.
     """
     from Wesker import trace_cache  # local: trace_cache imports nothing from engine
-    from Wesker.ci import _PROJECT_ROOT, callable_test_id
+    from Wesker.ci import _PROJECT_ROOT, callable_item_status, callable_test_id
 
     # Publish the session root BEFORE anything is keyed. Every id minted from here on —
     # the traced map below, and the kill vocabulary inside `evaluate_mutant` several frames
@@ -3747,6 +3783,9 @@ def build_session_baseline(
     # Branch edges alongside statements (#17), populated from the v4 cache cell on a hit and from a
     # fresh trace on a miss — so a warm session carries arcs without re-tracing for them.
     arcs: dict[str, dict[str, set[tuple[int, int]]]] = {}
+    # Tests whose reach the tracer could not fully observe (#17): a thread they started outlived
+    # their traced run. Their missing lines are unknown, never "not reached".
+    incomplete_reach: dict[str, str] = {}
     traced = _trace_suite(
         test_functions,
         target_files,
@@ -3759,6 +3798,7 @@ def build_session_baseline(
         arcs,
         replayed,
         within_run=within_run,
+        incomplete_reach=incomplete_reach,
     )
     failing: list[str] = []
     inert: set[int] = set()
@@ -3769,6 +3809,15 @@ def build_session_baseline(
         trace_cache.load_outcomes(project_root, targets_fp, budgets, regime_digest)
         if (project_root and persisted_cache)
         else ([], [], [], {})
+    )
+    # The TYPED outcomes the prior runs measured (#17). `failing`/`inert` alone read a skipped or
+    # expected-failure test as passed, so an outcome is reused only when its type was persisted too.
+    prior_status = (
+        trace_cache.load_outcome_status(
+            project_root, targets_fp, budgets, regime_digest
+        )
+        if (project_root and persisted_cache)
+        else {}
     )
     entries_out = dict(persisted_cache or {})
     entries_out.update(cache or {})
@@ -3792,6 +3841,7 @@ def build_session_baseline(
             regime_digest,
             prior_outcomes,
             prior_outcome_fps,
+            prior_status,
         )
 
     prior_failing_set = set(prior_failing)
@@ -3801,23 +3851,34 @@ def build_session_baseline(
     current_inert: list[str] = []
     current_outcomes: set[str] = set()
     current_outcome_fps: dict[str, str] = {}
+    # Every test this build ran (or exactly re-used) on the original, TYPED (#17). Its keys are the
+    # tests this baseline SCREENED — the only ones `_tests_for`'s fallback may run (#31).
+    current_status: dict[str, str] = {}
     for test_fn in test_functions:
         test_id = callable_test_id(test_fn)
         test_fp = trace_cache.test_fingerprint(test_fn)
         # A proof-facing fresh partial re-observes outcome as well as reach. A normal warm build may
-        # reuse an exact per-TestId outcome; absence means unmeasured, not green.
+        # reuse an exact per-TestId outcome; absence means unmeasured, not green — and so does an
+        # outcome persisted without its type (#17), which would otherwise read a skip as a pass.
         if (
             not fresh
             and test_id in prior_outcome_set
             and prior_outcome_fps.get(test_id) == test_fp
+            and test_id in prior_status
         ):
             outcome = (
                 "assertion"
                 if test_id in prior_failing_set
                 else ("inert" if test_id in prior_inert_set else None)
             )
+            typed = prior_status[test_id]
         else:
             outcome = _run_test_with_timeout(test_fn, None, True, timeout_ms)
+            # Read the live item's own category right after the run it describes (#17): the runner
+            # returns normally for a skip and an expected failure, so `outcome` alone reads both
+            # as a pass.
+            typed = baseline_outcome(outcome, callable_item_status(test_fn))
+        current_status[test_id] = typed
         current_outcomes.add(test_id)
         current_outcome_fps[test_id] = test_fp
         if outcome is not None:
@@ -3839,6 +3900,7 @@ def build_session_baseline(
             tuple(sorted(current_outcomes)),
             dict(current_outcome_fps),
             frozenset(current_ids),
+            dict(current_status),
         )
     elif project_root and cache is not None:
         # Persist the individually COMPLETE cells even when a sibling was cut. `trace_suite` never
@@ -3873,6 +3935,12 @@ def build_session_baseline(
         if carry is not None:
             outcome_fps_out.update(carry.outcome_fps)
         outcome_fps_out.update(current_outcome_fps)
+        status_out = {
+            tid: st for tid, st in prior_status.items() if tid not in replaced_ids
+        }
+        if carry is not None:
+            status_out.update(carry.outcome_status)
+        status_out.update(current_status)
         trace_cache.save(
             project_root,
             targets_fp,
@@ -3883,6 +3951,7 @@ def build_session_baseline(
             regime_digest,
             outcomes_out,
             outcome_fps_out,
+            status_out,
         )
     # Capture the live collection's OWN identity + node-ID proof basis HERE (#58), inside the
     # session scope where the manifest is admissible — the per-mutant collect-only discoveries run
@@ -3899,6 +3968,8 @@ def build_session_baseline(
         uncontained,
         arcs,
         replayed,
+        current_status,
+        incomplete_reach,
     )
     _sb.identity_standing = _standing
     _sb.identity_conflicts = _conflicts
@@ -3944,6 +4015,7 @@ def _baseline_failures(
     original_func: Callable[..., Any] | None,
     qualname: str | None,
     timeout_ms: float = 5000,
+    outcomes: dict[str, str] | None = None,
 ) -> tuple[set[int], set[str]]:
     """``id()`` of every test that FAILS against the UNMUTATED function, under
     ``evaluate_mutant``'s own call convention, AND the NAMED reasons the baseline was compromised.
@@ -3981,6 +4053,12 @@ def _baseline_failures(
     was credited with 123 crash "kills" while calling ``analyze`` exactly ZERO times —
     it is a bound method needing ``(tmp_path, monkeypatch)`` fixtures, so it raised
     TypeError before reaching the function under test, identically on the original.
+
+    ``outcomes`` (optional) receives each probed test's TYPED baseline outcome by test id (#17,
+    ``trace_evidence.baseline_outcome``) — the same probe, read finer: "did not pass" is the
+    attribution question, while the proof ledger needs to know a skip from a failure. A test that
+    could not be probed at all is ``error``. Untouched when the probe does not run (no genuine
+    original): no test was screened, and none is recorded as if it were.
     """
     if original_func is None or not qualname:
         return set(), set()
@@ -3994,6 +4072,8 @@ def _baseline_failures(
     probe = _unwrap_descriptor(original_func)
     if getattr(probe, "__name__", None) != func_name:
         return set(), set()
+    from Wesker.ci import callable_item_status, callable_test_id
+
     inert: set[int] = set()
     compromised: set[str] = set()
     for test_fn in test_functions:
@@ -4014,9 +4094,14 @@ def _baseline_failures(
                     _proof, test_fn, qualname, original_func
                 )
                 try:
-                    disposition = baseline_probe_disposition(
-                        _run_test_with_timeout(test_fn, probe, patched, timeout_ms)
+                    run_code = _run_test_with_timeout(
+                        test_fn, probe, patched, timeout_ms
                     )
+                    if outcomes is not None:
+                        outcomes[callable_test_id(test_fn)] = baseline_outcome(
+                            run_code, callable_item_status(test_fn)
+                        )
+                    disposition = baseline_probe_disposition(run_code)
                     # An uncontained probe is BOTH: inert, because a test that never finished
                     # cannot be credited with distinguishing anything; and a containment failure,
                     # because the worker is still live. Recording only the first is the bug — it
@@ -4028,6 +4113,8 @@ def _baseline_failures(
                 # BLE001: an unrunnable baseline is itself inert
                 except Exception:  # noqa: BLE001
                     inert.add(id(test_fn))
+                    if outcomes is not None:
+                        outcomes[callable_test_id(test_fn)] = "error"
                 finally:
                     _unpatch_mutant(_proof, patched, saved, patch_target, func_name)
         except ExecutionLockUnavailable:
@@ -4040,6 +4127,8 @@ def _baseline_failures(
             # not share a signifier.
             inert.add(id(test_fn))
             compromised.add("execution_lock_unavailable")
+            if outcomes is not None:
+                outcomes[callable_test_id(test_fn)] = "error"
     return inert, compromised
 
 
@@ -4056,6 +4145,8 @@ def _build_test_scope(
     trace_session_budget_s: float | None = None,
     uncontained: set[str] | None = None,
     arcs_out: dict[str, list[tuple[int, int]]] | None = None,
+    outcomes_out: dict[str, str] | None = None,
+    reach_out: dict[str, str] | None = None,
 ) -> tuple[
     Callable[[Mutant], list[Callable[..., None]]],
     dict[str, list[int]],
@@ -4080,6 +4171,11 @@ def _build_test_scope(
          * an empty covering set is only meaningful for a line the coverage data COULD
            have described. A line outside the traced denominator means "no data", not
            "no test", and must fall back to the full set.
+         * the trace follows the threads a test starts while it runs (#17). What a thread
+           that outlives the test executes afterwards is not observed — but it also cannot
+           change that test's verdict, which was fixed when the test returned, so for
+           KILLS the observed window is the whole story; that incompleteness qualifies only
+           the proof ledger's absences (``TraceEvidence.reach``).
 
     Filter 1 is what makes filter 2 sound without a compensation hack. A fails-on-
     baseline test used to be force-joined to EVERY scoped set, so that scoped matched
@@ -4094,6 +4190,10 @@ def _build_test_scope(
     Returns ``(_tests_for, line_cov, exec_lines, failing)`` so callers can also report
     the line-coverage axis. Lives here, used by both ``run_function_profiling`` and
     ``run_function_converged``, so the two can never drift apart on soundness.
+
+    ``outcomes_out`` receives each screened test's TYPED baseline outcome and ``reach_out`` the
+    tests whose reach was incompletely observed (#17), from whichever of the three sources
+    decided this scope — so the ledger a caller builds reads the same baseline the scope did.
     """
     exec_lines = sorted(_executable_lines(func_node))
     # Resolving the holder is what BUILDS the baseline (see `LazySessionBaseline`). Reaching
@@ -4101,12 +4201,17 @@ def _build_test_scope(
     # is exactly the demand the laziness waits for.
     session = session_baseline()
     inert: set[int] = set()
+    # Typed outcomes of the screened tests, and the tests whose reach was not fully observed (#17).
+    _typed: dict[str, str] = {}
+    _reach: dict[str, str] = {}
     if precomputed_line_data is not None:
         # An adaptive-probe caller already ran this baseline over the same tests+function;
         # reuse it so a probe + follow-up run don't trace twice. Deterministic, so the
         # reused map is identical to what a fresh trace would produce here.
         line_cov, failing = precomputed_line_data
-        inert, _unc = _baseline_failures(test_functions, original_func, qualname)
+        inert, _unc = _baseline_failures(
+            test_functions, original_func, qualname, outcomes=_typed
+        )
         if _unc and uncontained is not None:
             # Union the NAMES it reported rather than re-asserting one. The probe used to hand
             # back a bool and this site turned it into a single literal, so a second way to be
@@ -4133,6 +4238,8 @@ def _build_test_scope(
             )
         failing = session.failing
         inert = session.inert
+        _typed = dict(session.outcomes or {})
+        _reach = dict(session.incomplete_reach)
         if truncated is not None:
             truncated |= (
                 session.truncated
@@ -4152,9 +4259,12 @@ def _build_test_scope(
             truncated,
             trace_progress,
             trace_session_budget_s,
+            incomplete_reach=_reach,
         )
         failing = _failing_on_baseline(test_functions, original_func)
-        inert, _unc = _baseline_failures(test_functions, original_func, qualname)
+        inert, _unc = _baseline_failures(
+            test_functions, original_func, qualname, outcomes=_typed
+        )
         if _unc and uncontained is not None:
             # Union the NAMES it reported rather than re-asserting one. The probe used to hand
             # back a bool and this site turned it into a single literal, so a second way to be
@@ -4164,6 +4274,10 @@ def _build_test_scope(
             uncontained.update(_unc)
     else:
         line_cov, failing = {}, []
+    if outcomes_out is not None:
+        outcomes_out.update(_typed)
+    if reach_out is not None:
+        reach_out.update(_reach)
 
     # Filter 1 — bar tests that cannot distinguish anything from the kill loop.
     usable = (
@@ -6517,6 +6631,10 @@ def run_function_profiling(
     _trace_truncated: set[str] = set()
     _baseline_uncontained: set[str] = set()
     _arc_cov: dict[str, list[tuple[int, int]]] = {}
+    # Typed baseline outcomes and incompletely-observed reach (#17), as the scope's baseline saw them
+    # — read for the ledger only when no session baseline exists (the session's own are read below).
+    _scope_outcomes: dict[str, str] = {}
+    _scope_reach: dict[str, str] = {}
     _tests_for, line_cov, exec_lines, failing = _build_test_scope(
         func_node,
         test_functions,
@@ -6530,6 +6648,8 @@ def run_function_profiling(
         trace_session_budget_s,
         _baseline_uncontained,
         _arc_cov,
+        outcomes_out=_scope_outcomes,
+        reach_out=_scope_reach,
     )
     # Before the mutation loop: re-observe this function's covering tests fresh, so a warm run's
     # replayed reach is promoted back to admissible and the certificate rests on this session (#20).
@@ -6961,6 +7081,12 @@ def run_function_profiling(
     # they are meant to. Without a live session the per-function pass computed `failing` and
     # `_trace_truncated` directly and those are the whole story.
     _sb = session_baseline()
+    # The TYPED outcomes (#17): `inert_ids`/`failing` cannot see a skipped or expected-failure test —
+    # both return normally — so every test whose typed outcome is not `passed` is barred too, in
+    # BOTH views below. Without it, an xfail test's reach closed a line in `admissible_line_coverage`.
+    _typed = dict(_sb.outcomes or {}) if _sb is not None else _scope_outcomes
+    _reach = dict(_sb.incomplete_reach) if _sb is not None else _scope_reach
+    _not_green = {tid for tid, outcome in _typed.items() if outcome != "passed"}
     # `uncontained` belongs here too (#D4 repair 4, §4.6): an unstoppable worker's trace may still be
     # running and mutating state, so its coverage cannot discharge a line obligation — the same
     # exclusion `admissible_line_coverage` already applies. It is TEST IDS (`trace_suite` adds
@@ -6969,9 +7095,9 @@ def run_function_profiling(
     # the coverage view honest BEFORE the refuse. The per-function fallback has no per-test containment
     # set, so it stays as it was.
     _barred = sorted(
-        (_sb.inert_ids | _sb.truncated | _sb.replayed | _sb.uncontained)
+        (_sb.inert_ids | _not_green | _sb.truncated | _sb.replayed | _sb.uncontained)
         if _sb is not None
-        else (set(failing) | set(_trace_truncated))
+        else (set(failing) | _not_green | set(_trace_truncated))
     )
     # `all_contained` tracks the MUTATION loop. A worker the BASELINE trace could not stop is
     # the same condition one phase earlier, and it was invisible here (#19): the run reported
@@ -7056,7 +7182,7 @@ def run_function_profiling(
     # is built from, so the typed view and the derived `admissible_line_coverage` cannot disagree.
     # Containment is measurement-wide (absorbing), so it is stamped on every item. (The converged
     # entry point emits no per-TestId line data, so it carries no ledger — nothing is lost there.)
-    _failed_ids = _sb.inert_ids if _sb is not None else set(failing)
+    _failed_ids = (_sb.inert_ids if _sb is not None else set(failing)) | _not_green
     _truncated_ids = _sb.truncated if _sb is not None else set(_trace_truncated)
     # Reach REPLAYED from the cache (#20): kept out of the admissible proof basis — a source-keyed
     # cache hit is routing, not a trace observed this session. Empty without a live session.
@@ -7068,6 +7194,8 @@ def run_function_profiling(
         _contained,
         arc_coverage=_arc_cov,
         replayed_ids=_replayed_ids,
+        outcomes=_typed,
+        incomplete_reach=_reach,
     )
 
     # The candidate-operator policy census (#22), a first-class field on every profile so what the

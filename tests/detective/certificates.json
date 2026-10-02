@@ -89,5 +89,23 @@
     "function_digest": "d15b60f8af8cfb83",
     "refusal": "",
     "standing": "complete"
+  },
+  "Wesker/trace_evidence.py::baseline_outcome": {
+    "cut_reasons": [],
+    "function_digest": "28d9a5d957d25eac",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/trace_evidence.py::item_run_status": {
+    "cut_reasons": [],
+    "function_digest": "5b0ab08439caff28",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/trace_evidence.py::trace_admissibility": {
+    "cut_reasons": [],
+    "function_digest": "5a0e2f360f570d34",
+    "refusal": "",
+    "standing": "complete"
   }
 }

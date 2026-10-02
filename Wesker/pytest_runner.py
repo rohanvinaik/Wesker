@@ -223,9 +223,11 @@ def _install_cheap_failure_repr(item: Any) -> None:
     pytest routes a call-phase failure through ``item.repr_failure(excinfo)`` and a setup/teardown
     failure through ``item._repr_failure_py(excinfo, style=...)`` (``_pytest.reports.
     _format_failed_longrepr``, pytest 9.1.1). Instance attributes shadow the methods for THIS item
-    only, and the items are this module's own measurement session, whose loop the driver replaces —
-    pytest never renders their reports. Best-effort: an item that refuses the assignment keeps
-    pytest's formatting, which is slower and never wrong.
+    only. Two measurement sessions install it, and neither reads a report's text: this module's own,
+    whose loop the driver replaces, so pytest never renders its reports; and the isolated worker's
+    (``_isolated_worker._CheapFailureRepr``, W#34), whose verdict is the exit code and whose terminal
+    output goes to a sink — a plain-string longrepr renders there as itself. Best-effort: an item
+    that refuses the assignment keeps pytest's formatting, which is slower and never wrong.
     """
     with contextlib.suppress(Exception):
         item.repr_failure = _cheap_failure_repr

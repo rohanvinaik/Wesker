@@ -35,6 +35,7 @@ from typing import Any
 import pytest
 
 from Wesker.isolation import aggregate_kill_reason, classify_kill_reason
+from Wesker.pytest_runner import _install_cheap_failure_repr
 
 
 def _build_mutant(target_file: str, func_name: str, mutant_source: str) -> Any | None:
@@ -206,6 +207,24 @@ class _MutantPlugin:
             item.session.shouldfail = "mutation distinguished by a value assertion"
 
 
+class _CheapFailureRepr:
+    """Give every item this worker collects the measurement session's cheap failure repr (W#34).
+
+    EP-C1 (Detective docs/ENGINEERING_PASS_2026-09-26.md): every killed mutant is a failing test to
+    pytest, and building its report formatted a source-annotated traceback — re-parsing source with
+    ``ast`` per traceback entry — for text nothing reads. ``49f7e91`` stopped it for the in-process
+    session; this process runs its OWN ``pytest.main`` per mutant (and per determinism baseline), so
+    it kept paying, once per killed mutant. Nothing here reads a report's text either: the verdict is
+    pytest's exit code, the kill reason comes from :class:`_MutantPlugin`'s raw ``excinfo``, and the
+    terminal output goes to a sink. The SAME installer as the in-process session
+    (``pytest_runner._install_cheap_failure_repr``), so the two cannot drift.
+    """
+
+    def pytest_collection_modifyitems(self, items: list[Any]) -> None:
+        for item in items:
+            _install_cheap_failure_repr(item)
+
+
 def _resolve_target(root: str, target_file: str) -> str:
     return (
         target_file if os.path.isabs(target_file) else os.path.join(root, target_file)
@@ -231,7 +250,7 @@ def _evaluate_full(
     ):
         rc = pytest.main(
             [*node_ids, "-p", "no:cacheprovider", "-q", "--no-header", "--capture=sys"],
-            plugins=[plugin],
+            plugins=[plugin, _CheapFailureRepr()],
         )
     return {
         "rc": int(rc),
@@ -316,7 +335,9 @@ def _trace_baseline_run(target_abspath: str, node_ids: list[str]) -> dict[str, A
                     "-q",
                     "--no-header",
                     "--capture=sys",
-                ]
+                ],
+                # The outcome is read off the exit code alone (W#34): no report text is needed here.
+                plugins=[_CheapFailureRepr()],
             )
         finally:
             sys.settrace(None)

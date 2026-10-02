@@ -166,6 +166,27 @@ def test_the_ledger_types_each_row_and_keeps_the_skipped_reach_as_observed_only(
     )  # no typed outcome: the old meaning stands
 
 
+def test_the_report_reader_never_fails_the_run_it_describes():
+    """`pytest_runner._reports_status` reads report OBJECTS, so it cannot be pinned — it is held by
+    this: no reports, a shape it does not know, and a hostile attribute all read `unobserved` (the
+    engine's own channel then decides), while a well-formed xfail report is read as pytest reads it."""
+    from types import SimpleNamespace
+
+    from Wesker.pytest_runner import _reports_status
+
+    class Hostile:
+        @property
+        def when(self):
+            raise RuntimeError("a report that will not describe itself")
+
+    assert _reports_status([]) == "unobserved"
+    assert _reports_status([object()]) == "unobserved"
+    assert _reports_status([Hostile()]) == "unobserved"
+    xfail_call = SimpleNamespace(when="call", outcome="skipped", wasxfail="known")
+    setup = SimpleNamespace(when="setup", outcome="passed")
+    assert _reports_status([setup, xfail_call]) == "xfailed"
+
+
 # ── end-to-end through a live pytest session (Wesker only) ────────────────────────────
 
 _TARGET = "def pick(flag):\n    if flag:\n        return 1\n    return 0\n"

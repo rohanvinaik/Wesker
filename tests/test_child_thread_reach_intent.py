@@ -89,6 +89,50 @@ def test_a_thread_that_outlives_the_run_makes_the_reach_unknown_and_is_not_cache
     assert traced[test_id].get(path, set()) == set()
 
 
+def test_an_unstoppable_worker_still_hands_threadings_hook_back(tmp_path, monkeypatch):
+    """The adversarial case: the traced worker cannot be stopped, so its own `finally` does not run
+    when the joiner gives up. The JOINER must close the window — else every thread the process
+    starts from then on is traced into a measurement that is over — and the runaway's late
+    `finally` must not reinstall anything."""
+    from Wesker import interrupt as INTERRUPT
+    from Wesker import line_coverage as LC
+
+    mod, path = _module(tmp_path, "thr_unstoppable_unit")
+    monkeypatch.setattr(INTERRUPT, "abandon", lambda _thread: False)
+    done = threading.Event()
+
+    def runaway():
+        threading.Event().wait(
+            0.5
+        )  # outlives the 0.1 s budget; the patch injects nothing
+        late = threading.Thread(target=lambda: mod.double(9))
+        late.start()
+        late.join()
+        done.set()
+
+    hits: set[int] = set()
+
+    def local(frame, event, _arg):
+        if event == "line":
+            hits.add(frame.f_lineno)
+        return local
+
+    def dispatch(frame, event, _arg):
+        if event == "call" and os.path.realpath(frame.f_code.co_filename) == path:
+            return local
+        return None
+
+    hook_before = threading.gettrace()
+    cut, contained = LC._traced_in_thread(runaway, dispatch, 0.1, [])
+    assert cut is True and contained is False
+    assert threading.gettrace() is hook_before, "the joiner left the window open"
+    assert done.wait(5)
+    assert threading.gettrace() is hook_before, (
+        "the runaway's late finally clobbered it"
+    )
+    assert hits == set(), "a thread started after the window closed was traced into it"
+
+
 # ── end-to-end through a live pytest session (Wesker only) ────────────────────────────
 
 _THREAD_TESTS = """import threading

@@ -22,11 +22,23 @@ THE BOUNDARY, stated honestly and NOT fixable in-process: a thread blocked OUTSI
 until that call returns on its own. `abandon` returns False there rather than claiming a stop it
 did not make. Bounding that for real needs process isolation, which is a different engine than an
 in-process one.
+
+THE START/JOIN EDGE (#28). One blocking call that boundary covers is ENTIRELY the pair's own: the
+execution lock. A test that runs the engine, measured inside a held evaluation, parks its worker in
+the lock's C-level acquire while the lock's owner — the very thread that started the worker and is
+joining it — waits for the worker. A wait-for cycle; the injection cannot land; the worker dies
+owning the lock when the holder finally releases. Unlike a socket, this wait is KNOWABLE before it
+begins: every worker the pair bounds is a :class:`JoinedWorker`, which records the thread that
+started it, so a worker can ask whether the lock's owner is upstream of it and refuse instead of
+waiting (:class:`MeasurementRefused`). A thread the code UNDER TEST starts records nothing, so a
+cycle routed through one stays outside what can be seen here — it is still detected and refused by
+the lock's orphan channels, never prevented.
 """
 
 from __future__ import annotations
 
 import ctypes
+import threading
 from typing import Any
 
 
@@ -38,6 +50,87 @@ class Abandoned(BaseException):
     SWALLOW the injection and keep running, leaving the leak in place exactly where the code looks
     safest. The interrupt has to outrank the interrupted code's own error handling to be one.
     """
+
+
+class MeasurementRefused(BaseException):
+    """Raised INSTEAD of a blocking wait that could only complete a wait-for cycle (#28).
+
+    ``code`` names why (``"nested_measurement"``: the execution lock is held by a thread upstream of
+    this one on the start/join edge, so waiting for it waits for itself); ``owner_tid`` is the owner
+    it would have waited on.
+
+    A ``BaseException``, like :class:`Abandoned`: the engine nested inside a test is ordinary code
+    full of ``except Exception`` handlers (and one ``except ExecutionLockUnavailable``), and any of
+    them catching the refusal would let it carry on into the next acquire — or worse, into a result.
+    Outranking them unwinds the nested engine at once. That is NOT what makes the outcome survive,
+    though: pytest's call wrapper and the measurement's own worker both catch ``BaseException``, so
+    the status travels on :attr:`JoinedWorker.refusal`, written BEFORE this is raised
+    (:func:`mark_refusal`). Swallowing the exception cannot unwrite the record.
+    """
+
+    def __init__(self, code: str, owner_tid: int) -> None:
+        super().__init__(f"{code} (owner_tid={owner_tid})")
+        self.code = code
+        self.owner_tid = owner_tid
+
+
+class JoinedWorker(threading.Thread):
+    """A worker its starter waits on under a bounded join — the start/join edge, recorded (#28).
+
+    ``starter`` is the thread that constructed it, which in every site that uses this class is the
+    thread that starts it and then waits in :func:`bounded_join` for it. ``refusal`` is the side
+    channel :func:`mark_refusal` writes: empty until something this worker ran was refused, then the
+    refusal's code. The starter reads it after the join, where neither pytest's exception capture nor
+    the worker's own ``except BaseException`` can have erased it.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.starter = threading.current_thread()
+        self.refusal = ""
+
+
+def starter_chain() -> tuple[int, ...]:
+    """Idents of the live threads waiting, through bounded joins, on the CURRENT thread — nearest first.
+
+    Empty for any thread that is not a :class:`JoinedWorker` (the main thread, a thread the code
+    under test started), which is the common case and costs one ``isinstance``. The walk stops at the
+    first starter that is no longer alive: a dead thread waits on nothing, and its ident may already
+    belong to an unrelated thread, so naming it would forge an edge. Bounded by a seen-set as well,
+    because a chain is only acyclic by construction and this must terminate even if constructed wrong.
+    """
+    chain: list[int] = []
+    seen: set[int] = set()
+    current = threading.current_thread()
+    while isinstance(current, JoinedWorker) and id(current) not in seen:
+        seen.add(id(current))
+        starter = current.starter
+        if starter.ident is None or not starter.is_alive():
+            break
+        chain.append(starter.ident)
+        current = starter
+    return tuple(chain)
+
+
+def mark_refusal(code: str, owner_tid: int) -> None:
+    """Record ``code`` on every :class:`JoinedWorker` from the current thread up to — not including —
+    the thread ``owner_tid`` names (#28).
+
+    Every level below the owner learns it, because each is a measurement whose result now contains a
+    refused nested measurement; the owner's own measurement is the one the refusal protects, and a
+    worker ABOVE it was never part of the cycle. The first code recorded on a worker is kept.
+    """
+    seen: set[int] = set()
+    current = threading.current_thread()
+    while (
+        isinstance(current, JoinedWorker)
+        and current.ident != owner_tid
+        and id(current) not in seen
+    ):
+        seen.add(id(current))
+        if not current.refusal:
+            current.refusal = code
+        current = current.starter
 
 
 # How long to let an injected thread unwind before conceding it is blocked outside the interpreter.

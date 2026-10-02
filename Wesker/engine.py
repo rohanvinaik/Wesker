@@ -28,7 +28,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, TypeGuard
 
-from .interrupt import bounded_join
+from .interrupt import (
+    JoinedWorker,
+    MeasurementRefused,
+    bounded_join,
+    mark_refusal,
+    starter_chain,
+)
 from .isolation import (
     IsolatedMutantWorker,
     IsolatedRun,
@@ -229,6 +235,16 @@ class MutantResult:
     # `candidate-equivalent — UNPROVEN` to `equivalent` by assertion, which is precisely the
     # move this tool refuses everywhere else.
     equivalence_warrant: str = ""
+    # --- a refused nested measurement (#28) ---------------------------------------------------
+    # Non-empty when a test this verdict needed could not be measured HERE: the test runs the
+    # engine, and inside this held evaluation its nested measurement was refused before it could
+    # wait for the lock this evaluation holds (`_refuse_nested_measurement`). The value is the
+    # refusal's code ("nested_measurement"), `refused_test` the first such test in the kill
+    # vocabulary. Set only on a result that is NOT a kill — a kill another test earned stands on
+    # its own — so a refused mutant is neither killed nor survived, and `mutant_disposition` keeps
+    # it out of the denominator under the refusal's own name.
+    refusal: str = ""
+    refused_test: str | None = None
 
 
 # Dispositions that belong in the mutation-score denominator. A mutant only measures the SUITE
@@ -242,6 +258,7 @@ def mutant_disposition(
     entered: bool | None,
     contained: bool,
     killed: bool,
+    refusal: str = "",
 ) -> str:
     """What a mutant's outcome is EVIDENCE OF (issue #18).
 
@@ -259,6 +276,11 @@ def mutant_disposition(
     * ``not_installed``  — built, but no call site was rebound to it. A survivor here is a
       patch blind spot, not a specification gap; `_patch_module_qualified` skips any object
       without ``__code__``, so an `lru_cache`/`partial`-wrapped target lands here.
+    * ``refusal`` itself, when one is set and nothing killed the mutant — today only
+      ``nested_measurement`` (#28): a test the verdict needed runs the engine, and inside this
+      held evaluation its nested measurement was refused rather than left to wait for itself. The
+      test was never observed to pass or fail, so the mutant is neither killed nor survived.
+      Ahead of ``not_entered`` because the refused test may have been the one to enter it.
     * ``not_entered``    — installed, but the test never called it. The classic decorator and
       registry capture: the namespace holds the mutant while the caller holds the original.
     * ``cut``            — ran, but the measurement is truncated or uncontained, so its outcome
@@ -274,6 +296,8 @@ def mutant_disposition(
         return "harness_error"
     if not installed:
         return "not_installed"
+    if refusal and not killed:
+        return refusal
     if entered is False:
         return "not_entered"
     if not contained:
@@ -478,6 +502,12 @@ class ProfilingResult:
     trace_evidence: tuple[TraceEvidence, ...] = ()
     survivor_records: list[dict] = field(default_factory=list)
     killed_records: list[dict] = field(default_factory=list)
+    # One record per mutant kept OUT of the denominator (#28): its identity, the disposition that
+    # kept it out, and — where one is known — what to act on (`test`: the test whose nested
+    # measurement was refused). `unscored_by` COUNTS these; a count cannot say which test to move
+    # to the isolated worker, and a reader handed only the count has nothing to act on. A list of
+    # plain dicts like the two record lists above, so a cached result round-trips unchanged.
+    unscored_records: list[dict] = field(default_factory=list)
     budget_exhausted: bool = False
     elapsed_ms: float = 0.0
     total_equivalent: int = 0
@@ -747,6 +777,10 @@ class ProfilingResult:
             d["value_survivor_records"] = self.value_survivor_records
         if self.killed_records:
             d["killed_records"] = self.killed_records
+        # Which mutants `unscored_by` counts, and why each (#28): emitted when non-empty, like the
+        # other record views, so a reader can act on a named mutant rather than a tally.
+        if self.unscored_records:
+            d["unscored_records"] = self.unscored_records
         if self.line_coverage:
             d["line_coverage"] = self.line_coverage
         # The proof view alongside the observed one (#17), never instead of it. A consumer
@@ -814,6 +848,30 @@ def _containment_lost(
             }
         )
     return tuple(lost)
+
+
+def _unscored_record(result: MutantResult, disposition: str) -> dict:
+    """One mutant kept out of the denominator, named (#28): its identity, the disposition that
+    kept it out, and — where one is known — the test to act on.
+
+    Both profiling paths build the record here, for the reason `_containment_lost` gives: two
+    builders of one record are two answers to one question. `test` is present only for a refused
+    nested measurement, the case whose remedy is a specific test (measure it in a killable worker,
+    `--isolated`, where its nested engine re-enters the lock on its own thread instead).
+    """
+    mutant = result.mutant
+    record: dict[str, Any] = {
+        "mutant_id": mutant.mutant_id,
+        "mutant": mutant.description,
+        "category": mutant.category.value,
+        "mutated_line": mutant.mutated_line,
+        "dimension": mutant.dimension,
+        "change": _mutant_change(mutant),
+        "disposition": disposition,
+    }
+    if result.refused_test:
+        record["test"] = result.refused_test
+    return record
 
 
 # ── §6.4 Dispatch Table: Category → AST Transform ────────────────
@@ -4002,11 +4060,21 @@ def baseline_probe_disposition(outcome: str | None) -> str:
     Total over the channel: an outcome this does not recognise is INERT, not usable. A new
     kill reason added later is by construction "did not pass", so the conservative default is
     the correct one; only ``None`` — an actual clean pass — earns ``usable``.
+
+    A FOURTH state since #28, and it is the one the default would get wrong: ``nested_measurement``
+    — the test runs the engine, and the held baseline guard refused its nested measurement before
+    it could wait for itself. Not a pass, so not usable. Not "did not pass" either: the test was
+    never observed to fail, and filing it inert bars it from attribution, so every mutant only it
+    covers would be evaluated against no test at all and scored a plain survivor — a claim about
+    the suite manufactured from a limit of this regime. Its own name lets the caller keep the test
+    and leave the mutant loop to name each outcome it cannot measure.
     """
     if outcome is None:
         return "usable"
     if outcome == "uncontained":
         return "uncontained"
+    if outcome == "nested_measurement":
+        return "nested_measurement"
     return "inert"
 
 
@@ -4108,7 +4176,13 @@ def _baseline_failures(
                     # is what let a live thread read as an ordinary unrunnable test.
                     if disposition == "uncontained":
                         compromised.add("baseline_probe")
-                    if disposition != "usable":
+                    # A refused NESTED measurement (#28) is kept: the test runs the engine, so under
+                    # this held guard its outcome on the original is unobservable, not red. Barring
+                    # it would make every mutant only it covers a plain survivor; kept, the mutant
+                    # loop refuses it again and names that mutant `nested_measurement` — unscored,
+                    # never a kill and never a survivor. A failure under a mutant BEFORE its nested
+                    # point remains attributable: the original passed that prefix to reach it.
+                    if disposition not in ("usable", "nested_measurement"):
                         inert.add(id(test_fn))
                 # BLE001: an unrunnable baseline is itself inert
                 except Exception:  # noqa: BLE001
@@ -5501,8 +5575,13 @@ def _execution_guard(timeout_s: float | None = None) -> Iterator[_PatchProof]:
     the thread HOLDS the lock, and only then does the injection arrive, so it dies owning it and
     nothing ever releases it. Giving up before that point is what stops the orphan being created
     at all, which is why the in-process caller passes its own budget.
+
+    BOTH branches refuse a nested measurement first (#28, `_refuse_nested_measurement`): a bound
+    stops the orphan by losing the race, but a worker whose own measurement holds the lock cannot
+    win it at any length, and the unbounded `with` below would wait for it forever.
     """
     if timeout_s is None:
+        _refuse_nested_measurement()
         with _EXECUTION_LOCK:
             _note_lock_entry()
             try:
@@ -5674,6 +5753,49 @@ def execution_lock_disposition(
     return "free_but_unacquired"
 
 
+def nested_acquire_disposition(
+    owner_tid: int,
+    repr_owner: int,
+    self_tid: int,
+    upstream: tuple[int, ...],
+) -> str:
+    """Whether a thread about to wait for the execution lock would be waiting for ITSELF.
+
+    (#28, pure — pinned) THE CYCLE, measured 2026-09-27: `evaluate_mutant` holds the lock for
+    the whole evaluation and joins the worker running a test; when that test runs the engine
+    in-process, the worker's nested acquire waits on the holder while the holder waits on the
+    worker. Only the holder's timeout breaks it, by abandoning a worker parked in C where the
+    injection cannot land — so the worker dies the instant its acquire finally succeeds, OWNING
+    the lock, and every later evaluation is refused `orphaned`. `execution_lock_disposition`
+    DETECTS that afterwards; this decides it BEFORE the wait, where refusing costs nothing.
+
+    THREE states, three different actions:
+
+      reentrant          -- the caller already owns it. The RLock admits the re-entry at once
+                            (every patch site under `evaluate_mutant`, and the isolated worker's
+                            hookwrapper, take this road); there is nothing to decide.
+      nested_measurement -- the owner is UPSTREAM on the start/join edge: it started (a thread
+                            that started) the caller and is waiting, in a bounded join, for the
+                            caller to finish. Waiting completes the cycle. Refuse instead.
+      acquire            -- no cycle the edge can show: the lock is free, or held by a thread whose
+                            release does not wait on this one. Contend under the existing bounds;
+                            serialising unrelated threads is exactly what the lock is for.
+
+    ``owner_tid`` is the ownership record and ``repr_owner`` the lock repr's owner, the same two
+    channels `execution_lock_disposition` reads (the record is blind in the window between
+    `acquire()` returning and the record being written); 0 means "none recorded" and is never
+    matched as a thread. ``upstream`` is `interrupt.starter_chain()` — the live threads waiting on
+    the caller, nearest first. Supplied by the caller, so this is a total function over literals
+    rather than a snapshot of a race.
+    """
+    known = tuple(tid for tid in (owner_tid, repr_owner) if tid)
+    if self_tid in known:
+        return "reentrant"
+    if any(tid in upstream for tid in known):
+        return "nested_measurement"
+    return "acquire"
+
+
 def _lock_owner_from_repr() -> int:
     """The execution lock's true owner, read from CPython's own repr. 0 if unreadable.
 
@@ -5734,8 +5856,11 @@ def _acquire_execution_lock(
     HONEST LIMIT: an async exception delivered between `acquire()` returning and `_note_lock_entry()`
     leaves the lock held with no record, and CPython offers no way to close that window from
     Python. It is not hypothetical -- it is precisely where the measured defect lands -- which is
-    why `execution_lock_disposition` does not rely on the record alone.
+    why `execution_lock_disposition` does not rely on the record alone. #28 closes the ROUTE the
+    measured case took into that window: a worker whose own measurement holds the lock is refused
+    by `_refuse_nested_measurement` before it can wait at all.
     """
+    _refuse_nested_measurement()
     if _EXECUTION_LOCK.acquire(timeout=probe_s):
         return
     _self = threading.get_ident()
@@ -5754,6 +5879,37 @@ def _acquire_execution_lock(
         ),
         _LOCK_OWNER_TID or _lock_owner_from_repr(),
     )
+
+
+def _refuse_nested_measurement() -> None:
+    """Raise `MeasurementRefused` when waiting for the lock would be waiting for an upstream joiner.
+
+    (#28) Called BEFORE every blocking acquire — `_acquire_execution_lock` (so `_serialized` and
+    the bounded `_execution_guard`) and the unbounded `_execution_guard` — so the refused thread
+    never enters the C-level wait that injection cannot reach, and no orphan can be created. The
+    decision is `nested_acquire_disposition`; this only gathers its inputs and acts on its answer.
+
+    The refusal is RECORDED (`interrupt.mark_refusal`) before it is raised, on every measurement
+    worker between this thread and the owner: pytest's call wrapper and `_run_test_with_timeout`'s
+    own worker catch `BaseException`, and the nested engine may catch anything, so the exception is
+    only how the nested engine unwinds — the record is how the measurement learns what happened.
+
+    Costs one `isinstance` on any thread that is not a `JoinedWorker`, which is every top-level
+    caller: the main thread evaluating mutants never reads the repr.
+    """
+    upstream = starter_chain()
+    if not upstream:
+        return
+    record = _LOCK_OWNER_TID
+    repr_owner = _lock_owner_from_repr()
+    if (
+        nested_acquire_disposition(record, repr_owner, threading.get_ident(), upstream)
+        != "nested_measurement"
+    ):
+        return
+    owner = record if record in upstream else repr_owner
+    mark_refusal("nested_measurement", owner)
+    raise MeasurementRefused("nested_measurement", owner)
 
 
 def _serialized(fn):
@@ -5918,6 +6074,11 @@ def evaluate_mutant(
         first_killer: str | None = None
         saw_uncontained = False  # a timed-out worker that could not be stopped (#14)
         uncontained_test: str | None = None  # the first test whose worker that was
+        # A test whose nested measurement was refused (#28): it runs the engine, so inside this
+        # held evaluation it could not be measured at all. Remembered so a mutant nothing else
+        # kills is NAMED rather than read as a survivor; a kill another test earns outranks it.
+        refusal = ""
+        refused_test: str | None = None
         # How many tests actually got to run against this mutant. `entered` is only
         # INTERPRETABLE when at least one did: with an empty scoped set — which is the normal
         # state of Detective's synthesis path, where the tests do not exist yet — the probe is
@@ -5970,6 +6131,17 @@ def evaluate_mutant(
 
                         uncontained_test = callable_test_id(test_fn)
                     result = "timeout"
+                if result == "nested_measurement":
+                    # NOT A KILL REASON (#28): the test runs the engine and its nested measurement
+                    # was refused before it could wait for the lock this evaluation holds. Whatever
+                    # the test did after that — fail on the refusal, swallow it, pass — says nothing
+                    # about this mutant, so it is neither a kill nor a pass. Kept by name; the loop
+                    # goes on, because another test may still kill the mutant outright.
+                    if refused_test is None:
+                        from Wesker.ci import callable_test_id
+
+                        refusal, refused_test = result, callable_test_id(test_fn)
+                    result = None
                 # A failure is only a KILL if the mutation CAUSED it. When the mutant
                 # could not be patched into the test's namespace, the unpatched path
                 # INJECTS it as a positional argument — a contract only Wesker's own
@@ -6086,6 +6258,9 @@ def evaluate_mutant(
             contained=not saw_uncontained,
             uncontained_test=uncontained_test,
             entered=(getattr(mutated_obj, "entered", None) if ran else None),
+            # Nothing killed it, but a test that might have was refused (#28): not a survivor.
+            refusal=refusal,
+            refused_test=refused_test,
             elapsed_ms=_elapsed(start),
         )
     finally:
@@ -6206,12 +6381,21 @@ def _run_test_with_timeout(
     route the outcome through `baseline_probe_disposition`, which names the three states,
     rather than testing it against None.
 
+    AND A SECOND: "nested_measurement" (#28). The test runs the engine, and because the caller
+    holds the execution lock while it joins this worker, the nested acquire was refused instead
+    of waiting for itself (`_refuse_nested_measurement`). The test was never measured, so this
+    is neither a kill nor a pass. It cannot travel on the exception: the worker below catches
+    `BaseException` (reading it "crash") and pytest's call wrapper catches it before that, so it
+    is read off the worker's own record (`JoinedWorker.refusal`), written before the raise. An
+    uncontained worker still outranks it — a live runaway poisons the process whatever else
+    happened — and it outranks a contained timeout: a run that included a refused measurement
+    is not evidence about the mutant however long it took.
+
     The timeout bounds the WAIT and, via `interrupt.abandon`, the thread itself — see there for what
     that can and cannot reach.
     """
     import contextlib
     import io
-    import threading
 
     result_box: list[str | None] = [None]  # None = survived
 
@@ -6243,7 +6427,9 @@ def _run_test_with_timeout(
             # again. That is not a slow path to a verdict; it is a loop with no exit.
             result_box[0] = "exception" if _is_declared_failure(exc) else "crash"
 
-    thread = threading.Thread(target=_target, daemon=True)
+    # A `JoinedWorker`, not a bare Thread: it records that THIS thread started it and is about to
+    # join it, which is the edge a nested acquire inside the test checks before it waits (#28).
+    thread = JoinedWorker(target=_target, daemon=True)
     # Isolate the discovered test's own stdout/stderr (argparse usage banners,
     # prints, logging) so consumer-test side-effects never pollute the engine's
     # report. Set up in the main thread around start+join so restoration is
@@ -6285,8 +6471,14 @@ def _run_test_with_timeout(
             thread, timeout_ms / 1000.0, unwind_s=_ABANDON_UNWIND_S
         )
 
+    if timed_out and not contained:
+        return "uncontained"
+    # THE SIDE CHANNEL (#28): read after the join, where nothing the test or pytest caught can
+    # have erased it. `result_box` says "crash" (or whatever the test made of the refusal).
+    if thread.refusal:
+        return thread.refusal
     if timed_out:
-        return "timeout" if contained else "uncontained"
+        return "timeout"
 
     return result_box[0]
 
@@ -6422,7 +6614,12 @@ def run_function_sampling(
         # PARTIAL universe, which is exactly why the partiality must stay honest — a harness
         # failure silently scored as a kill inflates the one number a sample is read for.
         disposition = mutant_disposition(
-            result.constructed, result.installed, result.entered, True, result.killed
+            result.constructed,
+            result.installed,
+            result.entered,
+            True,
+            result.killed,
+            result.refusal,
         )
         if disposition not in SCORED_DISPOSITIONS:
             cr.unscored += 1
@@ -6872,8 +7069,13 @@ def run_function_profiling(
     kill_matrix: dict[str, list[str]] = {}
     survivor_records: list[dict] = []
     killed_records: list[dict] = []
+    # Which mutants `unscored_by` counts, and why (#28).
+    unscored_records: list[dict] = []
     # The Mutant objects of survivors, for the target-first widen pass to re-evaluate against unknowns.
     _survivor_mutants: dict[str, Mutant] = {}
+    # The open obligations among them that are currently REFUSED (#28): accounted unscored under
+    # this disposition, but re-evaluated by the widen like a survivor, since an unknown may kill them.
+    _refused_open: dict[str, str] = {}
     budget_exhausted = False
     all_contained = True  # #14: cleared if any timed-out worker could not be stopped
     _uncontained_results: list[
@@ -7007,11 +7209,23 @@ def run_function_profiling(
         # through here too would silently move mutants out of a shipped contract's denominator.
         # #18 owns the install/entry phases; W#19 revisits containment.
         disposition = mutant_disposition(
-            result.constructed, result.installed, result.entered, True, result.killed
+            result.constructed,
+            result.installed,
+            result.entered,
+            True,
+            result.killed,
+            result.refusal,
         )
         if disposition not in SCORED_DISPOSITIONS:
             cr.unscored += 1
             cr.unscored_by[disposition] = cr.unscored_by.get(disposition, 0) + 1
+            unscored_records.append(_unscored_record(result, disposition))
+            if result.refusal:
+                # Still an OPEN OBLIGATION for the widen (#28): an unknown it traces may kill this
+                # mutant outright, as the full run over A∪B would — stopping the widen because the
+                # only open mutants are refused would make seed+expand disagree with that run.
+                _survivor_mutants[mutant.mutant_id] = mutant
+                _refused_open[mutant.mutant_id] = disposition
         elif result.killed:
             cr.total += 1
             cr.killed += 1
@@ -7197,6 +7411,35 @@ def run_function_profiling(
                 source_path=source_path,
             )
             if not _res.killed:
+                _disp = mutant_disposition(
+                    _res.constructed,
+                    _res.installed,
+                    _res.entered,
+                    True,
+                    _res.killed,
+                    _res.refusal,
+                )
+                if (
+                    _res.refusal
+                    and _disp not in SCORED_DISPOSITIONS
+                    and _mid not in _refused_open
+                ):
+                    # The widened set holds a test that could not be measured here (#28), so this
+                    # is no longer a survivor: over A∪B the full run names it by its refusal, and
+                    # seed+expand must agree with the full run. Out of the denominator — but still
+                    # an OPEN obligation: a later batch may trace the unknown that kills it.
+                    _cr = results_by_cat.setdefault(
+                        _mutant.category, CategoryResult(category=_mutant.category)
+                    )
+                    _cr.total -= 1
+                    _cr.survived -= 1
+                    _cr.unscored += 1
+                    _cr.unscored_by[_disp] = _cr.unscored_by.get(_disp, 0) + 1
+                    survivor_records[:] = [
+                        r for r in survivor_records if r["mutant_id"] != _mid
+                    ]
+                    unscored_records.append(_unscored_record(_res, _disp))
+                    _refused_open[_mid] = _disp
                 continue
             # Prune the now-killed mutant so the incremental obligation check and the next micro-batch
             # no longer see it as open — the run-once widen never needed to, as it re-evaluated the
@@ -7208,6 +7451,22 @@ def run_function_profiling(
             _cr = results_by_cat.setdefault(
                 _mutant.category, CategoryResult(category=_mutant.category)
             )
+            _was_refused = _refused_open.pop(_mid, None)
+            if _was_refused is not None:
+                # Refused until now (#28) and killed by a widened test: back into the denominator
+                # as the survivor it was accounted as before the refusal, so the move below is the
+                # same survivor -> killed move every other widen kill makes.
+                _cr.unscored -= 1
+                _left = _cr.unscored_by.get(_was_refused, 0) - 1
+                if _left > 0:
+                    _cr.unscored_by[_was_refused] = _left
+                else:
+                    _cr.unscored_by.pop(_was_refused, None)
+                _cr.total += 1
+                _cr.survived += 1
+                unscored_records[:] = [
+                    r for r in unscored_records if r["mutant_id"] != _mid
+                ]
             _cr.survived -= 1
             _cr.killed += 1
             if _res.killed_by == "assertion":
@@ -7394,12 +7653,20 @@ def run_function_profiling(
         kill_matrix=kill_matrix,
         survivor_records=survivor_records,
         killed_records=killed_records,
+        unscored_records=unscored_records,
         budget_exhausted=budget_exhausted,
         is_gateable=_measurement_gateable(
+            # `nested_measurement` (#28) beside the three #18 named: a mutant whose only possible
+            # killer could not be measured here is unmeasured, and a verdict over it is a floor.
             not any(
                 cr.unscored_by.get(reason, 0)
                 for cr in per_cat
-                for reason in ("harness_error", "not_installed", "not_entered")
+                for reason in (
+                    "harness_error",
+                    "not_installed",
+                    "not_entered",
+                    "nested_measurement",
+                )
             ),
             _contained,
             not budget_exhausted,
@@ -7944,6 +8211,10 @@ def run_function_converged(
                         constructed=result.constructed,
                         installed=result.installed,
                         entered=result.entered,
+                        # A refused measurement is a phase fact too (#28) — the same data-loss
+                        # this reconstruction already had to be taught about for entry.
+                        refusal=result.refusal,
+                        refused_test=result.refused_test,
                         elapsed_ms=result.elapsed_ms,
                     )
 
@@ -7960,6 +8231,7 @@ def run_function_converged(
                     result.entered,
                     True,
                     result.killed,
+                    result.refusal,
                 )
                 in SCORED_DISPOSITIONS
             )
@@ -8014,6 +8286,12 @@ def run_function_converged(
                     kill_matrix.setdefault(mutant.description, []).append(
                         result.test_name
                     )
+            elif result.refusal:
+                # Neither killed nor survived (#28): no survivor record, which every survivor
+                # reader (SARIF, annotations, the witness search) would report as an unpinned
+                # behaviour. The aggregation below names it in `unscored_records` instead. Still an
+                # open obligation for the widen: an unknown may kill it, as the full run would.
+                _survivor_mutants[mutant.mutant_id] = mutant
             elif result.equivalent:
                 record["equivalent"] = True
                 survivor_records.append(record)
@@ -8129,6 +8407,16 @@ def run_function_converged(
                 record_all_killers=full_matrix,
                 source_path=source_path,
             )
+            if not _res.killed and _res.refusal:
+                # The widened set holds a test that could not be measured here (#28): over A∪B the
+                # full run names this mutant by its refusal, not as a survivor. `seen` drives the
+                # aggregation, which keeps it out of the denominator and records it. It stays an
+                # open obligation — a later batch may trace the unknown that kills it outright.
+                seen[_mid] = _res
+                survivor_records[:] = [
+                    r for r in survivor_records if r["mutant_id"] != _mid
+                ]
+                continue
             if not _res.killed:
                 continue  # still a survivor after widening — the honest gap
             # Move survivor -> killed across EVERY view. `seen` drives the per-category
@@ -8159,7 +8447,12 @@ def run_function_converged(
                 kill_matrix.setdefault(_mutant.description, []).append(_res.test_name)
             if (
                 mutant_disposition(
-                    _res.constructed, _res.installed, _res.entered, True, _res.killed
+                    _res.constructed,
+                    _res.installed,
+                    _res.entered,
+                    True,
+                    _res.killed,
+                    _res.refusal,
                 )
                 in SCORED_DISPOSITIONS
                 and _mutant.dimension
@@ -8186,6 +8479,8 @@ def run_function_converged(
     # actually runs. A zero-mutant run (`seen` empty) therefore left this True and published a
     # clean badge over a live runaway.
     all_contained = not _baseline_uncontained
+    # #28: built from the FINAL `seen`, widen included.
+    unscored_records: list[dict] = []
     for result in seen.values():
         if not result.contained:
             all_contained = False
@@ -8196,11 +8491,17 @@ def run_function_converged(
         # a drift the shared `CategoryResult` cannot express. See that site for why
         # containment is passed as True here rather than routed through the disposition.
         disposition = mutant_disposition(
-            result.constructed, result.installed, result.entered, True, result.killed
+            result.constructed,
+            result.installed,
+            result.entered,
+            True,
+            result.killed,
+            result.refusal,
         )
         if disposition not in SCORED_DISPOSITIONS:
             cr.unscored += 1
             cr.unscored_by[disposition] = cr.unscored_by.get(disposition, 0) + 1
+            unscored_records.append(_unscored_record(result, disposition))
         elif result.killed:
             cr.total += 1
             cr.killed += 1
@@ -8283,6 +8584,7 @@ def run_function_converged(
         kill_matrix=kill_matrix,
         survivor_records=survivor_records,
         killed_records=killed_records,
+        unscored_records=unscored_records,
         budget_exhausted=budget_exhausted,
         elapsed_ms=_elapsed(start),
         trace_truncated=sorted(_trace_truncated),

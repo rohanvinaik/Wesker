@@ -41,15 +41,33 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/engine.py::baseline_probe_disposition": {
+    "cut_reasons": [],
+    "function_digest": "f3326547ffa1b1b4",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/engine.py::execution_lock_disposition": {
     "cut_reasons": [],
     "function_digest": "30afa2daf0abb2dc",
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/engine.py::mutant_disposition": {
+    "cut_reasons": [],
+    "function_digest": "81dc3f2be6a60ede",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/engine.py::mutant_scope_route": {
     "cut_reasons": [],
     "function_digest": "d02323b2c55a8319",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/engine.py::nested_acquire_disposition": {
+    "cut_reasons": [],
+    "function_digest": "f14735507b4d2b3a",
     "refusal": "",
     "standing": "complete"
   },

@@ -27,7 +27,7 @@ from collections.abc import Callable
 from types import CodeType
 from typing import Any
 
-from Wesker.interrupt import Abandoned, bounded_join
+from Wesker.interrupt import Abandoned, JoinedWorker, MeasurementRefused, bounded_join
 
 
 def _traceable_lines(
@@ -212,7 +212,10 @@ def _traced_in_thread(
         # `except Exception` cannot swallow the stop) — catching it here is the point. Naming the
         # pair rather than BaseException lets a real KeyboardInterrupt/SystemExit through, which
         # should stop the run rather than be absorbed by a coverage worker (S5754).
-        except (Exception, Abandoned):  # noqa: BLE001, S110
+        # `MeasurementRefused` (#28) for the same reason as `Abandoned`: a BaseException by design,
+        # raised when the traced test runs the engine under a measurement holding the lock. Its
+        # status is already recorded on this worker; the lines reached before it are real.
+        except (Exception, Abandoned, MeasurementRefused):  # noqa: BLE001, S110
             pass
         finally:
             _close_window(window, child, previous_child_hook)
@@ -224,7 +227,9 @@ def _traced_in_thread(
                 reach.append("incomplete_thread")
             done.set()
 
-    thread = threading.Thread(target=_worker, daemon=True)
+    # A `JoinedWorker` (#28): this thread joins it below, so a nested acquire inside the traced
+    # test can see that edge — the trace runs inside other measurements' workers too.
+    thread = JoinedWorker(target=_worker, daemon=True)
     thread.start()
     # Cut → stop it, don't leak it. Partial coverage is kept either way — and whether the stop
     # actually LANDED travels with the result instead of being discarded (#19). `bounded_join`

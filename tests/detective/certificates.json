@@ -7,6 +7,12 @@
     "refusal": "",
     "standing": "ungateable"
   },
+  "Wesker/action.py::progress_gap_notice": {
+    "cut_reasons": [],
+    "function_digest": "56642bbc2f8daf23",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/action.py::stack_dump_owner": {
     "cut_reasons": [],
     "function_digest": "4e082b208c38cfa2",
@@ -131,6 +137,12 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/engine.py::original_control_standing": {
+    "cut_reasons": [],
+    "function_digest": "d8751347fc91b3cd",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/isolation.py::isolated_test_selection": {
     "function_digest": "cd8a3be413a6f79c",
     "refusal": "",
@@ -166,6 +178,12 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/mu_minus.py::stale_memory_standing": {
+    "cut_reasons": [],
+    "function_digest": "e81250c3a37f1447",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/policy.py::_fingerprint_counts": {
     "cut_reasons": [],
     "function_digest": "c9f6a705ec9f2619",
@@ -179,6 +197,18 @@
     "function_digest": "17bc0412de23ec64",
     "refusal": "",
     "standing": "ungateable"
+  },
+  "Wesker/pytest_runner.py::argument_copy_standing": {
+    "cut_reasons": [],
+    "function_digest": "cd396b9cba9b8522",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/pytest_runner.py::identity_standing": {
+    "cut_reasons": [],
+    "function_digest": "5120433401083802",
+    "refusal": "",
+    "standing": "complete"
   },
   "Wesker/swap_plan.py::swap_label": {
     "cut_reasons": [],

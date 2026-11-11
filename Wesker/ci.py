@@ -1931,7 +1931,10 @@ def truncation_cause(
 #   "truncated"   the run itself stopped short; `truncation_cause` owns it at the function level.
 #   "harness"     the outcome measures the harness, not the suite: the mutant was never built, never
 #                 installed, never entered, or the test it needed runs the engine and was refused
-#                 before it could wait for itself. It leaves the ratio, as it always has.
+#                 before it could wait for itself. It leaves the ratio, as it always has, and since
+#                 W#54 the rollup says so: `harness_dispositions` names what a function holds,
+#                 `total_harness_mutants` / `harness_mutants` count it, `harness_functions` names it
+#                 and `describe_harness` renders it beside the kill rate. The badge does not gate on it.
 UNSCORED_ROLLUP: tuple[tuple[str, str], ...] = (
     ("undetermined", "unresolved"),
     ("diverged", "unresolved"),
@@ -1983,6 +1986,118 @@ def unresolved_causes(unscored_by: dict) -> tuple[str, ...]:
         d for d, owner in UNSCORED_ROLLUP if owner == "unresolved" and d in present
     ]
     return (*known, *sorted(present - owners.keys()))
+
+
+def harness_dispositions(unscored_by: dict) -> tuple[str, ...]:
+    """Every harness disposition a function holds, in table order (W#54, pure — pinned).
+
+    The third owner in `UNSCORED_ROLLUP`. The rollup named the "unresolved" and "truncated" owners and
+    dropped "harness", so a function whose mutants were never built, installed or entered reported a
+    kill rate over the rest with nothing saying that some had left the denominator, or how many. This
+    is `unresolved_causes` for that owner: the dispositions come from ``unscored_by`` (the per-
+    disposition counts `ProfilingResult.to_dict` emits), a zero count is absence and not a finding,
+    and a disposition the table does not know is not read here: `unresolved_causes` owns it.
+    """
+    present = {disposition for disposition, count in unscored_by.items() if count}
+    return tuple(
+        d for d, owner in UNSCORED_ROLLUP if owner == "harness" and d in present
+    )
+
+
+def harness_standing(recorded: bool, harness_mutants: int) -> str:
+    """What a report says about the mutants the harness kept out of its kill rate (W#54, pure — pinned).
+
+    Absence and emptiness never render alike (COMMUNICATING_DETERMINISM §4):
+
+      "not_recorded"  the report carries no harness record at all (written before W#54): nothing is
+                      claimed about whether any mutant left the denominator.
+      "none"          the report records the harness and no mutant left the ratio for that reason.
+      "left_ratio"    ``harness_mutants`` mutants left the ratio: the kill rate is over the rest.
+    """
+    if not recorded:
+        return "not_recorded"
+    return "left_ratio" if harness_mutants > 0 else "none"
+
+
+# What each harness disposition means for the reader of a kill rate, and what a named `not_entered` cause
+# asks of them. None is a test result: the mutant never reached a verdict about the suite.
+_HARNESS_MEANINGS = (
+    (
+        "harness_error",
+        "never built: Wesker could not construct the mutant, so no test ran against it.",
+    ),
+    (
+        "not_installed",
+        (
+            "built, but no call site was rebound to it (a wrapped or cached target the install "
+            "cannot patch), so no test could see it."
+        ),
+    ),
+    (
+        "not_entered",
+        "installed, but no test entered it; the cause is named per function below.",
+    ),
+    (
+        "nested_measurement",
+        (
+            "a test the verdict needed runs the engine and its nested measurement was refused; "
+            "measure that test in a killable worker (`--isolated`)."
+        ),
+    ),
+)
+
+_NOT_ENTERED_CAUSE_NOTES = {
+    "not_reached": "no test reaches the function: route one to it",
+    "decorator_wrapper": "a wrapper bound in a module calls the original",
+    "captured_at_import": "a module-level constant or registry holds the original",
+    "pre_bound_reference": "a module binds the original under another name",
+    "holder_not_found": "tests reached it, no holder found",
+    "no_reach_data": "no complete trace says whether the tests reached it",
+}
+
+
+def describe_harness(mutation: dict, limit: int = 20) -> str:
+    """The harness line that stands beside a kill rate, or "" never: every report says one thing (W#54, pure).
+
+    One renderer for every text surface that prints a ratio (`python -m Wesker`, `Wesker.metrics`, the
+    Action's step summary), so none can drop the mutants that left the denominator. Counted per
+    disposition, each function named, and `not_entered` carrying its named cause (#18).
+    """
+    recorded = "harness_functions" in mutation
+    total = int(mutation.get("total_harness_mutants", 0) or 0)
+    standing = harness_standing(recorded, total)
+    if standing == "not_recorded":
+        return "Harness: not recorded in this report — nothing is claimed about mutants kept out of the kill rate."
+    if standing == "none":
+        return "Harness: 0 mutants left the kill rate (none unbuilt, uninstalled, unentered or refused)."
+    by = mutation.get("harness_mutants") or {}
+    counted = ", ".join(f"{d} {by[d]}" for d, _ in _HARNESS_MEANINGS if by.get(d))
+    n_fn = int(mutation.get("total_harness", 0) or 0)
+    lines = [
+        (
+            f"Harness: {total} mutant(s) in {n_fn} function(s) are NOT in the kill rate "
+            f"({counted}) — they measure the harness, not your tests."
+        )
+    ]
+    entries = mutation.get("harness_functions") or []
+    for disposition, meaning in _HARNESS_MEANINGS:
+        group = [e for e in entries if e.get("disposition") == disposition]
+        if not group:
+            continue
+        lines.append(f"  {disposition} [{by.get(disposition, 0)}] {meaning}")
+        for e in group[:limit]:
+            causes = e.get("causes") or {}
+            named = ", ".join(
+                f"{c} {n} ({_NOT_ENTERED_CAUSE_NOTES.get(c, 'cause not described')})"
+                for c, n in sorted(causes.items())
+            )
+            lines.append(
+                f"    {e.get('function_key') or '?'} — {e.get('count', 0)}"
+                + (f": {named}" if named else "")
+            )
+        if len(group) > limit:
+            lines.append(f"    … and {len(group) - limit} more")
+    return "\n".join(lines)
 
 
 # The remedy each cause needs, in the order a reader should act on them: a worker that could not be
@@ -2185,6 +2300,43 @@ def describe_unresolved(unresolved: list[dict], limit: int = 20) -> str:
     return "\n".join(blocks)
 
 
+def _harness_entries(r: dict) -> list[dict]:
+    """One entry per harness disposition one function's result holds (W#54).
+
+    ``count`` is the engine's own tally (``unscored_by``); ``mutants`` names them from
+    ``unscored_records``; a ``not_entered`` entry carries its per-cause counts (``not_entered_causes``).
+    """
+    entries: list[dict] = []
+    by = dict(r.get("unscored_by") or {})
+    for disposition in harness_dispositions(by):
+        entry: dict = {
+            "function_key": r.get("function_key", ""),
+            "disposition": disposition,
+            "count": int(by[disposition]),
+            "mutants": [
+                str(u.get("mutant_id", "?"))
+                for u in (r.get("unscored_records") or [])
+                if u.get("disposition") == disposition
+            ],
+        }
+        if disposition == "not_entered":
+            entry["causes"] = dict(r.get("not_entered_causes") or {})
+        entries.append(entry)
+    return entries
+
+
+def _harness_totals(entries: list[dict]) -> dict[str, int]:
+    """Mutants per harness disposition across the run, in table order (W#54)."""
+    totals: dict[str, int] = {}
+    for disposition, owner in UNSCORED_ROLLUP:
+        if owner != "harness":
+            continue
+        n = sum(e["count"] for e in entries if e["disposition"] == disposition)
+        if n:
+            totals[disposition] = n
+    return totals
+
+
 def profile_codebase(
     project_root: str,
     targets: list[str],
@@ -2246,6 +2398,7 @@ def profile_codebase(
     total_truncated = 0
     truncated_functions: list[dict] = []
     unresolved_functions: list[dict] = []
+    harness_functions: list[dict] = []
     total_universe = 0
     total_dof = 0
     total_dof_covered = 0
@@ -2306,6 +2459,10 @@ def profile_codebase(
         # Each cut is recorded with its cause, so a refusal can name the function and the remedy
         # rather than only count them.
         for r in results:
+            # The third owner (W#54): mutants the harness kept out of the ratio. Counted for EVERY
+            # function, a cut one included: the cut below names the function's unevaluated mutants,
+            # these were evaluated and are outside the ratio for another reason.
+            harness_functions.extend(_harness_entries(r))
             cause = truncation_cause(
                 r.get("coverage_depth", ""),
                 bool(r.get("budget_exhausted")),
@@ -2451,6 +2608,13 @@ def profile_codebase(
         # a function holding two causes has an entry under each (W#51) and is counted once.
         "total_unresolved": len({u["function_key"] for u in unresolved_functions}),
         "unresolved_functions": unresolved_functions,
+        # Mutants the HARNESS kept out of the kill rate (W#54): never built, installed or entered, or
+        # refused as a nested measurement. Not a completeness refusal (the badge does not gate on it),
+        # but never silent: counted per disposition and named per function beside the ratio.
+        "total_harness_mutants": sum(e["count"] for e in harness_functions),
+        "harness_mutants": _harness_totals(harness_functions),
+        "total_harness": len({e["function_key"] for e in harness_functions}),
+        "harness_functions": harness_functions,
         "passes": passes,
         "elapsed_ms": round(elapsed),
         # Progress lines this run could not write (W#52): its stream was closed or redirected under

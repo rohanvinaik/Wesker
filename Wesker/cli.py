@@ -197,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
             # A cut or no-verdict function's mutants are missing from both sides of the ratio
             # below. Say so before the number, in the renderer `Wesker.metrics` shares (W#51):
             # this summary used to print the bare kill rate and exit 0 with the cause unnamed.
-            from Wesker.ci import completeness_warnings
+            from Wesker.ci import completeness_warnings, describe_harness
 
             warnings = completeness_warnings(result)
             if warnings:
@@ -206,6 +206,8 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"Kill rate: {result['kill_pct']}% ({result['total_killed']}/{result['total_mutants']})"
             )
+            # Mutants the harness kept out of the ratio above, beside it (W#54).
+            print(describe_harness(result))
             # DOF coverage — the claim a bounded run can actually make. Under
             # singleton cover sets the greedy reaches min(picks, D) of D dimensions
             # exactly, so this is measured coverage, not an estimate.

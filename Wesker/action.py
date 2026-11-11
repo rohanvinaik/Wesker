@@ -237,6 +237,8 @@ def _summary_markdown(report: dict, scope_note: str) -> str:
     item: it can afford to say WHY the number means something, and saying it here rather than
     on the front reads as conviction rather than salesmanship.
     """
+    from Wesker.ci import describe_harness
+
     spec = report.get("spec_pct", 0)
     pinned = report.get("total_dof_pinned", 0)
     dof = report.get("total_dof", 0)
@@ -258,6 +260,10 @@ def _summary_markdown(report: dict, scope_note: str) -> str:
         f"| Unspecified | **{dof - pinned}** |",
         f"| Mutants run | {mutants} ({per_dim} per dimension) |",
         f"| Judged by | `{report.get('execution_mode', 'unknown')}` |",
+        "",
+        "```",
+        describe_harness(report),
+        "```",
         "",
         "<details><summary>Why this number is comparable and a kill rate is not</summary>",
         "",
@@ -355,6 +361,7 @@ def _write_outputs(report: dict) -> None:
         "dof-pct": report.get("dof_pct", 0),
         "kill-pct": report.get("kill_pct", 0),
         "total-mutants": report.get("total_mutants", 0),
+        "harness-mutants": report.get("total_harness_mutants", 0),
         "execution-mode": report.get("execution_mode", "unknown"),
         "survivors": len(report.get("survivors") or []),
     }
@@ -368,6 +375,11 @@ def _annotate(report: dict) -> None:
     Emitted in addition to SARIF because annotations need no extra permissions and show up
     even where code scanning is unavailable (most private repos on free plans).
     """
+    from Wesker.ci import describe_harness
+
+    if report.get("total_harness_mutants"):
+        # W#54: the ratio the survivors below belong to leaves these mutants out; say so with them.
+        print(f"::notice::{describe_harness(report).splitlines()[0]}")
     for s in (report.get("survivors") or [])[:50]:
         path = str(s.get("function_key", "")).split("::", 1)[0]
         line = s.get("mutated_line")

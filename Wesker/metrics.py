@@ -33,7 +33,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from Wesker.ci import completeness_warnings, profile_codebase
+from Wesker.ci import completeness_warnings, describe_harness, profile_codebase
 from Wesker.self_profile import profiler_for_targets
 
 # ---------------------------------------------------------------------------
@@ -653,6 +653,7 @@ def main():
         f"Mutation: {mutation['total_killed']}/{mutation['total_mutants']} "
         f"({mutation['kill_pct']}%){equiv_note}{coverage_note}"
     )
+    print(describe_harness(mutation))
     print(f"MC/DC: {mcdc_status} — {mcdc_detail}")
     print(f"Mean sigma: {mean_sigma} across {func_count} functions")
     print(f"Tests: {test_count} | Source: {source_loc} LOC | Ratio: 1:{ratio}")

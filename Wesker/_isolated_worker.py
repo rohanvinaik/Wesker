@@ -244,7 +244,7 @@ class _MutantPlugin(_FreshArgumentsPlugin):
         self.write_blocked: str | None = None
         self.blocked_writes: list[str] = []
 
-    def pytest_runtest_logstart(self, nodeid: str, location: Any) -> None:
+    def pytest_runtest_logstart(self) -> None:
         """A test boundary (#49): a Form B wrapper's memory (stale) ends with the test that made it."""
         begin_test()
 

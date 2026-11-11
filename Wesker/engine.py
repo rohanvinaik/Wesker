@@ -7036,6 +7036,21 @@ def _prepare_base_globals(original_func: Callable[..., Any] | None) -> dict[str,
     return dict(getattr(original_func, "__globals__", None) or {})
 
 
+def first_refusal(
+    refusal: str, refused_test: str | None, code: str, test_id: str
+) -> tuple[str, str | None]:
+    """The refusal an evaluation reports: the FIRST test refused keeps its name (#55, pure — pinned).
+
+    A refused or voided test (nested measurement, prevented write, a failure the original reproduces)
+    is named once, by the first test it happened to, and a later one never overwrites it. Split out of
+    ``evaluate_mutant``'s loop, whose nesting the decision had pushed past what a reader holds: the loop
+    only chooses WHEN a test is refused and which id it has; this only keeps the first.
+    """
+    if refused_test is not None:
+        return refusal, refused_test
+    return code, test_id
+
+
 @_serialized
 def evaluate_mutant(
     mutant: Mutant,
@@ -7386,10 +7401,12 @@ def evaluate_mutant(
                     # write (#105) is the same kind of fact: the run never finished as the mutant
                     # would have run it.
                     if refused_test is None:
-                        from Wesker.ci import callable_test_id
-
-                        refusal, refused_test = result, callable_test_id(test_fn)
                         refused_writes = list(dict.fromkeys(blocked))[:3]
+                    from Wesker.ci import callable_test_id
+
+                    refusal, refused_test = first_refusal(
+                        refusal, refused_test, result, callable_test_id(test_fn)
+                    )
                     result = None
                 # A failure is only a KILL if the mutation CAUSED it, and that is a DIFFERENCE FROM THE
                 # ORIGINAL on the same input (KNOWABILITY Def. 2.3): re-run the test with the ORIGINAL
@@ -7433,13 +7450,14 @@ def evaluate_mutant(
                         # The original fails the same way here: this test detected nothing. Not a
                         # kill, and not a survivor either -- named, like a refused measurement; a kill
                         # another test earns still outranks it.
-                        if refused_test is None:
-                            from Wesker.ci import callable_test_id
+                        from Wesker.ci import callable_test_id
 
-                            refusal, refused_test = (
-                                ORIGINAL_ALSO_FAILS,
-                                callable_test_id(test_fn),
-                            )
+                        refusal, refused_test = first_refusal(
+                            refusal,
+                            refused_test,
+                            ORIGINAL_ALSO_FAILS,
+                            callable_test_id(test_fn),
+                        )
                         result = None
                 if result is not None:
                     # The kill vocabulary (issue #16). Coverage is keyed the same way in

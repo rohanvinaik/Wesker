@@ -434,6 +434,45 @@ def _install_cheap_failure_repr(item: Any) -> None:
         item._repr_failure_py = _cheap_failure_repr
 
 
+def _fresh_arguments_of(item: Any) -> FreshArguments:
+    """The fresh-arguments holder of one wrapped item, snapshotted now (#55): taken at wrapping time,
+    before any run has had a chance to alter the module-level objects the item's parameters are."""
+    fresh = FreshArguments()
+    fresh.capture(item)
+    return fresh
+
+
+def _settle_first_run(
+    item: Any,
+    cap: _ExcCapture,
+    fresh: FreshArguments,
+    reports: list[Any],
+    first_run: bool,
+    rtp: Callable[..., list[Any]],
+    reset: Callable[[Any], None],
+) -> list[Any]:
+    """The reports a wrapped item's run stands on once its FIRST run has been judged (#55).
+
+    The first failure of an item that is handed copies: is it the copy's? The first run of an item is
+    the baseline's, the original's. Run it once on the AUTHORED objects; if that passes, the test
+    depends on object identity and its arguments stay shared. Every later run stands on its own reports.
+    """
+    if not first_run:
+        return reports
+    if any(r.failed for r in reports):
+        first_exc = cap.last.get(item.nodeid)
+        fresh.use_authored(item)
+        cap.last.pop(item.nodeid, None)
+        reset(item)
+        again = rtp(item, nextitem=None, log=False)
+        if fresh.mark_by_identity(item, not any(r.failed for r in again)):
+            reports = again
+        else:
+            cap.last[item.nodeid] = first_exc
+    fresh.measured(item)
+    return reports
+
+
 def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
     """Wrap a LIVE pytest item as a zero-arg callable that raises on failure.
 
@@ -481,8 +520,7 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
     # Fresh arguments for EVERY run of this item (#55): the original's, the baseline's and each
     # mutant's. The snapshot is taken now, at wrapping time, before any run has had a chance to alter
     # the module-level objects the item's parameters are.
-    fresh = FreshArguments()
-    fresh.capture(item)
+    fresh = _fresh_arguments_of(item)
 
     def run(  # type: ignore[no-untyped-def]
         *,
@@ -493,6 +531,7 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
         _status=status,
         _classify=_reports_status,
         _fresh=fresh,
+        _settle=_settle_first_run,
     ) -> None:
         _cap.last.pop(_item.nodeid, None)
         _status.value = "unobserved"
@@ -500,21 +539,7 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
         _fresh.refresh(_item)
         _reset(_item)
         reports = _rtp(_item, nextitem=None, log=False)
-        if first_run and any(r.failed for r in reports):
-            # The first failure of an item that is handed copies: is it the copy's? (#55) The first run
-            # of an item is the baseline's, the original's. Run it once on the AUTHORED objects; if
-            # that passes, the test depends on object identity and its arguments stay shared.
-            first_exc = _cap.last.get(_item.nodeid)
-            _fresh.use_authored(_item)
-            _cap.last.pop(_item.nodeid, None)
-            _reset(_item)
-            again = _rtp(_item, nextitem=None, log=False)
-            if _fresh.mark_by_identity(_item, not any(r.failed for r in again)):
-                reports = again
-            else:
-                _cap.last[_item.nodeid] = first_exc
-        if first_run:
-            _fresh.measured(_item)
+        reports = _settle(_item, _cap, _fresh, reports, first_run, _rtp, _reset)
         _status.value = _classify(reports)
         if not any(r.failed for r in reports):
             return

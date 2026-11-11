@@ -166,6 +166,17 @@ class _ControlPlugin(_FreshArgumentsPlugin):
             self.reasons[getattr(item, "nodeid", "")] = reason
 
 
+class _AuthoredControlPlugin(_ControlPlugin):
+    """The original control on the AUTHORED objects: no fresh copy is handed out (#55)."""
+
+    def pytest_runtest_setup(self, item: Any) -> None:
+        return None
+
+
+#: The nodes whose copies this process has already measured against the original (#55).
+_MEASURED: set[str] = set()
+
+
 class _MutantPlugin(_FreshArgumentsPlugin):
     """Install the mutant into each test's namespace for the duration of its call, and CLASSIFY
     why each node failed (#19).
@@ -443,8 +454,22 @@ def _evaluate_full(
         # difference. One decision, `engine.original_control_standing`, shared with the in-process loop.
         fresh_failures = plugin.node_reasons[controlled:]
         controlled = len(plugin.node_reasons)
+        sensitive: set[str] = set()
         if fresh_failures:
-            voided |= _voided_by_control(fresh_failures)
+            newly_voided, sensitive = _voided_by_control(fresh_failures)
+            voided |= newly_voided
+            if sensitive:
+                # These nodes failed under the mutant on COPIES of arguments their test cannot be
+                # handed copies of (`identity_standing`): that failure says nothing. Forget it and
+                # run them again on the authored objects.
+                plugin.node_reasons = [
+                    (n, r) for n, r in plugin.node_reasons if n not in sensitive
+                ]
+                controlled = len(plugin.node_reasons)
+                plugin.done -= sensitive
+                fresh_failures = [
+                    (n, r) for n, r in fresh_failures if n not in sensitive
+                ]
             plugin.settle(voided)
         # A round pytest stopped at a value failure that the control voided has not run the rest of the
         # suite against this mutant; go on with what it never reached, as the in-process loop does.
@@ -452,7 +477,7 @@ def _evaluate_full(
             reason in ("assertion", "exception") for _, reason in fresh_failures
         )
         value_standing = any(r in ("assertion", "exception") for r in plugin.reasons)
-        if (
+        if not sensitive and (
             not stopped
             or value_standing
             or not (plugin.collected - plugin.done)
@@ -515,14 +540,20 @@ def _pytest_round(node_ids: list[str], plugin: Any) -> int:
         )
 
 
-def _voided_by_control(failures: list[tuple[str, str]]) -> set[str]:
-    """The failing nodes whose failure the ORIGINAL reproduces in this process state (#55).
+def _voided_by_control(failures: list[tuple[str, str]]) -> tuple[set[str], set[str]]:
+    """The failing nodes whose failure the ORIGINAL reproduces in this process state, and the ones that
+    reproduce it only because they were handed copies (#55).
 
     Runs exactly those nodes once more with nothing installed (the mutant's evaluation restored every
-    binding) and reads each pair of outcomes through ``engine.original_control_standing``. A control
-    that cannot run (a harness fault) voids nothing: absence of a control is not evidence of one.
+    binding) and reads each pair of outcomes through ``engine.original_control_standing``. A node the
+    original fails the same way is then run ONCE MORE on the authored objects, never twice in a
+    process: if it passes there, ``identity_standing`` says the test depends on object identity, its
+    arguments stay shared from now on and it is returned in the second set instead of being voided.
+    A control that cannot run (a harness fault) voids nothing: absence of a control is not evidence of
+    one.
     """
     from Wesker.engine import original_control_standing
+    from Wesker.pytest_runner import identity_standing
 
     nodes = list(dict.fromkeys(nodeid for nodeid, _ in failures))
     control = _ControlPlugin()
@@ -530,13 +561,31 @@ def _voided_by_control(failures: list[tuple[str, str]]) -> set[str]:
         _pytest_round(nodes, control)
     # BLE001: a control that cannot run is no control; the failures keep the verdict they had
     except Exception:  # noqa: BLE001
-        return set()
-    return {
+        return set(), set()
+    same = {
         nodeid
         for nodeid, reason in failures
         if original_control_standing(reason, control.reasons.get(nodeid))
         == "control_same"
     }
+    unmeasured = sorted(same - _MEASURED)
+    sensitive: set[str] = set()
+    if unmeasured:
+        _MEASURED.update(unmeasured)
+        on_authored = _AuthoredControlPlugin()
+        try:
+            _pytest_round(unmeasured, on_authored)
+        # BLE001: a measurement that cannot run measures nothing; the arguments keep their standing
+        except Exception:  # noqa: BLE001
+            return same, set()
+        for nodeid in unmeasured:
+            if (
+                identity_standing(nodeid not in on_authored.reasons, False)
+                == "identity_sensitive"
+            ):
+                _ARGUMENTS.mark_identity_sensitive(nodeid)
+                sensitive.add(nodeid)
+    return same - sensitive, sensitive
 
 
 def _apply_mem_limit(mem_limit_bytes: Any) -> bool:

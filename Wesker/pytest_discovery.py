@@ -270,16 +270,33 @@ def _bind_item(item: Any, fn: Callable[..., Any]) -> Callable[..., Any] | None:
 
     # Fresh arguments for every call (#55): `bound` holds the module-level parametrize objects, which a
     # mutant that writes into its argument would alter for every later call. Copied per call from a
-    # pristine snapshot; an argument that cannot be copied is named on `__wesker_shared_arguments__`.
+    # pristine snapshot; an argument that cannot be copied is named by `fresh.shared()`, read through `__wesker_fresh_arguments__`.
     from Wesker.pytest_runner import FreshArguments
 
     fresh = FreshArguments()
     fresh.capture(item)
 
     def run() -> None:
+        first_run = fresh.unmeasured(item)
         fresh.refresh(item)
         live = callspec.params
-        fn(**{p: live[p] for p in sig_params})
+        try:
+            fn(**{p: live[p] for p in sig_params})
+        except Exception:
+            if not first_run:
+                raise
+            # The first failure of an item handed copies: is it the copy's? (#55) Once, on the authored
+            # objects; a pass means the test depends on object identity and its arguments stay shared.
+            fresh.use_authored(item)
+            try:
+                fn(**{p: live[p] for p in sig_params})
+            except Exception:
+                fresh.mark_by_identity(item, False)
+                raise
+            fresh.mark_by_identity(item, True)
+        finally:
+            if first_run:
+                fresh.measured(item)
 
     run.__name__ = f"{getattr(fn, '__name__', 'test')}[{getattr(callspec, 'id', '')}]"
     # Honor the trace-cache identity contract `_make_item_callable` (the live-session path) already sets,
@@ -291,7 +308,7 @@ def _bind_item(item: Any, fn: Callable[..., Any]) -> Callable[..., Any] | None:
     # edit still invalidates the entry (and distinct tests still differ).
     run.__qualname__ = str(getattr(item, "nodeid", run.__name__))
     run.__wrapped__ = fn  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute] — functools.wraps sets it; not in the stub
-    run.__wesker_shared_arguments__ = tuple(fresh.shared())  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+    run.__wesker_fresh_arguments__ = fresh  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     return run
 
 

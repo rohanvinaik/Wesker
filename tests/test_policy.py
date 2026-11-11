@@ -59,8 +59,9 @@ from Wesker.policy import (
 # Wesker #55: the same policy-9 universe; every evaluation receives the test's arguments as authored
 # (fresh copies, either mode), and a failure the ORIGINAL reproduces in the same process state is the
 # unscored outcome original_also_fails, never a kill (categories and counts verified unchanged:
-# GOLDEN_FINGERPRINT holds). One-sign id 9.261d14e34119 -> 9.415d3755221e.
-GOLDEN_POLICY_ID = "9.415d3755221e"
+# GOLDEN_FINGERPRINT holds). One-sign id 9.261d14e34119 -> 9.415d3755221e -> 9.008828e5f6a9 (the copy is
+# a measured precondition: an argument the original fails on as a copy stays shared).
+GOLDEN_POLICY_ID = "9.008828e5f6a9"
 
 # The same fact, readable: the engine's target counts over the fingerprint
 # corpus. A failure here names the category and function that moved.
@@ -113,7 +114,8 @@ GOLDEN_FINGERPRINT = {
 # 9+neg.f5a15364c11d (integrated with W#27's loop budget and #105's write authority, both
 # observation texts the one-sign golden records) -> 9+neg.001902a9950c (W#55's fresh-argument and
 # original-control observation text) -> 9+neg.89326e7f549c (W#49: the stale wrapper's memory ends at
-# a test boundary; the one-sign id is unchanged by it).
+# a test boundary; the one-sign id is unchanged by it). The identity-sensitivity rule above then moved
+# both ids: two-sign 9+neg.89326e7f549c -> 9+neg.1a13fddd1d5f.
 GOLDEN_TWO_SIGN_OUTPUT = {
     "fp_annotations": 4,
     "fp_value": 3,

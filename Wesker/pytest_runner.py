@@ -52,6 +52,7 @@ from Wesker.write_authority import install as install_write_authority
 __all__ = [
     "FreshArguments",
     "argument_copy_standing",
+    "identity_standing",
     "run_in_session",
     "session_callables",
 ]
@@ -201,6 +202,28 @@ def argument_copy_standing(
     return "copy" if copy_equals else "identity_bearing"
 
 
+def identity_standing(authored_passes: bool, copy_passes: bool) -> str:
+    """Whether a test that gets COPIES of its arguments is the same test (#55, pure — pinned).
+
+    ``argument_copy_standing`` clears an argument when its copy compares EQUAL, and equal is not
+    identical: a test can assert ``lookup(k) is x`` against a module-level object, or write through
+    ``x`` and read the module-level name afterwards. Handed a copy, the ORIGINAL fails such a test, and
+    a healthy test would read as failing (inert, its kills lost). So copying is a measured precondition,
+    not an assumed one: the original is run on the authored objects and on the copies.
+
+      copy_ok             the original passes on the copies (whatever it does on the authored ones):
+                          the copies are harmless, hand them out.
+      identity_sensitive  it passes on the authored objects and FAILS on the copies: the test depends
+                          on the objects themselves. Its arguments stay shared, named, and the original
+                          control guards them.
+      fails_on_original   it fails on both: the test is failing on the original whatever it is handed.
+                          The baseline names it; the copies are not what failed it, and stay.
+    """
+    if copy_passes:
+        return "copy_ok"
+    return "identity_sensitive" if authored_passes else "fails_on_original"
+
+
 class FreshArguments:
     """Fresh test arguments for every evaluation (#55).
 
@@ -222,6 +245,13 @@ class FreshArguments:
     def __init__(self) -> None:
         self._pristine: dict[str, dict[str, Any]] = {}
         self._shared: dict[str, dict[str, str]] = {}
+        #: The authored objects themselves, by item: what an identity-sensitive test must be handed.
+        self._authored: dict[str, dict[str, Any]] = {}
+        #: Items whose copies have been measured against the original (`identity_standing`).
+        self._measured: set[str] = set()
+        #: Items already snapshotted: a second sight must never re-snapshot, even after an item stopped
+        #: being copied.
+        self._seen: set[str] = set()
 
     @staticmethod
     def _params(item: Any) -> dict[str, Any] | None:
@@ -235,8 +265,9 @@ class FreshArguments:
 
         key = str(getattr(item, "nodeid", ""))
         params = self._params(item)
-        if params is None or key in self._pristine:
+        if params is None or key in self._seen:
             return
+        self._seen.add(key)
         try:
             together: dict[str, Any] | None = copy.deepcopy(params)
         # BLE001: an arbitrary user object refuses copying in arbitrary ways; each is named below
@@ -267,6 +298,7 @@ class FreshArguments:
                 shared[name] = standing
         self._pristine[key] = pristine
         self._shared[key] = shared
+        self._authored[key] = {name: params[name] for name in pristine}
 
     def refresh(self, item: Any) -> None:
         """Replace this item's copyable parameters with a new deep copy of the pristine snapshot."""
@@ -277,6 +309,38 @@ class FreshArguments:
         if params is None or not pristine:
             return
         params.update(copy.deepcopy(pristine))
+
+    def unmeasured(self, item: Any) -> bool:
+        """True while this item hands out copies that no run of the original has yet been checked on."""
+        key = str(getattr(item, "nodeid", ""))
+        return bool(self._pristine.get(key)) and key not in self._measured
+
+    def measured(self, item: Any) -> None:
+        self._measured.add(str(getattr(item, "nodeid", "")))
+
+    def use_authored(self, item: Any) -> None:
+        """Put the AUTHORED objects back into this item's parameters (for the measurement run only)."""
+        params = self._params(item)
+        authored = self._authored.get(str(getattr(item, "nodeid", "")))
+        if params is not None and authored:
+            params.update(authored)
+
+    def mark_by_identity(self, item: Any, authored_passes: bool) -> bool:
+        """Settle an item whose copy run FAILED, given whether the authored run passed; True when the
+        item is identity-sensitive (its arguments are now shared and the authored run stands)."""
+        if identity_standing(authored_passes, False) == "identity_sensitive":
+            self.mark_identity_sensitive(str(getattr(item, "nodeid", "")))
+            return True
+        return False
+
+    def mark_identity_sensitive(self, nodeid: str) -> None:
+        """Stop copying this item's arguments: the original fails on a copy (:func:`identity_standing`)."""
+        pristine = self._pristine.pop(nodeid, None) or {}
+        self._authored.pop(nodeid, None)
+        self._measured.add(nodeid)
+        shared = self._shared.setdefault(nodeid, {})
+        for name in pristine:
+            shared[name] = "identity_sensitive"
 
     def shared(self) -> list[str]:
         """The arguments left shared, each named with its standing, sorted."""
@@ -432,9 +496,25 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
     ) -> None:
         _cap.last.pop(_item.nodeid, None)
         _status.value = "unobserved"
+        first_run = _fresh.unmeasured(_item)
         _fresh.refresh(_item)
         _reset(_item)
         reports = _rtp(_item, nextitem=None, log=False)
+        if first_run and any(r.failed for r in reports):
+            # The first failure of an item that is handed copies: is it the copy's? (#55) The first run
+            # of an item is the baseline's, the original's. Run it once on the AUTHORED objects; if
+            # that passes, the test depends on object identity and its arguments stay shared.
+            first_exc = _cap.last.get(_item.nodeid)
+            _fresh.use_authored(_item)
+            _cap.last.pop(_item.nodeid, None)
+            _reset(_item)
+            again = _rtp(_item, nextitem=None, log=False)
+            if _fresh.mark_by_identity(_item, not any(r.failed for r in again)):
+                reports = again
+            else:
+                _cap.last[_item.nodeid] = first_exc
+        if first_run:
+            _fresh.measured(_item)
         _status.value = _classify(reports)
         if not any(r.failed for r in reports):
             return
@@ -462,7 +542,7 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
     run.__qualname__ = str(getattr(item, "nodeid", name))
     run.__wesker_item_status__ = status  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     # The arguments left shared, named (#55): read by the profile, never silently absent.
-    run.__wesker_shared_arguments__ = tuple(fresh.shared())  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+    run.__wesker_fresh_arguments__ = fresh  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     if mod is not None:
         # inspect.getmodule() fallback in _patch_mutant_into_test keys off __module__.
         run.__module__ = getattr(mod, "__name__", run.__module__)

@@ -29,7 +29,9 @@ changed twice, so the policy id moved twice.
   Now, in both modes: (1) every evaluation, the original's and each mutant's, gets a fresh deep copy
   of the test's parametrize values (direct, indirect and fixture params) from a snapshot taken before
   any test body ran; an argument that cannot be copied stays shared and is named in the profile
-  (`shared_arguments`); (2) a test that fails under a mutant is re-run against the original in the
+  (`shared_arguments`), and so is an item whose test passes on the authored objects but fails on a copy
+  (it depends on object identity: `identity_sensitive`), measured on the original's first failure;
+  (2) a test that fails under a mutant is re-run against the original in the
   same process state, and a failure the original reproduces is the unscored outcome
   `original_also_fails`, never a kill and never a survivor. Both modes read one decision,
   `engine.original_control_standing`. The in-process control used to cover only the tests the mutant
@@ -49,9 +51,9 @@ Policy id: `8.dcc355186875` → `8.68a525594c46` → `8.51a0c2a545b5`; two-sign
 on the id, so rows recorded under an older observation rule are not reused.
 
 W#55 moves it again, on the policy-9 universe (categories and counts unchanged): `9.261d14e34119` →
-`9.415d3755221e`; two-sign `9+neg.f5a15364c11d` → `9+neg.001902a9950c`. Receipts and cached verdicts
-recorded under the old id are not reused. W#49 moves only the two-sign id, `9+neg.001902a9950c` →
-`9+neg.89326e7f549c`: its rule is a two-sign Form B operator's, so the one-sign id and its receipts stand.
+`9.415d3755221e` → `9.008828e5f6a9` (copies are a measured precondition, see above); two-sign
+`9+neg.f5a15364c11d` → `9+neg.001902a9950c` → `9+neg.89326e7f549c` (W#49) → `9+neg.1a13fddd1d5f`. Receipts and cached verdicts
+recorded under the old id are not reused. W#49 alone moves only the two-sign id: its rule is a two-sign Form B operator's, so the one-sign id and its receipts stand.
 
 ### The two-sign policy (μ⁻)
 

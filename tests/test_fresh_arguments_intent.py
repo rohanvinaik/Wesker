@@ -38,7 +38,11 @@ from types import SimpleNamespace
 import pytest
 
 from Wesker.engine import original_control_standing
-from Wesker.pytest_runner import FreshArguments, argument_copy_standing
+from Wesker.pytest_runner import (
+    FreshArguments,
+    argument_copy_standing,
+    identity_standing,
+)
 
 # ── the two pure decisions ──────────────────────────────────────────────────────────────────────
 
@@ -545,3 +549,131 @@ def test_an_uncopyable_parametrize_value_is_named_and_a_writer_still_cannot_forg
     for row in profile["rows"].values():
         if "max(1, 1)" in row["change"] and row["status"] == "killed":
             pytest.fail(f"a site no test can kill was killed: {row}")
+
+
+# ── a healthy test must never read as failing because it was handed a copy ──────────────────────
+#
+# `argument_copy_standing` clears an argument whose copy compares EQUAL, and equal is not identical.
+# A test can assert `lookup(k) is x` against a module-level object, or write through `x` and read the
+# module-level name. Handed a copy, the ORIGINAL fails it: a healthy test would read as failing, go
+# inert, and lose its kills (measured: 0 of 1, 0 of 1, 0 of 2 killed where 1, 1, 2 were before #55).
+# Copying is therefore a MEASURED precondition (`identity_standing`): an item's arguments are copies
+# only if the original passes on a copy; if it passes on the authored objects and fails on the copy,
+# they stay shared, named `identity_sensitive`, and the original control guards them.
+
+
+@pytest.mark.parametrize(
+    ("authored", "copy", "standing"),
+    [
+        (True, True, "copy_ok"),
+        (False, True, "copy_ok"),
+        (True, False, "identity_sensitive"),
+        (False, False, "fails_on_original"),
+    ],
+)
+def test_identity_standing_is_decided_by_the_original_on_both_kinds_of_argument(
+    authored, copy, standing
+):
+    assert identity_standing(authored, copy) == standing
+
+
+def test_an_identity_sensitive_item_is_handed_its_authored_objects_and_named():
+    shared = {"a": [1]}
+    item = _item("t.py::t[0]", x=shared)
+    fresh = FreshArguments()
+    fresh.capture(item)
+    assert fresh.unmeasured(item)
+    fresh.refresh(item)
+    assert item.callspec.params["x"] is not shared
+
+    fresh.use_authored(item)
+    assert item.callspec.params["x"] is shared
+
+    assert fresh.mark_by_identity(item, True) is True
+    fresh.measured(item)
+    item.callspec.params["x"] = object()
+    fresh.refresh(item)  # no pristine any more: nothing is replaced
+    assert not fresh.unmeasured(item)
+    assert fresh.shared() == ["t.py::t[0] :: x (identity_sensitive)"]
+    # A later sight of the item (the next evaluation's collection) never re-snapshots it.
+    fresh.capture(item)
+    assert fresh.shared() == ["t.py::t[0] :: x (identity_sensitive)"]
+
+
+def test_an_item_that_fails_on_the_authored_objects_too_keeps_its_copies():
+    item = _item("t.py::t[0]", x=[1])
+    fresh = FreshArguments()
+    fresh.capture(item)
+    assert fresh.mark_by_identity(item, False) is False
+    fresh.measured(item)
+    fresh.refresh(item)
+    assert fresh.shared() == []
+
+
+_IDENTITY = (
+    "SHARED = {'a': [1]}\n\n\ndef fetch():\n    return SHARED\n",
+    (
+        "import pytest\nfrom m import fetch, SHARED\n\n\n"
+        "@pytest.mark.parametrize('x', [SHARED])\n"
+        "def test_fetch(x):\n    assert fetch() is x\n"
+    ),
+    "fetch",
+)
+_CACHE = (
+    "CACHE = {'k': ['v']}\n\n\ndef lookup(k):\n    return CACHE[k]\n",
+    (
+        "import pytest\nfrom m import lookup, CACHE\n\n\n"
+        "@pytest.mark.parametrize('x', [CACHE['k']])\n"
+        "def test_lookup(x):\n    assert lookup('k') is x\n"
+    ),
+    "lookup",
+)
+_MUTATES = (
+    "REG = {'n': 0}\n\n\ndef count():\n    return REG['n']\n",
+    (
+        "import pytest\nfrom m import count, REG\n\n\n"
+        "@pytest.mark.parametrize('reg', [REG])\n"
+        "def test_count(reg):\n    reg['n'] = 5\n    assert count() == 5\n"
+    ),
+    "count",
+)
+
+
+@pytest.mark.parametrize("mode", ["in_process", "isolated"])
+@pytest.mark.parametrize(
+    ("fixture", "argument"),
+    [(_IDENTITY, "x"), (_CACHE, "x"), (_MUTATES, "reg")],
+    ids=[
+        "identity-against-a-module-object",
+        "module-level-cache",
+        "writes-through-the-parameter",
+    ],
+)
+def test_a_test_that_depends_on_object_identity_keeps_its_kills_and_is_named(
+    tmp_path, mode, fixture, argument
+):
+    source, tests, function = fixture
+    profile = _profile(tmp_path, source, tests, function, mode)
+
+    rows = profile["rows"].values()
+    assert rows
+    assert all(r["status"] == "killed" for r in rows), [
+        (r["change"], r["status"]) for r in rows
+    ]
+    assert profile["unscored_by"] == {}
+    assert [
+        e for e in profile["shared"] if f":: {argument} (identity_sensitive)" in e
+    ], profile["shared"]
+
+
+@pytest.mark.parametrize("mode", ["in_process", "isolated"])
+def test_an_ordinary_parameter_is_still_copied_and_the_55_results_are_unchanged(
+    tmp_path, mode
+):
+    profile = _profile(tmp_path, _REVISION, _REVISION_TESTS, "revision", mode)
+    assert profile["shared"] == []
+    table = _verdicts(profile)
+    assert table["tag = max(2, 2) → tag = 2"] == ["survivor"]
+    assert table["new = copy.deepcopy(written) → new = written"] == ["survivor"]
+    identical = [r for r in profile["rows"].values() if r["change"] == ""]
+    assert identical and all(r["status"] != "killed" for r in identical)

@@ -7598,17 +7598,18 @@ def original_control_standing(
 def _shared_arguments(test_functions: list[Callable[..., None]]) -> list[str]:
     """The test arguments no evaluation could be handed a fresh copy of, named (#55).
 
-    Read off the tag `pytest_runner._make_item_callable` and `pytest_discovery._bind_item` put on each
-    callable they build. A callable built elsewhere (an inline or legacy test) has no parametrized
-    arguments and carries no tag: nothing to name, which is not a claim that anything was copied.
+    Read off the `FreshArguments` that `pytest_runner._make_item_callable` and
+    `pytest_discovery._bind_item` attach to each callable they build, AFTER the baseline has run, so an
+    argument found identity-sensitive by that run is included. A callable built elsewhere (an inline or
+    legacy test) has no parametrized arguments and carries none: nothing to name, which is not a claim
+    that anything was copied.
     """
-    return sorted(
-        {
-            entry
-            for test in test_functions
-            for entry in getattr(test, "__wesker_shared_arguments__", ())
-        }
-    )
+    named: set[str] = set()
+    for test in test_functions:
+        fresh = getattr(test, "__wesker_fresh_arguments__", None)
+        if fresh is not None:
+            named.update(fresh.shared())
+    return sorted(named)
 
 
 def _outcome_on_original(

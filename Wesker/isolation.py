@@ -134,6 +134,14 @@ class IsolatedRun:
     #: state (the worker's original control). Non-empty only when nothing else failed the mutant: those
     #: failures detected nothing, so the engine names the mutant `original_also_fails`, never a kill.
     original_also_fails: tuple[str, ...] = ()
+    #: Detective #145 — the full-matrix scan: every node that failed under the mutant and whose failure
+    #: the original control did NOT reproduce, with that node's own kill reason, in run order. None when
+    #: the scan was not asked for (the worker then stops at the first value kill, so a list would be a
+    #: prefix of the relation, never the relation). `unresolved_nodes` are nodes whose cell the scan
+    #: could not settle (a loop budget stopped them, a write was prevented, a phase outside the call
+    #: failed): neither a kill nor a pass.
+    killers: tuple[tuple[str, str], ...] | None = None
+    unresolved_nodes: tuple[str, ...] = ()
 
     @property
     def outcome(self) -> str:
@@ -274,6 +282,24 @@ def classify_kill_reason(is_assertion: bool, is_declared_failure: bool) -> str:
     if is_declared_failure:
         return "exception"
     return "crash"
+
+
+def decided_kill_reason(reasons: list[str]) -> str:
+    """The reason that DECIDES a mutant's kill, from the surviving per-node reasons in run order
+    (Detective #145, pure — pinned).
+
+    A mutant's kill is decided at the FIRST value pin (an assertion or a declared exception): the
+    in-process loop returns there, and the worker's `shouldfail` stops its session there, so nothing
+    after it is run. Under the full-matrix scan the session does not stop, and a later node's reason
+    must not change what the same mutant reads without the scan. So: the first value pin in run order
+    decides; failing that a crash; ``""`` when nothing killed. When at most one value pin exists (every
+    run that stops at it) this equals `aggregate_kill_reason`; it differs only where the scan sees two,
+    and then it names the one the unscanned run would have named.
+    """
+    for reason in reasons:
+        if reason in ("assertion", "exception"):
+            return reason
+    return "crash" if "crash" in reasons else ""
 
 
 def aggregate_kill_reason(reasons: list[str]) -> str:
@@ -729,6 +755,7 @@ class IsolatedMutantWorker:
         timeout_s: float,
         node_ids: Sequence[str] | None = None,
         step_caps: dict[str, int] | None = None,
+        full_matrix: bool = False,
     ) -> IsolatedRun:
         """Evaluate ONE mutant on the reused worker. A hang kills the group and retires the worker.
 
@@ -744,6 +771,9 @@ class IsolatedMutantWorker:
         if step_caps:
             # W#27: per-node loop budgets, keyed by `isolated_selector_key`.
             spec["step_caps"] = dict(step_caps)
+        if full_matrix:
+            # Detective #145: run every node and report each failing node's own reason.
+            spec["full_matrix"] = True
         try:
             # Explicit checks, not `assert`s (see `open`): an assert vanishes under `python -O`.
             if self._proc.stdin is None or self._proc.stdout is None:
@@ -792,6 +822,12 @@ class IsolatedMutantWorker:
             original_also_fails=tuple(
                 str(n) for n in data.get("original_also_fails") or ()
             ),
+            killers=(
+                None
+                if data.get("killers") is None
+                else tuple((str(n), str(r)) for n, r in data["killers"])
+            ),
+            unresolved_nodes=tuple(str(n) for n in data.get("unresolved_nodes") or ()),
         )
 
     def _reap(self) -> bool:

@@ -34,7 +34,7 @@ from typing import Any
 
 import pytest
 
-from Wesker.isolation import aggregate_kill_reason, classify_kill_reason
+from Wesker.isolation import classify_kill_reason, decided_kill_reason
 from Wesker.mu_minus import begin_test
 from Wesker.pytest_runner import FreshArguments, _install_cheap_failure_repr
 from Wesker.write_authority import (
@@ -197,7 +197,11 @@ class _MutantPlugin(_FreshArgumentsPlugin):
         step_caps: dict[str, int] | None = None,
         project_root: str = "",
         write_roots: tuple[str, ...] = (),
+        full_matrix: bool = False,
     ) -> None:
+        #: Detective #145: run every node and keep each one's reason, instead of stopping the session
+        #: at the first value kill. The verdict is unchanged either way (`decided_kill_reason`).
+        self._full_matrix = full_matrix
         self._target_file = target_file
         #: The write roots the spawning live session declared (#105): its basetemp and pytest's
         #: per-user root, which also holds this worker's own per-mutant session directories.
@@ -220,6 +224,13 @@ class _MutantPlugin(_FreshArgumentsPlugin):
         #: Failures of a phase the call-phase ladder does not see (a fixture's setup, a teardown).
         #: They carry no reason; the control does not speak for them, so they keep their kill.
         self.other_failures = 0
+        #: The nodes those failures belong to: their cell is unresolved under a full-matrix scan.
+        self.other_failure_nodes: list[str] = []
+        #: What `ran` and `entered` read when each failing node's call ended (Detective #145). The
+        #: unscanned run stops at the first value kill, so the counts it reports are the ones as of that
+        #: node; a scan that goes on must report the same, or a later node could turn a `not_entered`
+        #: verdict into a scored one.
+        self.after_node: dict[str, tuple[int, bool]] = {}
         #: Nodes that reached their call phase, and every node collected, across the rounds of one
         #: evaluation (#55): a round that stops at a value failure the control voids is continued over
         #: the nodes it never ran, exactly as the in-process loop goes on to the next test.
@@ -257,6 +268,7 @@ class _MutantPlugin(_FreshArgumentsPlugin):
         self.done.add(str(getattr(report, "nodeid", "")))
         if getattr(report, "failed", False) and getattr(report, "when", "") != "call":
             self.other_failures += 1
+            self.other_failure_nodes.append(str(getattr(report, "nodeid", "")))
 
     def pytest_collection_finish(self, session: Any) -> None:
         """Compile after pytest establishes the actual package/import regime."""
@@ -360,12 +372,19 @@ class _MutantPlugin(_FreshArgumentsPlugin):
             self.memory_cut = True
             return
         self.node_reasons.append((getattr(item, "nodeid", ""), reason))
+        self.after_node[getattr(item, "nodeid", "")] = (
+            self.ran,
+            bool(getattr(self._mutated, "entered", False)),
+        )
         self.settle(set())
         # Like the in-process evaluator, stop once a value kill is established.
         # Otherwise a later slow test can time out the worker and erase the already
         # observed assertion. shouldfail ends pytest with TESTS_FAILED, preserving it.
+        # Not under the full-matrix scan (Detective #145): every node is asked, and the parent
+        # re-runs a mutant whose scan timed out without it, so the verdict stands either way.
         if (
-            reason in ("assertion", "exception")
+            not self._full_matrix
+            and reason in ("assertion", "exception")
             and getattr(item, "session", None) is not None
         ):
             item.session.shouldfail = "mutation distinguished by a value assertion"
@@ -381,11 +400,11 @@ class _MutantPlugin(_FreshArgumentsPlugin):
         for nodeid, reason in self.node_reasons:
             if nodeid in voided:
                 continue
-            previous = aggregate_kill_reason(self.reasons)
+            previous = decided_kill_reason(self.reasons)
             self.reasons.append(reason)
             if (
                 self.first_failing_node is None
-                or aggregate_kill_reason(self.reasons) != previous
+                or decided_kill_reason(self.reasons) != previous
             ):
                 self.first_failing_node = nodeid
 
@@ -422,6 +441,7 @@ def _evaluate_full(
     step_caps: dict[str, int] | None = None,
     project_root: str = "",
     write_roots: tuple[str, ...] = (),
+    full_matrix: bool = False,
 ) -> dict[str, Any]:
     """Run the node IDs against ONE mutant; return its verdict payload.
 
@@ -443,6 +463,7 @@ def _evaluate_full(
         step_caps,
         project_root,
         write_roots,
+        full_matrix,
     )
     rcs: list[int] = []
     voided: set[str] = set()
@@ -485,19 +506,28 @@ def _evaluate_full(
         ):
             break
     rc = next((code for code in rcs if code != 0), 0)
+    # As of the node that decided a value kill (Detective #145), where the unscanned run would have
+    # stopped; otherwise the run's end, which both runs share.
+    ran, entered = plugin.ran, bool(getattr(plugin._mutated, "entered", False))
+    if (
+        full_matrix
+        and decided_kill_reason(plugin.reasons) in ("assertion", "exception")
+        and plugin.first_failing_node in plugin.after_node
+    ):
+        ran, entered = plugin.after_node[plugin.first_failing_node]
     return {
         # W#27: a node whose loop budget stopped the mutant — the named non-kill `diverged`, read
         # by the engine BEFORE pytest's exit code (the stopped node reads as a failure there).
         "diverged": bool(plugin.diverged_nodes),
         "rc": int(rc),
-        "killed_by": aggregate_kill_reason(plugin.reasons) or None,
+        "killed_by": decided_kill_reason(plugin.reasons) or None,
         "constructed": plugin._mutated is not None,
         "test_name": plugin.first_failing_node,
         # Installation-and-entry proof (#18): the engine feeds these to `mutant_disposition` so an
         # installed-but-never-entered mutant scores `not_entered`, outside the denominator.
         "installed": plugin.installed,
-        "ran": plugin.ran,
-        "entered": bool(getattr(plugin._mutated, "entered", False)),
+        "ran": ran,
+        "entered": entered,
         # W#21: this mutant hit the worker's address-space cap — a budget CUT, not a kill.
         "memory_cut": plugin.memory_cut,
         # Detective #105: a node whose write was prevented, and what it was prevented from writing.
@@ -509,6 +539,25 @@ def _evaluate_full(
         "original_also_fails": (
             sorted(voided)
             if voided and not plugin.reasons and not plugin.other_failures
+            else []
+        ),
+        # Detective #145: under the full-matrix scan, every failing node the control did not void, with
+        # its own reason, and the nodes whose cell could not be settled. None when not asked: the
+        # unscanned run stops at the first value kill, so a list here would be a prefix.
+        "killers": (
+            [[n, r] for n, r in plugin.node_reasons if n not in voided]
+            if full_matrix
+            else None
+        ),
+        "unresolved_nodes": (
+            sorted(
+                {
+                    *plugin.diverged_nodes,
+                    *plugin.other_failure_nodes,
+                    *([plugin.write_blocked] if plugin.write_blocked else []),
+                }
+            )
+            if full_matrix
             else []
         ),
     }
@@ -717,6 +766,7 @@ def _serve() -> int:
             step_caps=spec.get("step_caps"),
             project_root=session["project_root"],
             write_roots=tuple(session.get("write_roots") or ()),
+            full_matrix=bool(spec.get("full_matrix")),
         )
         payload["enforced"] = enforced
         real_stdout.write(json.dumps(payload) + "\n")
@@ -754,6 +804,7 @@ def main() -> int:
         step_caps=spec.get("step_caps"),
         project_root=spec["project_root"],
         write_roots=tuple(spec.get("write_roots") or ()),
+        full_matrix=bool(spec.get("full_matrix")),
     )
     if payload["original_also_fails"] and not payload["killed_by"]:
         # The original reproduces every failure (#55): not a kill either. Same exit as a prevented write.

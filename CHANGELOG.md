@@ -10,6 +10,16 @@ changed twice, so the policy id moved twice.
 
 ### Correctness
 
+- **One profile run can carry the per-test kill relation.** `run_function_profiling(full_matrix=True)`
+  runs every test that reaches a mutant and returns, per killed mutant, every test that kills it with that
+  test's own kill reason (`ProfilingResult.kill_relation`; `kill_relation_standing` says whether it is
+  whole, and is `not_requested` when it was not asked for), in both execution modes: in-process through
+  `evaluate_mutant`'s scan, isolated through a worker that no longer stops at the first value kill. The
+  #55 original control still voids a node the original also fails, and a loop budget, a wall bound or a
+  refused measurement is an unresolved cell, never a kill. It adds a field and changes no verdict: every
+  mutant's killed / survived / unscored disposition and `killed_by` are what they are with it off, so
+  the policy id does not move. Default off, because it runs tests a first-killer run skips. Detective
+  paid for this relation by profiling once per test (audit 0.9 s to 3.6 s). (Detective D#145)
 - **A test exception never selects a second invocation.** The unpatched fallback called
   `test_fn(mutated_func)` and, on any `TypeError`, called `test_fn()` again, so a body that changed
   state and raised could run twice and read as a survivor. The calling convention is now chosen by

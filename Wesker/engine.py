@@ -212,6 +212,16 @@ class MutantResult:
     elapsed_ms: float = 0.0
     equivalent: bool = False
     killed_by_tests: list[str] = field(default_factory=list)
+    # --- the per-test kill relation of ONE mutant (full-matrix scan; Detective #145) -------------------
+    # Set only when every test in the mutant's scope was asked to run against it (`record_all_killers`).
+    # `killer_reasons` maps each test that killed it to THAT test's own reason (assertion / exception /
+    # crash); `killed_by` / `test_name` / `killed` are what they are without the scan, never recomputed
+    # from it. `unresolved_tests` are tests whose cell the scan could not settle (a loop budget, a wall,
+    # a refused measurement): neither a kill nor a pass. `killer_scan` says what the scan covered, by
+    # `killer_scan_standing`: "" when not asked, else "complete" / "cut" / "unresolved".
+    killer_reasons: dict[str, str] = field(default_factory=dict)
+    unresolved_tests: list[str] = field(default_factory=list)
+    killer_scan: str = ""
     # False when a timed-out worker could not be stopped — blocked outside the interpreter
     # (subprocess/socket/C-extension), where the async-exception injection cannot land (#14). The
     # kill still counts as a run-only timeout, but the measurement is UNCONTAINED: the runaway may
@@ -600,6 +610,17 @@ class ProfilingResult:
     proof_basis: tuple[tuple[str, str], ...] = ()
     per_category: list[CategoryResult] = field(default_factory=list)
     kill_matrix: dict[str, list[str]] = field(default_factory=dict)
+    #: THE PER-TEST KILL RELATION (Detective #145): ``mutant description -> {test id: that test's own
+    #: kill reason}`` for every scored killed mutant, EVERY test that kills it and not only the first.
+    #: `kill_matrix` credits each mutant to the first covering test that killed it, which is a fact
+    #: about execution order; this is a fact about the suite. Measured only when a caller asks for it
+    #: (``run_function_profiling(full_matrix=True)``), because it runs tests a first-killer run skips;
+    #: `kill_relation_standing` says whether it was asked for and whether it is whole, and an empty
+    #: dict is a claim ("nothing killed") ONLY under the standing "complete".
+    kill_relation: dict[str, dict[str, str]] = field(default_factory=dict)
+    #: "not_requested" (the default: no relation was measured), "complete", or the named reason it is
+    #: not whole (`kill_relation_standing`): "run_cut", "scan_incomplete", "row_missing".
+    kill_relation_standing: str = "not_requested"
     # The PROOF view of `line_coverage` (issue #17): the same map with the entries whose owner
     # cannot discharge an obligation removed — baseline-failing, truncated, or uncontained.
     #
@@ -897,6 +918,9 @@ class ProfilingResult:
         }
         if self.kill_matrix:
             d["kill_matrix"] = self.kill_matrix
+        if self.kill_relation_standing != "not_requested":
+            d["kill_relation"] = self.kill_relation
+            d["kill_relation_standing"] = self.kill_relation_standing
         # W#25: killed mutants this suite cannot tell apart, grouped for the reader — presentation
         # only, emitted when non-empty like the other record views, and never shrinking the universe.
         if self.empirical_redundancy_groups:
@@ -7036,6 +7060,96 @@ def _prepare_base_globals(original_func: Callable[..., Any] | None) -> dict[str,
     return dict(getattr(original_func, "__globals__", None) or {})
 
 
+_KILL_REASONS = ("assertion", "exception", "crash")
+
+
+def stronger_kill_reason(held: str | None, new: str) -> str:
+    """The stronger of two kill reasons one test earned (Detective #145, pure — pinned).
+
+    VALUE-SPECIFICATION PRECEDENCE: an assertion pins the return value, an exception is a declared
+    failure of the same strength, a crash only proves the run differed. ``held`` is what the test was
+    already credited (None when nothing), ``new`` a later reason for the same test id; the stronger
+    stands, and a reason outside the vocabulary never displaces one inside it.
+    """
+    order = {reason: rank for rank, reason in enumerate(_KILL_REASONS)}
+    if new not in order:
+        return held if held is not None else new
+    if held is None or held not in order:
+        return new
+    return held if order[held] <= order[new] else new
+
+
+def killer_scan_standing(tests_total: int, tests_scanned: int, unresolved: int) -> str:
+    """What one mutant's full-matrix scan covered (Detective #145, pure — pinned).
+
+      "complete"    every test in its scope ran against it and every cell is a kill or a pass.
+      "cut"         its allowance ran out before every test ran: the unrun cells are unknown.
+      "unresolved"  every test ran, but some cell is neither a kill nor a pass (a loop budget, a wall
+                    bound, a refused measurement), so the row may be missing a killer.
+
+    A test the ORIGINAL also fails on is not unresolved: it is determinately no killer.
+    """
+    if tests_scanned < tests_total:
+        return "cut"
+    if unresolved > 0:
+        return "unresolved"
+    return "complete"
+
+
+def note_scan_cell(
+    reasons: dict[str, str],
+    unresolved: list[str],
+    test_id: str,
+    outcome: str | None,
+    refused: bool,
+) -> None:
+    """Record one test's cell of a mutant's scan (Detective #145).
+
+    ``outcome`` is what the test did against the mutant after the original control: a kill reason, None
+    (it passed, or the original reproduced its failure: determinately no killer), or an unresolved
+    outcome. ``refused`` is True when the measurement itself was refused (a nested measurement, a
+    prevented write), which `outcome` no longer shows.
+    """
+    if refused or outcome in ("diverged", "undetermined", "timeout"):
+        unresolved.append(test_id)
+    elif outcome in _KILL_REASONS:
+        reasons[test_id] = stronger_kill_reason(reasons.get(test_id), outcome)
+
+
+def kill_relation_standing(
+    requested: bool,
+    run_cut: bool,
+    killed_mutants: int,
+    mutants_with_row: int,
+    incomplete_scans: int,
+) -> str:
+    """Whether a profile's per-test kill relation may be claimed, and if not, why (Detective #145,
+    pure — pinned).
+
+      "not_requested"    the full-matrix scan was not asked for: there is NO relation, and an empty
+                         one must not be read as "no test kills anything".
+      "run_cut"          the run stopped short (budget, memory, an uncontained worker): mutants after
+                         the cut were never scanned.
+      "scan_incomplete"  some killed mutant's scan did not cover every test or left a cell unresolved
+                         (a loop budget, a wall bound, a refused measurement).
+      "row_missing"      a killed mutant has no killer in its row (a kill that no scanned test
+                         reproduces, e.g. a failure outside every test's call phase).
+      "complete"         every scored killed mutant has a row and every scan covered its scope.
+
+    A mutant with no verdict (diverged, undetermined, refused, original_also_fails, not_entered) is
+    not killed and contributes no row; it is named by the profile's unscored records as before.
+    """
+    if not requested:
+        return "not_requested"
+    if run_cut:
+        return "run_cut"
+    if incomplete_scans > 0:
+        return "scan_incomplete"
+    if mutants_with_row < killed_mutants:
+        return "row_missing"
+    return "complete"
+
+
 def first_refusal(
     refusal: str, refused_test: str | None, code: str, test_id: str
 ) -> tuple[str, str | None]:
@@ -7211,8 +7325,12 @@ def evaluate_mutant(
     )
     try:
         # Run tests against mutated function
-        killers: list[str] = []
-        reasons: list[str] = []
+        # Full-matrix scan (record_all_killers): each test's own cell, kept apart from the verdict below.
+        # The verdict follows the same state machine with the scan on or off (`decided` freezes it at
+        # the first value kill instead of returning), so the scan only ADDS the relation.
+        scan_reasons: dict[str, str] = {}
+        scan_unresolved: list[str] = []
+        decided: dict[str, Any] | None = None
         first_reason: str | None = (
             None  # provisional crash/timeout kill (no assertion yet)
         )
@@ -7243,8 +7361,8 @@ def evaluate_mutant(
         for test_fn in test_functions:
             remaining_ms = timeout_ms - _elapsed(allowance_t0)
             if remaining_ms <= 0:
-                if record_all_killers and killers:
-                    break  # budget hit — keep the killers already collected
+                if decided is not None:
+                    break  # budget hit after the verdict — keep the cells already collected
                 if first_reason is not None and first_reason not in (
                     "undetermined",
                     "timeout",
@@ -7392,7 +7510,8 @@ def evaluate_mutant(
 
                         uncontained_test = callable_test_id(test_fn)
                     result = "undetermined"
-                if result in ("nested_measurement", WRITE_OUTSIDE_AUTHORITY):
+                refused_cell = result in ("nested_measurement", WRITE_OUTSIDE_AUTHORITY)
+                if refused_cell:
                     # NOT A KILL REASON (#28): the test runs the engine and its nested measurement
                     # was refused before it could wait for the lock this evaluation holds. Whatever
                     # the test did after that — fail on the refusal, swallow it, pass — says nothing
@@ -7473,35 +7592,32 @@ def evaluate_mutant(
                     from Wesker.ci import callable_test_id
 
                     tname = callable_test_id(test_fn)
-                    if record_all_killers:
-                        if result in ("assertion", "exception", "crash"):
-                            killers.append(tname)
-                            reasons.append(result)
-                            if first_reason is None:
-                                first_reason = result
-                        elif first_reason is None:
-                            first_reason = (
-                                "diverged" if result == "diverged" else "undetermined"
-                            )
+                    if decided is not None:
+                        pass  # the verdict is settled; this test only adds its cell (below)
                     elif result in ("assertion", "exception"):
                         # Strongest verdict: the value is pinned — stop here. An exception
                         # kill is the same strength as an assertion: both are a test stating
                         # what the function does and the mutant contradicting it. Scanning on
                         # for a "better" kill would find none, and treating it as provisional
                         # would let a later crash-kill overwrite a real pin.
-                        return MutantResult(
-                            mutant=mutant,
-                            killed=True,
-                            killed_by=result,
-                            test_name=tname,
-                            contained=not saw_uncontained,
-                            uncontained_test=uncontained_test,
-                            entered=(
+                        verdict: dict[str, Any] = {
+                            "killed": True,
+                            "killed_by": result,
+                            "test_name": tname,
+                            "entered": (
                                 getattr(mutated_obj, "entered", None) if ran else None
                             ),
-                            tests_run=ran,
-                            elapsed_ms=_elapsed(start),
-                        )
+                            "tests_run": ran,
+                        }
+                        if not record_all_killers:
+                            return MutantResult(
+                                mutant=mutant,
+                                contained=not saw_uncontained,
+                                uncontained_test=uncontained_test,
+                                elapsed_ms=_elapsed(start),
+                                **verdict,
+                            )
+                        decided = verdict
                     elif result == "crash":
                         first_reason, first_killer = result, tname
                     elif result == "diverged":
@@ -7512,27 +7628,40 @@ def evaluate_mutant(
                             first_reason, first_killer = result, tname
                     elif result in ("undetermined", "timeout") and first_reason is None:
                         first_reason, first_killer = "undetermined", tname
+                if record_all_killers:
+                    from Wesker.ci import callable_test_id
+
+                    note_scan_cell(
+                        scan_reasons,
+                        scan_unresolved,
+                        callable_test_id(test_fn),
+                        result,
+                        refused_cell,
+                    )
             finally:
                 _unpatch_mutant(_proof, patched, saved, patch_target, func_name)
 
-        if record_all_killers and killers:
+        # The relation this evaluation measured, beside (never inside) the verdict below (Detective #145).
+        scan: dict[str, Any] = (
+            {
+                "killed_by_tests": list(scan_reasons),
+                "killer_reasons": dict(scan_reasons),
+                "unresolved_tests": list(scan_unresolved),
+                "killer_scan": killer_scan_standing(
+                    len(test_functions), ran, len(scan_unresolved)
+                ),
+            }
+            if record_all_killers
+            else {}
+        )
+        if decided is not None:
             return MutantResult(
                 mutant=mutant,
-                killed=True,
-                killed_by=(
-                    "assertion"
-                    if "assertion" in reasons
-                    else "exception"
-                    if "exception" in reasons
-                    else "crash"
-                ),
-                test_name=killers[0],
-                killed_by_tests=killers,
                 contained=not saw_uncontained,
                 uncontained_test=uncontained_test,
-                entered=(getattr(mutated_obj, "entered", None) if ran else None),
-                tests_run=ran,
                 elapsed_ms=_elapsed(start),
+                **decided,
+                **scan,
             )
         if first_reason is not None:
             # Deterministic SICP: crash kills count as kills; divergence and undetermined
@@ -7548,6 +7677,7 @@ def evaluate_mutant(
                 entered=(getattr(mutated_obj, "entered", None) if ran else None),
                 tests_run=ran,
                 elapsed_ms=_elapsed(start),
+                **scan,
             )
         # THE survivor return, and the one #18 exists for: "no test detected this" and "no test
         # ever called this" are the same silence here, and only `entered` tells them apart.
@@ -7568,6 +7698,7 @@ def evaluate_mutant(
             refused_test=refused_test,
             blocked_writes=refused_writes,
             elapsed_ms=_elapsed(start),
+            **scan,
         )
     finally:
         for _mod, _orig in module_saved:
@@ -8423,8 +8554,27 @@ _ISOLATED_WORKER_RECYCLE = 100
 _ISOLATED_MIN_TIMEOUT_S = 10.0
 
 
+def _isolated_scan(full_matrix: bool, run: IsolatedRun) -> dict[str, Any]:
+    """The relation an isolated full-matrix scan measured, as MutantResult fields (Detective #145).
+
+    Empty when the scan was not asked for. A scan that was asked for but did not come back (the
+    unscanned re-run that follows a timeout or a memory cut) is ``killer_scan="cut"``: no row, and a
+    named reason there is none, never an empty row that reads as "no test kills it".
+    """
+    if not full_matrix:
+        return {}
+    if run.killers is None:
+        return {"killer_scan": "cut"}
+    return {
+        "killed_by_tests": [n for n, _ in run.killers],
+        "killer_reasons": dict(run.killers),
+        "unresolved_tests": list(run.unresolved_nodes),
+        "killer_scan": killer_scan_standing(1, 1, len(run.unresolved_nodes)),
+    }
+
+
 def _isolated_result(
-    mutant: Mutant, run: IsolatedRun, elapsed_ms: float
+    mutant: Mutant, run: IsolatedRun, elapsed_ms: float, full_matrix: bool = False
 ) -> MutantResult:
     """One isolated worker verdict -> a MutantResult with the SAME inputs the in-process path feeds
     `mutant_disposition` (#18/#19).
@@ -8520,6 +8670,7 @@ def _isolated_result(
             installed=run.installed,
             entered=entered,
             elapsed_ms=elapsed_ms,
+            **_isolated_scan(full_matrix, run),
         )
     return MutantResult(
         mutant=mutant,
@@ -8528,6 +8679,7 @@ def _isolated_result(
         installed=run.installed,
         entered=entered,
         elapsed_ms=elapsed_ms,
+        **_isolated_scan(full_matrix, run),
     )
 
 
@@ -8577,6 +8729,34 @@ def _isolated_step_caps(
     return caps, cost_ms
 
 
+def _named_run(
+    run: IsolatedRun,
+    identities: dict[str, str],
+    selector_key: Callable[[str], str],
+) -> IsolatedRun:
+    """The worker's node ids in the kill vocabulary: every test a run names, by `callable_test_id`
+    (Detective #145 adds the scan's killers and unresolved nodes to the first-failing node and the
+    nodes the original control voided)."""
+    from dataclasses import replace
+
+    def named(node: str) -> str:
+        return identities.get(selector_key(node), node)
+
+    if run.test_name:
+        run = replace(run, test_name=named(run.test_name))
+    if run.original_also_fails:
+        run = replace(
+            run, original_also_fails=tuple(named(n) for n in run.original_also_fails)
+        )
+    if run.killers is not None:
+        run = replace(
+            run,
+            killers=tuple((named(n), r) for n, r in run.killers),
+            unresolved_nodes=tuple(named(n) for n in run.unresolved_nodes),
+        )
+    return run
+
+
 def _evaluate_isolated(
     worker: IsolatedMutantWorker | None,
     mutant: Mutant,
@@ -8585,6 +8765,7 @@ def _evaluate_isolated(
     per_mutant_timeout_ms: float,
     step_plan: StepPlan | None = None,
     original_func: Any = None,
+    full_matrix: bool = False,
 ) -> tuple[MutantResult, IsolatedMutantWorker | None, IsolatedRun | None]:
     """Evaluate one mutant in a killable isolated worker, recycling the worker when spent (#19).
 
@@ -8602,8 +8783,6 @@ def _evaluate_isolated(
     the hang bound instead; `select` returns the instant the worker answers, so the generous floor
     costs a normal mutant nothing and only bounds a true runaway.
     """
-    from dataclasses import replace
-
     from Wesker.ci import callable_node_id, callable_origin, callable_test_id
     from Wesker.isolation import isolated_selector_key, isolated_test_selection
 
@@ -8660,23 +8839,30 @@ def _evaluate_isolated(
     t0 = time.monotonic()
     try:
         run = worker.evaluate(
-            source, timeout_s, node_ids=node_ids, step_caps=step_caps or None
+            source,
+            timeout_s,
+            node_ids=node_ids,
+            step_caps=step_caps or None,
+            full_matrix=full_matrix,
         )
+        if full_matrix and (run.timed_out or run.memory_cut):
+            # The scan runs nodes the unscanned run stops before, and one of them hung or hit the
+            # memory cap: that must not replace a verdict the unscanned run reaches (Detective #145).
+            # Measure the mutant the way it is measured without the scan, on a fresh worker if the hang
+            # retired this one; the relation is then not claimed for it (`killer_scan="cut"`).
+            if not worker.alive:
+                worker.close()
+                worker = IsolatedMutantWorker(
+                    root, [], target, qualname, mem_limit_bytes=mem_limit
+                )
+            run = worker.evaluate(
+                source, timeout_s, node_ids=node_ids, step_caps=step_caps or None
+            )
     except BaseException:
         worker.close()
         raise
-    if run.test_name:
-        run = replace(
-            run, test_name=identities.get(selector_key(run.test_name), run.test_name)
-        )
-    if run.original_also_fails:
-        run = replace(
-            run,
-            original_also_fails=tuple(
-                identities.get(selector_key(n), n) for n in run.original_also_fails
-            ),
-        )
-    return _isolated_result(mutant, run, _elapsed(t0)), worker, run
+    run = _named_run(run, identities, selector_key)
+    return _isolated_result(mutant, run, _elapsed(t0), full_matrix), worker, run
 
 
 def next_routing_action(
@@ -8772,6 +8958,98 @@ def _measurement_boundary(fn):
     return _wrapped
 
 
+def _note_relation_row(
+    mutant: Mutant,
+    result: MutantResult,
+    scoped: list[Callable[..., None]],
+    rows: dict[str, dict[str, str]],
+    incomplete: set[str],
+    seen: dict[str, set[str]],
+    mutants: dict[str, Mutant],
+) -> None:
+    """Keep one scored killed mutant's row of the per-test relation (Detective #145).
+
+    The row is what the scan measured, never reconstructed from the first-killer credit; a scan that
+    was not whole (`killer_scan` other than "complete") is remembered, and the test ids the mutant was
+    evaluated against, so the widen can complete the row over tests it traces later.
+    """
+    from Wesker.ci import callable_test_id
+
+    description = mutant.description
+    rows[description] = dict(result.killer_reasons)
+    mutants[description] = mutant
+    seen[description] = {callable_test_id(t) for t in scoped}
+    if result.killer_scan != "complete" or not result.killer_reasons:
+        incomplete.add(description)
+
+
+def _complete_relation_rows(
+    rows: dict[str, dict[str, str]],
+    incomplete: set[str],
+    seen: dict[str, set[str]],
+    mutants: dict[str, Mutant],
+    tests_for: Callable[[Mutant], list[Callable[..., None]]],
+    original_func: Callable[..., Any] | None,
+    qualname: str | None,
+    source_path: str | None,
+    step_plan: StepPlan | None,
+    baseline_ms: float | None,
+    per_mutant_timeout_ms: float,
+    budget_ms: float | None,
+    start: float,
+    uncontained_results: list[MutantResult],
+) -> tuple[bool, bool]:
+    """Scan each killed mutant against the tests the widen put in scope after it was evaluated.
+
+    Returns ``(all_contained, budget_exhausted)`` for the profile. A mutant killed by the seed and
+    reached by a widened test gets that test's cell; a mutant whose scope did not grow is untouched.
+    The verdict of a mutant is never revisited here, only its row.
+    """
+    from Wesker.ci import callable_test_id
+
+    all_contained = True
+    for description in sorted(rows):
+        mutant = mutants[description]
+        extra = [
+            t for t in tests_for(mutant) if callable_test_id(t) not in seen[description]
+        ]
+        if not extra:
+            continue
+        if budget_ms is not None and _elapsed(start) > budget_ms:
+            return all_contained, True
+        remaining = (
+            budget_ms - _elapsed(start)
+            if budget_ms is not None
+            else per_mutant_timeout_ms
+        )
+        res = evaluate_mutant(
+            mutant,
+            extra,
+            original_func,
+            timeout_ms=_adaptive_allowance(
+                baseline_ms, per_mutant_timeout_ms, remaining
+            ),
+            qualname=qualname,
+            source_path=source_path,
+            step_plan=step_plan,
+            liveness_ceiling_ms=remaining,
+            record_all_killers=True,
+        )
+        if not res.contained:
+            all_contained = False
+            uncontained_results.append(res)
+        for test_id, reason in res.killer_reasons.items():
+            rows[description][test_id] = stronger_kill_reason(
+                rows[description].get(test_id), reason
+            )
+        seen[description] |= {callable_test_id(t) for t in extra}
+        if res.killer_scan != "complete":
+            incomplete.add(description)
+        if not all_contained:
+            break
+    return all_contained, False
+
+
 @_measurement_boundary
 def run_function_profiling(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -8801,6 +9079,7 @@ def run_function_profiling(
     is_pure: bool = False,
     widen_tests: list[Callable[..., None]] | None = None,
     observed_return_types: frozenset[str] | None = None,
+    full_matrix: bool = False,
 ) -> ProfilingResult:
     """Profiling mode — generate mutants (exhaustive by default), evaluate with budget.
 
@@ -8827,6 +9106,12 @@ def run_function_profiling(
             speedup, since a test that never runs the mutated line behaves identically under
             the mutation. False evaluates every mutant against the full set (the A/B baseline
             for verifying the scoping is bit-identical).
+        full_matrix: When True, every test that reaches a mutant is run against it and the result
+            carries ``kill_relation``: for each killed mutant EVERY test that kills it, with that
+            test's own kill reason (Detective #145). Default False, because it runs tests a
+            first-killer run skips. It adds a field and changes no verdict: each mutant's killed /
+            survived / unscored disposition and its ``killed_by`` are what they are with it off, in
+            both execution modes.
     """
     start = time.monotonic()
     # Reuse a caller's already-generated mutant list when given (an adaptive probe generates
@@ -8983,6 +9268,13 @@ def run_function_profiling(
 
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
     kill_matrix: dict[str, list[str]] = {}
+    # The per-test relation (Detective #145), kept only under `full_matrix`: each scored killed mutant's
+    # row, the mutants whose scan was not whole, the test ids each was evaluated against (so the widen
+    # can complete a row for tests it traced later), and the mutant objects to do that with.
+    relation_rows: dict[str, dict[str, str]] = {}
+    relation_incomplete: set[str] = set()
+    relation_seen: dict[str, set[str]] = {}
+    relation_mutants: dict[str, Mutant] = {}
     survivor_records: list[dict] = []
     killed_records: list[dict] = []
     # Which mutants `unscored_by` counts, and why (#28).
@@ -9074,6 +9366,7 @@ def run_function_profiling(
                     per_mutant_timeout_ms,
                     step_plan,
                     original_func,
+                    full_matrix,
                 )
                 if _iso_run is not None:
                     _mem_cut = _mem_cut or _iso_run.memory_cut
@@ -9089,6 +9382,7 @@ def run_function_profiling(
                         source_path=source_path,
                         step_plan=step_plan,
                         liveness_ceiling_ms=remaining_ms,
+                        record_all_killers=full_matrix,
                     )
             except Exception as exc:
                 # ONE EXCEPTION to "one bad mutant must never abort the run", and it is not a mutant
@@ -9192,6 +9486,16 @@ def run_function_profiling(
                 if result.test_name:
                     kill_matrix.setdefault(mutant.description, []).append(
                         result.test_name
+                    )
+                if full_matrix:
+                    _note_relation_row(
+                        mutant,
+                        result,
+                        _scoped,
+                        relation_rows,
+                        relation_incomplete,
+                        relation_seen,
+                        relation_mutants,
                     )
                 # Carry diff_summary on EVERY kill: a crash/timeout kill is a value-survivor
                 # (see ProfilingResult.value_survivor_records) and needs the diff for a
@@ -9367,6 +9671,7 @@ def run_function_profiling(
                 source_path=source_path,
                 step_plan=step_plan,
                 liveness_ceiling_ms=_remaining_ms,
+                record_all_killers=full_matrix,
             )
             if not _res.contained:
                 all_contained = False
@@ -9452,6 +9757,16 @@ def run_function_profiling(
             ]
             if _res.test_name:
                 kill_matrix.setdefault(_mutant.description, []).append(_res.test_name)
+            if full_matrix:
+                _note_relation_row(
+                    _mutant,
+                    _res,
+                    _tests_for(_mutant),
+                    relation_rows,
+                    relation_incomplete,
+                    relation_seen,
+                    relation_mutants,
+                )
             killed_records.append(
                 {
                     "mutant_id": _mutant.mutant_id,
@@ -9466,6 +9781,28 @@ def run_function_profiling(
                     "elapsed_ms": round(_res.elapsed_ms, 1),
                 }
             )
+
+    # The widen traced tests the main loop never saw. A mutant it killed from the seed was evaluated
+    # against the seed only, so its row would miss a widened test that also kills it: complete each row
+    # over the tests now in scope (Detective #145), so the relation is the one a full run over the
+    # traced set measures. A no-op when nothing was traced, and never run on a cut or uncontained run.
+    if full_matrix and not isolated and not budget_exhausted and all_contained:
+        all_contained, budget_exhausted = _complete_relation_rows(
+            relation_rows,
+            relation_incomplete,
+            relation_seen,
+            relation_mutants,
+            _tests_for,
+            original_func,
+            qualname,
+            source_path,
+            step_plan,
+            baseline_ms,
+            per_mutant_timeout_ms,
+            budget_ms,
+            start,
+            _uncontained_results,
+        )
 
     # Persist the widen's observations ONCE, here — not once per micro-batch. Each per-step save
     # rewrote the whole cache (json.dump + fsync): ~96 ms at 1,600 cells, ~5 minutes of a 42-minute
@@ -9629,6 +9966,19 @@ def run_function_profiling(
         survival_rate=survived / total if total > 0 else 0.0,
         per_category=per_cat,
         kill_matrix=kill_matrix,
+        kill_relation={
+            mutant: dict(sorted(relation_rows[mutant].items()))
+            for mutant in sorted(relation_rows)
+        }
+        if full_matrix
+        else {},
+        kill_relation_standing=kill_relation_standing(
+            full_matrix,
+            budget_exhausted or not all_contained or bool(_baseline_uncontained),
+            len({record["mutant"] for record in killed_records}),
+            len(relation_rows),
+            len(relation_incomplete),
+        ),
         survivor_records=survivor_records,
         killed_records=killed_records,
         unscored_records=unscored_records,

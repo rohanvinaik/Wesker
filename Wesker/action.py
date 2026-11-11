@@ -28,6 +28,8 @@ that the selection is optimal, not a claim about anyone's tests.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import gc
 import io
 import json
 import os
@@ -40,6 +42,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from typing import IO
 
 _DETECTIVE_PKG = "detective-spec"
 
@@ -378,6 +381,20 @@ def _annotate(report: dict) -> None:
 # ── Entry point ──────────────────────────────────────────────────
 
 
+# The process-global marker the outermost Action sets for as long as it owns the streams (W#52): its pid.
+# It is read with `stack_dump_owner`, the same pure decision the stall dump reads, but is a DIFFERENT
+# variable: the dump's marker exists only when a dump is armed, and a nested Action must find the stream
+# owner whether or not one is.
+_STREAM_OWNER_ENV = "WESKER_STREAM_OWNER"
+
+
+def _is_nested() -> bool:
+    """Whether an Action in THIS process already owns the streams (reads the marker; sets nothing)."""
+    return (
+        stack_dump_owner(os.environ.get(_STREAM_OWNER_ENV, ""), os.getpid()) == "nested"
+    )
+
+
 def _stream_reentry() -> Callable[[], None]:
     """Snapshot the REAL stdout/stderr fds; return the hand that re-enters them.
 
@@ -387,13 +404,20 @@ def _stream_reentry() -> Callable[[], None]:
     restores the function, not the file descriptor. Measured (2026-08-05,
     the first whole-codebase run after DATAFLOW grew that universe): the
     badge run completed its measurement and then died at the first
-    ``::warning`` annotation with EBADF, taking the report down with it.
+    ``::warning`` annotation with EBADF — taking the report down with it.
     Same belt-and-braces as ``ci._body`` re-entering the streams around the
     baseline, one layer up: the MEASUREMENT may fight hostile mutants — the
-    REPORT must not. Per-file progress lines during the run stay best-effort;
-    the GitHub-protocol lines (annotations, outputs, summary, banner) are the
-    contract and are written only after re-entry.
+    REPORT must not. Per-file progress lines during the run go through a private
+    descriptor (`_open_progress`); the GitHub-protocol lines (annotations, outputs,
+    summary, banner) are the contract and are written only after re-entry.
+
+    A NESTED Action (W#52) — a test of the Action run by the measurement inside the measuring
+    process — owns no streams: it snapshots nothing and re-enters nothing, so its output lands where
+    the calling test's capture put it, and a mutant of this very code cannot touch the descriptors the
+    measuring process reports through. The hand it returns does nothing.
     """
+    if _is_nested():
+        return lambda: None
     saved_out, saved_err = os.dup(1), os.dup(2)
 
     def reenter() -> None:
@@ -409,8 +433,25 @@ def _stream_reentry() -> Callable[[], None]:
         sys.stderr = io.TextIOWrapper(
             io.FileIO(2, "w", closefd=False), line_buffering=True
         )
+        # W#52: rebinding drops the previous wrappers, and one a mutant built with `closefd=True`
+        # closes the descriptor it wraps when it is collected, which is the one just restored. Let
+        # every dropped wrapper die, then restore again: the descriptors the report speaks through
+        # are the ones in place AFTER the last finalizer has run.
+        gc.collect()
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
 
     return reenter
+
+
+def _open_progress() -> IO[str]:
+    """A line-buffered text stream on a PRIVATE duplicate of the real stdout, made before profiling (W#52).
+
+    The measuring process's per-file progress is written here, never through ``sys.stdout`` or fd 1:
+    a nested Action, or a mutant of the stream code, can close or redirect those, and the run then
+    dies on its next ``[3/24]`` line. The duplicate is not a name the code under measurement uses.
+    """
+    return os.fdopen(os.dup(1), "w", buffering=1, encoding="utf-8", errors="replace")
 
 
 def _profile_live(
@@ -425,8 +466,15 @@ def _profile_live(
     other outcome is the report's, as before, including None for no live session.
     """
     lost_worker = worker_lost_types()
+    nested = _is_nested()
     reenter_streams = _stream_reentry()
     cancel_stack_dump = _stack_dump_from_env()
+    # An owner reports progress through its private duplicate and publishes the marker that makes every
+    # Action inside the measurement nested (W#52); a nested one does neither.
+    progress = None if nested else _open_progress()
+    kwargs = {} if progress is None else {"progress": progress}
+    if not nested:
+        os.environ[_STREAM_OWNER_ENV] = str(os.getpid())
     try:
         return (
             profile_codebase_live(
@@ -436,6 +484,7 @@ def _profile_live(
                 max_per_category=config.get("max_per_category"),
                 passes=config.get("convergence_passes", 1),
                 verbose=True,
+                **kwargs,
             ),
             "",
         )
@@ -443,10 +492,16 @@ def _profile_live(
         return None, worker_lost_reason(lost)
     finally:
         cancel_stack_dump()
+        if not nested:
+            os.environ.pop(_STREAM_OWNER_ENV, None)
         # Everything from here down is the REPORT — gates, SARIF, annotations,
         # outputs, summary, banner — and must not inherit a corpse fd from a
         # hostile mutant of the capture machinery.
         reenter_streams()
+        if progress is not None:
+            # closing the private progress stream must never cost the report that follows
+            with contextlib.suppress(Exception):
+                progress.close()
 
 
 def worker_lost_types() -> tuple[type[BaseException], ...]:

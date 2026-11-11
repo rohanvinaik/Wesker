@@ -30,7 +30,7 @@ import unittest
 from collections.abc import Callable, Iterable
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from Wesker.engine import (
     run_function_converged,
@@ -2179,6 +2179,7 @@ def profile_codebase(
     verbose: bool = True,
     isolated: bool = False,
     worker_mem_limit_mb: int | None = None,
+    progress: IO[str] | None = None,
 ) -> dict:
     """Profile all functions across multiple files with multi-pass convergence.
 
@@ -2198,12 +2199,26 @@ def profile_codebase(
             reaches full DOF coverage, so extra passes deepen WITHIN covered
             dimensions (a second mutant per dimension, a third, …) rather than
             reaching new ones — they buy kill evidence, not coverage.
+        progress: where the per-file progress lines go (W#52). ``None`` is ``sys.stdout`` as it
+            stands at each line. A caller that measures code able to close or redirect fd 1 and
+            ``sys.stdout`` (the Action, measuring Wesker with Wesker's own tests) passes a stream on a
+            descriptor it duplicated BEFORE profiling, so the run's own output survives whatever the
+            measured code does to the process's streams.
     """
+
+    def say(text: str = "", end: str = "\n") -> None:
+        # Progress is best-effort and never costs the measurement: a line that cannot be written is
+        # dropped, because the report is written by the caller, after it re-enters its streams.
+        try:
+            print(text, end=end, file=progress, flush=True)
+        except (OSError, ValueError):
+            pass
+
     # Layer 2: load historical priors from previous run
     cached_state = _load_cached_state(project_root)
     if verbose and cached_state and cached_state.get("per_category"):
         n_cats = len(cached_state["per_category"])
-        print(f"  {_DIM}(loaded {n_cats}-category priors from previous run){_RESET}")
+        say(f"  {_DIM}(loaded {n_cats}-category priors from previous run){_RESET}")
 
     total_killed = 0
     total_mutants = 0
@@ -2230,7 +2245,7 @@ def profile_codebase(
     for i, target in enumerate(targets, 1):
         if verbose:
             short = target.rsplit("/", 1)[-1]
-            print(f"  {_DIM}[{i}/{len(targets)}]{_RESET} {short}", end="", flush=True)
+            say(f"  {_DIM}[{i}/{len(targets)}]{_RESET} {short}", end="")
 
         file_start = time.monotonic()
         results = profile_file(
@@ -2373,13 +2388,13 @@ def profile_codebase(
                     if file_universe > file_total
                     else ""
                 )
-                print(
+                say(
                     f" {c}{file_killed}/{file_total}{_RESET}{equiv_note}{coverage}"
                     f" {_DIM}{file_ms:.0f}ms{_RESET}"
                 )
         else:
             if verbose:
-                print(f" {_DIM}(no mutants){_RESET}")
+                say(f" {_DIM}(no mutants){_RESET}")
 
     elapsed = (time.monotonic() - start) * 1000
     effective_total = total_mutants - total_equivalent

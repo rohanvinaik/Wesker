@@ -2206,13 +2206,17 @@ def profile_codebase(
             measured code does to the process's streams.
     """
 
+    dropped_progress = 0
+
     def say(text: str = "", end: str = "\n") -> None:
-        # Progress is best-effort and never costs the measurement: a line that cannot be written is
-        # dropped, because the report is written by the caller, after it re-enters its streams.
+        # Progress never costs the measurement: a line that cannot be written is dropped, because the
+        # report is written by the caller, after it re-enters its streams. A dropped line is COUNTED,
+        # and the count is in the report: a log with a hole in it must say that it has one.
+        nonlocal dropped_progress
         try:
             print(text, end=end, file=progress, flush=True)
         except (OSError, ValueError):
-            pass
+            dropped_progress += 1
 
     # Layer 2: load historical priors from previous run
     cached_state = _load_cached_state(project_root)
@@ -2433,6 +2437,9 @@ def profile_codebase(
         "unresolved_functions": unresolved_functions,
         "passes": passes,
         "elapsed_ms": round(elapsed),
+        # Progress lines this run could not write (W#52): its stream was closed or redirected under
+        # it. The measurement is unaffected; the LOG is incomplete, and says so (`progress_gap_notice`).
+        "progress_lines_dropped": dropped_progress,
         "per_file": per_file,
         "per_category": list(global_cats.values()),
         # Every surviving mutant, located. The report's only per-mutant detail: what a

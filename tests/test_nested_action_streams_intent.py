@@ -271,3 +271,60 @@ def test_progress_that_cannot_be_written_never_costs_the_measurement(
     sink.close()  # a dead progress stream: ValueError on write
     report = _one_target_profile(monkeypatch, progress=sink)
     assert report["total_functions"] == 0
+
+
+def test_a_dropped_progress_line_is_counted_in_the_report(monkeypatch, tmp_path):
+    sink = (tmp_path / "progress.txt").open("w")
+    sink.close()  # every write to it raises ValueError
+    report = _one_target_profile(monkeypatch, progress=sink)
+    assert (
+        report["progress_lines_dropped"] == 2
+    )  # the "[1/1] mod.py" line and its "(no mutants)"
+
+
+def test_a_run_that_wrote_every_progress_line_reports_none_dropped(
+    monkeypatch, tmp_path
+):
+    sink = (tmp_path / "progress.txt").open("w")
+    report = _one_target_profile(monkeypatch, progress=sink)
+    sink.close()
+    assert report["progress_lines_dropped"] == 0
+
+
+@pytest.mark.parametrize("dropped", [0, -1])
+def test_no_gap_notice_when_nothing_was_dropped(dropped):
+    assert action.progress_gap_notice(dropped) == ""
+
+
+@pytest.mark.parametrize("dropped", [1, 2, 24])
+def test_the_gap_notice_names_the_count_and_says_the_measurement_is_unaffected(
+    dropped,
+):
+    notice = action.progress_gap_notice(dropped)
+    assert notice.startswith(f"::warning::{dropped} progress line(s)")
+    assert "could not be written" in notice
+    assert "measurement and this report are unaffected" in notice
+    assert "progress above is incomplete" in notice
+
+
+def test_the_action_prints_the_gap_notice_after_the_report_is_built(
+    monkeypatch, capsys, tmp_path
+):
+    from Wesker import self_profile
+
+    report = {
+        "suite": {"tests": 1, "inert": 0},
+        "spec_pct": 100,
+        "total_dof": 1,
+        "total_dof_pinned": 1,
+        "progress_lines_dropped": 3,
+    }
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        self_profile, "profiler_for_targets", lambda targets: lambda *a, **k: report
+    )
+    monkeypatch.setenv(action._STREAM_OWNER_ENV, str(os.getpid()))
+    code = action.main(["--targets", "m.py"])
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "::warning::3 progress line(s) of this run could not be written" in out

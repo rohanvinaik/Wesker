@@ -444,6 +444,23 @@ def _stream_reentry() -> Callable[[], None]:
     return reenter
 
 
+def progress_gap_notice(dropped: int) -> str:
+    """The line that says this run's log is missing progress lines, or "" when it is not (W#52, pure — pinned).
+
+    A progress line the run could not write is dropped so that the measurement survives. Dropping it
+    silently would leave a log that reads as complete: the reader of a silent stretch cannot tell "the
+    run printed nothing" from "the run could not print". The report itself is unaffected, and the
+    notice says that too, so a hole in the log is never read as a hole in the measurement.
+    """
+    if dropped <= 0:
+        return ""
+    return (
+        f"::warning::{dropped} progress line(s) of this run could not be written: the code under "
+        "measurement closed or redirected the run's output. The measurement and this report are "
+        "unaffected; the per-file progress above is incomplete."
+    )
+
+
 def _open_progress() -> IO[str]:
     """A line-buffered text stream on a PRIVATE duplicate of the real stdout, made before profiling (W#52).
 
@@ -832,6 +849,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"SARIF: {sarif_path}")
 
     _annotate(report)
+    gap = progress_gap_notice(report.get("progress_lines_dropped", 0))
+    if gap:
+        print(gap)
     _write_outputs(report)
     _write_github_file("GITHUB_STEP_SUMMARY", _summary_markdown(report, scope_note))
 

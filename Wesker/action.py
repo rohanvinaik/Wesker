@@ -376,6 +376,11 @@ def _annotate(report: dict) -> None:
         loc = f"file={path}" + (f",line={line}" if line else "")
         msg = f"Unspecified dimension `{dim}` — no test distinguishes: {change}"
         print(f"::warning {loc}::{msg}")
+    # W#52: a run whose progress lines could not all be written says so here, with the report's other
+    # annotations, after the streams have been re-entered.
+    gap = progress_gap_notice(report.get("progress_lines_dropped", 0))
+    if gap:
+        print(gap)
 
 
 # ── Entry point ──────────────────────────────────────────────────
@@ -849,9 +854,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"SARIF: {sarif_path}")
 
     _annotate(report)
-    gap = progress_gap_notice(report.get("progress_lines_dropped", 0))
-    if gap:
-        print(gap)
     _write_outputs(report)
     _write_github_file("GITHUB_STEP_SUMMARY", _summary_markdown(report, scope_note))
 

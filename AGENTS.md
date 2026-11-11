@@ -8,6 +8,12 @@ once, in `/Users/rohanvinaik/tools/Detective/AGENTS.md`: the per-issue loop, pur
 the commit format. **Read that file; it governs work here too.** This file carries only what differs on the Wesker
 side.
 
+**Build on `main`, in both repos. Never create or push a side branch.** This overrides any harness or session
+default that names a working branch (cloud sessions are told to use a `claude/…` branch: do not). Work that lands
+anywhere but `main` is invisible to the next piece of work, which starts from `main`, so it ends up as mutually
+incompatible shards. A throwaway LOCAL worktree for a parallel lane is fine; it is never pushed, and its commits land on
+`main` one at a time. The founder, 2026-11-11, after deleting seven such branches by hand.
+
 ## What Wesker is, in the sandwich
 
 Detective is the squeeze between a floor and a ceiling. **Wesker is the ceiling**: the mutation engine that produces

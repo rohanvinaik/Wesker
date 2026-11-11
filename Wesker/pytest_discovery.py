@@ -268,10 +268,18 @@ def _bind_item(item: Any, fn: Callable[..., Any]) -> Callable[..., Any] | None:
     if any(p not in params for p in sig_params):
         return None  # a required arg is a real fixture, not a parametrized value
 
-    bound = {p: params[p] for p in sig_params}
+    # Fresh arguments for every call (#55): `bound` holds the module-level parametrize objects, which a
+    # mutant that writes into its argument would alter for every later call. Copied per call from a
+    # pristine snapshot; an argument that cannot be copied is named on `__wesker_shared_arguments__`.
+    from Wesker.pytest_runner import FreshArguments
+
+    fresh = FreshArguments()
+    fresh.capture(item)
 
     def run() -> None:
-        fn(**bound)
+        fresh.refresh(item)
+        live = callspec.params
+        fn(**{p: live[p] for p in sig_params})
 
     run.__name__ = f"{getattr(fn, '__name__', 'test')}[{getattr(callspec, 'id', '')}]"
     # Honor the trace-cache identity contract `_make_item_callable` (the live-session path) already sets,
@@ -283,6 +291,7 @@ def _bind_item(item: Any, fn: Callable[..., Any]) -> Callable[..., Any] | None:
     # edit still invalidates the entry (and distinct tests still differ).
     run.__qualname__ = str(getattr(item, "nodeid", run.__name__))
     run.__wrapped__ = fn  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute] — functools.wraps sets it; not in the stub
+    run.__wesker_shared_arguments__ = tuple(fresh.shared())  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     return run
 
 

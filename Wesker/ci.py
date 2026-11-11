@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import IO, Any
 
 from Wesker.engine import (
+    ORIGINAL_ALSO_FAILS,
     run_function_converged,
 )
 from Wesker.filter import filter_categories, prioritize_categories
@@ -1935,6 +1936,7 @@ UNSCORED_ROLLUP: tuple[tuple[str, str], ...] = (
     ("undetermined", "unresolved"),
     ("diverged", "unresolved"),
     (WRITE_OUTSIDE_AUTHORITY, "unresolved"),
+    (ORIGINAL_ALSO_FAILS, "unresolved"),
     ("cut", "truncated"),
     ("harness_error", "harness"),
     ("not_installed", "harness"),
@@ -1961,6 +1963,9 @@ def unresolved_causes(unscored_by: dict) -> tuple[str, ...]:
       "write_outside_authority"  a test run against the mutant tried to write outside its write
                                  authority and the write was prevented before it landed, so the test
                                  was never observed to pass or fail (W#51).
+      "original_also_fails"      every test that failed under the mutant fails the same way against the
+                                 ORIGINAL in the same process state (#55): those tests detected
+                                 nothing, so the mutant is neither killed nor survived.
       a disposition `UNSCORED_ROLLUP` does not know, under its own name, after the known ones: an
                                  unmapped outcome is never read as a verdict.
       ()                         every evaluated mutant reached a verdict (the "truncated" and
@@ -2132,6 +2137,17 @@ _UNRESOLVED_REMEDIES = (
             "and the mutant's question is missing from both sides of the ratio. Keep the test's "
             "writes inside its temporary directory (resolve relative paths there, e.g. "
             "monkeypatch.chdir(tmp_path)) to measure it."
+        ),
+    ),
+    (
+        ORIGINAL_ALSO_FAILS,
+        (
+            "Every test that failed under the mutant fails the same way against the ORIGINAL in "
+            "the same process state, so none of them detected a difference and the mutant's "
+            "question is missing from both sides of the ratio. A mutant that wrote into shared "
+            "state a copy of the arguments cannot reach (a module global, a class attribute, a "
+            "file) leaves every later test failing whatever the code under it is. Make the test "
+            "build that state itself (a fixture, a copy), so each run starts from the same one."
         ),
     ),
 )

@@ -44,14 +44,18 @@ from Wesker.ci import (
     describe_unresolved,
     unresolved_causes,
 )
-from Wesker.engine import SCORED_DISPOSITIONS, mutant_disposition
+from Wesker.engine import (
+    ORIGINAL_ALSO_FAILS,
+    SCORED_DISPOSITIONS,
+    mutant_disposition,
+)
 from Wesker.write_authority import WRITE_OUTSIDE_AUTHORITY
 
 # ── the table is total over what the engine can return ────────────────────────────────────────
 
 
 def _engine_dispositions() -> set[str]:
-    """Every value `mutant_disposition` returns over its whole input grid, both refusal codes included."""
+    """Every value `mutant_disposition` returns over its whole input grid, every refusal code included."""
     seen: set[str] = set()
     for (
         constructed,
@@ -67,7 +71,7 @@ def _engine_dispositions() -> set[str]:
         (True, False, None),
         (True, False),
         (True, False),
-        ("", "nested_measurement", WRITE_OUTSIDE_AUTHORITY),
+        ("", "nested_measurement", WRITE_OUTSIDE_AUTHORITY, ORIGINAL_ALSO_FAILS),
         (
             None,
             "assertion",

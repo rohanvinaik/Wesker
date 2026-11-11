@@ -130,6 +130,10 @@ class IsolatedRun:
     #: failure is the guard's: it records no kill reason, so `killed_by` speaks for the other nodes.
     write_blocked: str | None = None
     blocked_writes: tuple[str, ...] = ()
+    #: #55 — the nodes whose failure under the mutant the ORIGINAL reproduces in the same process
+    #: state (the worker's original control). Non-empty only when nothing else failed the mutant: those
+    #: failures detected nothing, so the engine names the mutant `original_also_fails`, never a kill.
+    original_also_fails: tuple[str, ...] = ()
 
     @property
     def outcome(self) -> str:
@@ -785,6 +789,9 @@ class IsolatedMutantWorker:
             diverged=bool(data.get("diverged", False)),
             write_blocked=data.get("write_blocked") or None,
             blocked_writes=tuple(str(p) for p in data.get("blocked_writes") or ()),
+            original_also_fails=tuple(
+                str(n) for n in data.get("original_also_fails") or ()
+            ),
         )
 
     def _reap(self) -> bool:

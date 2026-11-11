@@ -35,7 +35,7 @@ from typing import Any
 import pytest
 
 from Wesker.isolation import aggregate_kill_reason, classify_kill_reason
-from Wesker.pytest_runner import _install_cheap_failure_repr
+from Wesker.pytest_runner import FreshArguments, _install_cheap_failure_repr
 from Wesker.write_authority import (
     contain_writes,
     declared_roots,
@@ -96,7 +96,76 @@ def _build_mutant(target_file: str, func_name: str, mutant_source: str) -> Any |
     return _entry_probe(obj) if obj is not None else None
 
 
-class _MutantPlugin:
+#: The pristine test arguments of this worker process (#55). Module-level on purpose: every
+#: `pytest.main` here re-collects test modules that stay in `sys.modules`, so a module-level
+#: `parametrize` row is the same object for every mutant. The snapshot is taken at the FIRST collection
+#: this process makes (before any test body has run in it) and outlives every evaluation after it.
+_ARGUMENTS = FreshArguments()
+
+
+class _FreshArgumentsPlugin:
+    """Give every evaluation fresh test arguments: the mutant's, and the original control's (#55).
+
+    A mutant that writes into the argument it is given alters the object every later evaluation would
+    be handed. ``FreshArguments`` snapshots each item's parameters once, at collection, and replaces
+    them with a new deep copy before each item's setup, so no evaluation can change what another (or
+    the control) receives. What a copy cannot reach is the original control's business.
+    """
+
+    def pytest_collection_finish(self, session: Any) -> None:
+        for item in session.items:
+            _ARGUMENTS.capture(item)
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_runtest_setup(self, item: Any) -> None:
+        _ARGUMENTS.refresh(item)
+
+
+def _node_failure_reason(outcome: Any, is_declared_failure: Any) -> str | None:
+    """The kill-vocabulary word for one node's call outcome, or None (pass / not a failure).
+
+    ``outcome.excinfo`` is pluggy's ``(type, value, tb)`` for a hooked call that raised, or None when
+    it returned. ``KeyboardInterrupt``/``SystemExit`` are excluded exactly as the in-process
+    evaluator re-raises them; ``MemoryError`` is returned as ``"memory"`` so the caller can name the
+    cut. Everything else goes through :func:`classify_kill_reason`, the ladder
+    ``engine._run_test_with_timeout`` uses.
+    """
+    excinfo = getattr(outcome, "excinfo", None)
+    if excinfo is None:
+        return None
+    exc = excinfo[1]
+    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        return None
+    if isinstance(exc, MemoryError):
+        return "memory"
+    return classify_kill_reason(
+        isinstance(exc, AssertionError), bool(is_declared_failure(exc))
+    )
+
+
+class _ControlPlugin(_FreshArgumentsPlugin):
+    """Run nodes against the ORIGINAL and record how each fails (#55, the original control).
+
+    Nothing is installed: the mutant's evaluation has already restored every binding, so the target
+    is the original, in whatever process state that evaluation left (module globals, class
+    attributes, files). A node that fails here the same way it failed under the mutant detected
+    nothing: that is :func:`Wesker.engine.original_control_standing`, shared with the in-process loop.
+    """
+
+    def __init__(self) -> None:
+        self.reasons: dict[str, str] = {}
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_call(self, item: Any) -> Any:
+        from Wesker.engine import _is_declared_failure
+
+        outcome = yield
+        reason = _node_failure_reason(outcome, _is_declared_failure)
+        if reason is not None:
+            self.reasons[getattr(item, "nodeid", "")] = reason
+
+
+class _MutantPlugin(_FreshArgumentsPlugin):
     """Install the mutant into each test's namespace for the duration of its call, and CLASSIFY
     why each node failed (#19).
 
@@ -131,6 +200,19 @@ class _MutantPlugin:
         self._func_name = func_qualname.split(".")[-1]
         self.reasons: list[str] = []
         self.first_failing_node: str | None = None
+        #: Every failing node and its reason, in run order (#55): what the original control reads,
+        #: and what `settle` rebuilds `reasons` / `first_failing_node` from once it has voided nodes.
+        self.node_reasons: list[tuple[str, str]] = []
+        #: Nodes whose failure the ORIGINAL reproduces in the same process state (#55): no kill.
+        self.original_also_fails: list[str] = []
+        #: Failures of a phase the call-phase ladder does not see (a fixture's setup, a teardown).
+        #: They carry no reason; the control does not speak for them, so they keep their kill.
+        self.other_failures = 0
+        #: Nodes that reached their call phase, and every node collected, across the rounds of one
+        #: evaluation (#55): a round that stops at a value failure the control voids is continued over
+        #: the nodes it never ran, exactly as the in-process loop goes on to the next test.
+        self.done: set[str] = set()
+        self.collected: set[str] = set()
         #: Installation-and-entry proof (#18). `installed` is True once any node rebound an owner to
         #: the mutant; `ran` counts nodes that reached the call phase (so an empty run stays
         #: `unobserved`, never a false `not_entered`); `.entered` on the wrapped mutant records whether
@@ -150,11 +232,25 @@ class _MutantPlugin:
         self.write_blocked: str | None = None
         self.blocked_writes: list[str] = []
 
+    def pytest_collection_modifyitems(self, items: list[Any]) -> None:
+        """A continuation round runs only what an earlier round did not (#55)."""
+        if self.done:
+            items[:] = [i for i in items if getattr(i, "nodeid", "") not in self.done]
+
+    def pytest_runtest_logreport(self, report: Any) -> None:
+        self.done.add(str(getattr(report, "nodeid", "")))
+        if getattr(report, "failed", False) and getattr(report, "when", "") != "call":
+            self.other_failures += 1
+
     def pytest_collection_finish(self, session: Any) -> None:
         """Compile after pytest establishes the actual package/import regime."""
+        super().pytest_collection_finish(session)
         from Wesker.engine import _step_codes_of
 
-        if self._mutant_source:
+        self.collected.update(str(getattr(i, "nodeid", "")) for i in session.items)
+        # Built ONCE per evaluation: a continuation round must keep the same mutant, whose `entered`
+        # flag is the proof of entry the earlier rounds recorded.
+        if self._mutant_source and self._mutated is None:
             self._mutated = _build_mutant(
                 self._target_file, self._func_name, self._mutant_source
             )
@@ -187,6 +283,7 @@ class _MutantPlugin:
             yield
             return
         arm = _StepArm(*self._step_arm_for(getattr(item, "nodeid", "")))
+        self.done.add(getattr(item, "nodeid", ""))
         with _execution_guard() as proof:
             module_saved = _patch_module_qualified(
                 proof, self._func_name, self._mutated, self._target_file, self._qualname
@@ -237,30 +334,17 @@ class _MutantPlugin:
         (not this list) decides the kill, and ``crash`` is outranked by any value pin in the
         aggregate. ``KeyboardInterrupt``/``SystemExit`` are excluded, matching the in-process re-raise.
         """
-        excinfo = getattr(outcome, "excinfo", None)
-        if excinfo is None:
+        reason = _node_failure_reason(outcome, is_declared_failure)
+        if reason is None:
             return
-        exc = excinfo[1]
-        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-            return
-        if isinstance(exc, MemoryError):
+        if reason == "memory":
             # The address-space cap fired (W#21): the run exceeded its budget, so this is a CUT, not a
             # kill. Flag it and record no kill reason — pytest's rc will read `failed`, but the engine
             # checks the memory cut first and never scores it.
             self.memory_cut = True
             return
-        reason = classify_kill_reason(
-            isinstance(exc, AssertionError), bool(is_declared_failure(exc))
-        )
-        previous = aggregate_kill_reason(self.reasons)
-        self.reasons.append(reason)
-        # Credit the node supplying the strongest reason, never a preceding crash
-        # that would otherwise borrow a later assertion's value-kill attribution.
-        if (
-            self.first_failing_node is None
-            or aggregate_kill_reason(self.reasons) != previous
-        ):
-            self.first_failing_node = getattr(item, "nodeid", None)
+        self.node_reasons.append((getattr(item, "nodeid", ""), reason))
+        self.settle(set())
         # Like the in-process evaluator, stop once a value kill is established.
         # Otherwise a later slow test can time out the worker and erase the already
         # observed assertion. shouldfail ends pytest with TESTS_FAILED, preserving it.
@@ -269,6 +353,25 @@ class _MutantPlugin:
             and getattr(item, "session", None) is not None
         ):
             item.session.shouldfail = "mutation distinguished by a value assertion"
+
+    def settle(self, voided: set[str]) -> None:
+        """Rebuild ``reasons`` and ``first_failing_node`` from the failing nodes not in ``voided``.
+
+        Credit goes to the node supplying the strongest reason, never a preceding crash that would
+        otherwise borrow a later assertion's value-kill attribution.
+        """
+        self.reasons = []
+        self.first_failing_node = None
+        for nodeid, reason in self.node_reasons:
+            if nodeid in voided:
+                continue
+            previous = aggregate_kill_reason(self.reasons)
+            self.reasons.append(reason)
+            if (
+                self.first_failing_node is None
+                or aggregate_kill_reason(self.reasons) != previous
+            ):
+                self.first_failing_node = nodeid
 
 
 class _CheapFailureRepr:
@@ -325,14 +428,33 @@ def _evaluate_full(
         project_root,
         write_roots,
     )
-    with (
-        contextlib.redirect_stdout(io.StringIO()),
-        contextlib.redirect_stderr(io.StringIO()),
-    ):
-        rc = pytest.main(
-            [*node_ids, "-p", "no:cacheprovider", "-q", "--no-header", "--capture=sys"],
-            plugins=[plugin, _CheapFailureRepr()],
+    rcs: list[int] = []
+    voided: set[str] = set()
+    controlled = 0
+    while True:
+        rcs.append(_pytest_round(node_ids, plugin))
+        # The ORIGINAL control (#55): every node that failed under the mutant is re-run against the
+        # original, in the process state this evaluation left, and a failure it reproduces is not a
+        # difference. One decision, `engine.original_control_standing`, shared with the in-process loop.
+        fresh_failures = plugin.node_reasons[controlled:]
+        controlled = len(plugin.node_reasons)
+        if fresh_failures:
+            voided |= _voided_by_control(fresh_failures)
+            plugin.settle(voided)
+        # A round pytest stopped at a value failure that the control voided has not run the rest of the
+        # suite against this mutant; go on with what it never reached, as the in-process loop does.
+        stopped = any(
+            reason in ("assertion", "exception") for _, reason in fresh_failures
         )
+        value_standing = any(r in ("assertion", "exception") for r in plugin.reasons)
+        if (
+            not stopped
+            or value_standing
+            or not (plugin.collected - plugin.done)
+            or plugin.memory_cut
+        ):
+            break
+    rc = next((code for code in rcs if code != 0), 0)
     return {
         # W#27: a node whose loop budget stopped the mutant — the named non-kill `diverged`, read
         # by the engine BEFORE pytest's exit code (the stopped node reads as a failure there).
@@ -351,6 +473,64 @@ def _evaluate_full(
         # Detective #105: a node whose write was prevented, and what it was prevented from writing.
         "write_blocked": plugin.write_blocked,
         "blocked_writes": plugin.blocked_writes,
+        # #55: the nodes whose failure the ORIGINAL reproduces, named only when nothing else failed
+        # the mutant. A failure in a phase the call ladder does not see (a fixture's setup) is not
+        # controlled and keeps pytest's verdict.
+        "original_also_fails": (
+            sorted(voided)
+            if voided and not plugin.reasons and not plugin.other_failures
+            else []
+        ),
+    }
+
+
+def _pytest_round(node_ids: list[str], plugin: Any) -> int:
+    """One ``pytest.main`` over ``node_ids`` with ``plugin``; its output goes to a sink.
+
+    pytest's own output is redirected so, in server mode, it cannot land in the JSON-line protocol on
+    stdout; ``--capture=sys`` keeps the same isolation at the Python level without touching descriptor
+    1, the protocol channel.
+    """
+    with (
+        contextlib.redirect_stdout(io.StringIO()),
+        contextlib.redirect_stderr(io.StringIO()),
+    ):
+        return int(
+            pytest.main(
+                [
+                    *node_ids,
+                    "-p",
+                    "no:cacheprovider",
+                    "-q",
+                    "--no-header",
+                    "--capture=sys",
+                ],
+                plugins=[plugin, _CheapFailureRepr()],
+            )
+        )
+
+
+def _voided_by_control(failures: list[tuple[str, str]]) -> set[str]:
+    """The failing nodes whose failure the ORIGINAL reproduces in this process state (#55).
+
+    Runs exactly those nodes once more with nothing installed (the mutant's evaluation restored every
+    binding) and reads each pair of outcomes through ``engine.original_control_standing``. A control
+    that cannot run (a harness fault) voids nothing: absence of a control is not evidence of one.
+    """
+    from Wesker.engine import original_control_standing
+
+    nodes = list(dict.fromkeys(nodeid for nodeid, _ in failures))
+    control = _ControlPlugin()
+    try:
+        _pytest_round(nodes, control)
+    # BLE001: a control that cannot run is no control; the failures keep the verdict they had
+    except Exception:  # noqa: BLE001
+        return set()
+    return {
+        nodeid
+        for nodeid, reason in failures
+        if original_control_standing(reason, control.reasons.get(nodeid))
+        == "control_same"
     }
 
 
@@ -521,6 +701,9 @@ def main() -> int:
         project_root=spec["project_root"],
         write_roots=tuple(spec.get("write_roots") or ()),
     )
+    if payload["original_also_fails"] and not payload["killed_by"]:
+        # The original reproduces every failure (#55): not a kill either. Same exit as a prevented write.
+        return int(pytest.ExitCode.INTERNAL_ERROR)
     if payload["write_blocked"] and not payload["killed_by"]:
         # A prevented write is never a kill (#105). The exit code has no refusal to carry, so the
         # run reads as a harness outcome, outside the denominator, rather than the failure pytest saw.

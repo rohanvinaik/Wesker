@@ -635,6 +635,12 @@ class ProfilingResult:
     # "no test reaches this line", which turns a timing accident into a false completeness verdict
     # — the one thing a completeness tool must never do quietly.
     trace_truncated: list[str] = field(default_factory=list)
+    # The test arguments that could NOT be handed to each evaluation as a fresh copy (#55), each
+    # `"<test> :: <argument> (<standing>)"` with the standing `argument_copy_standing` gave (uncopyable /
+    # uncomparable / identity_bearing). Every other argument is copied per evaluation; these stay shared,
+    # so a mutant that writes into one alters what later evaluations receive. The original control is the
+    # guard that remains for them. Absent means every argument was copied.
+    shared_arguments: list[str] = field(default_factory=list)
     # What could not be stopped, named (`_containment_lost`): one entry per baseline test whose traced
     # run outlived `abandon`, then one per mutant whose timed-out test did. Empty when every worker was
     # stopped. `coverage_depth="cut"` says the measurement is invalid; this says what to bound or isolate.
@@ -920,6 +926,8 @@ class ProfilingResult:
         # renderer needs to say the right repair instead of one sentence for every cause.
         if self.not_entered_causes:
             d["not_entered_causes"] = self.not_entered_causes
+        if self.shared_arguments:
+            d["shared_arguments"] = self.shared_arguments
         if self.line_coverage:
             d["line_coverage"] = self.line_coverage
         # The proof view alongside the observed one (#17), never instead of it. A consumer
@@ -7381,39 +7389,56 @@ def evaluate_mutant(
                         refusal, refused_test = result, callable_test_id(test_fn)
                         refused_writes = list(dict.fromkeys(blocked))[:3]
                     result = None
-                # A failure is only a KILL if the mutation CAUSED it. When the mutant
-                # could not be patched into the test's namespace, the unpatched path
-                # INJECTS it as a positional argument — a contract only Wesker's own
-                # inline tests observe. A discovered test with an unfilled fixture
-                # parameter receives the mutant AS the fixture and fails on garbage;
-                # that failure is about the fixture, not the mutation. Confirm by
-                # re-running with the ORIGINAL injected identically: if it fails the
-                # same way, the test cannot distinguish the two and detected nothing.
+                # A failure is only a KILL if the mutation CAUSED it, and that is a DIFFERENCE FROM THE
+                # ORIGINAL on the same input (KNOWABILITY Def. 2.3): re-run the test with the ORIGINAL
+                # in place and read both outcomes through `original_control_standing`, the one
+                # decision the isolated worker shares (#55). Two reasons it must run for every
+                # failure, patched or not:
                 #
-                # Measured on prism/economics.py::analyze: without this,
-                # test_nudge_contains_tool_count (another module; never references
-                # `analyze`; needs a `tmp_state` fixture) was credited with 118 of 131
-                # "assertion kills" — a 100% kill rate that was almost entirely this
-                # artifact. failing_on_baseline cannot catch it: it calls test_fn()
-                # with no argument, which raises TypeError, and it only counts
-                # AssertionError. Only on failure, so a passing suite pays nothing.
+                #  * UNPATCHED. The unpatched path INJECTS the mutant as a positional argument -- a
+                #    contract only Wesker's own inline tests observe. A discovered test with an
+                #    unfilled fixture parameter receives the mutant AS the fixture and fails on
+                #    garbage; that failure is about the fixture, not the mutation.
+                #    Measured on prism/economics.py::analyze: without this,
+                #    test_nudge_contains_tool_count (another module; never references `analyze`; needs
+                #    a `tmp_state` fixture) was credited with 118 of 131 "assertion kills" -- a 100%
+                #    kill rate that was almost entirely this artifact.
+                #  * PATCHED. A mutant that corrupts state a copy of the arguments cannot reach (a
+                #    module global, a class attribute, a file) fails every test that reads it
+                #    afterwards, and so does the original.
+                #
+                # Only on failure, so a passing suite pays nothing.
                 if (
                     result in ("assertion", "exception", "crash")
-                    and not patched
                     and original_func is not None
                 ):
-                    result = (
-                        None
-                        if _outcome_on_original(
-                            test_fn,
-                            original_func,
-                            module_saved,
-                            func_name,
-                            max(timeout_ms - _elapsed(allowance_t0), 1.0),
-                        )
-                        == result
-                        else result
+                    control = _outcome_on_original(
+                        test_fn,
+                        original_func,
+                        module_saved,
+                        func_name,
+                        max(timeout_ms - _elapsed(allowance_t0), 1.0),
+                        binding=(
+                            _proof,
+                            patched,
+                            saved,
+                            patch_target,
+                            patch_name,
+                            mutated_obj,
+                        ),
                     )
+                    if original_control_standing(result, control) == "control_same":
+                        # The original fails the same way here: this test detected nothing. Not a
+                        # kill, and not a survivor either -- named, like a refused measurement; a kill
+                        # another test earns still outranks it.
+                        if refused_test is None:
+                            from Wesker.ci import callable_test_id
+
+                            refusal, refused_test = (
+                                ORIGINAL_ALSO_FAILS,
+                                callable_test_id(test_fn),
+                            )
+                        result = None
                 if result is not None:
                     # The kill vocabulary (issue #16). Coverage is keyed the same way in
                     # `trace_suite`, and a caller runs set-cover over BOTH — two vocabularies
@@ -7534,12 +7559,63 @@ def evaluate_mutant(
                 pass
 
 
+#: The refusal (and so the unscored disposition) for a mutant whose only failing tests fail the same
+#: way against the ORIGINAL in the same process state (#55): those tests detected nothing.
+ORIGINAL_ALSO_FAILS = "original_also_fails"
+
+
+def original_control_standing(
+    mutant_outcome: str | None, control_outcome: str | None
+) -> str:
+    """Whether one test's failure under a mutant is a DIFFERENCE FROM THE ORIGINAL (#55, pure — pinned).
+
+    KNOWABILITY Def. 2.3: a suite kills ``p∘f`` iff ``p(f(x)) != f(x)`` for some authored ``x``. A test
+    that fails under the mutant is evidence only if the ORIGINAL, run against the same test in the same
+    process state, does not fail the same way. The in-process loop re-ran the original for the tests it
+    could not patch the mutant into; the isolated worker re-ran nothing, so a failure the original also
+    produces was counted as a kill. Both modes now read this one decision. ``mutant_outcome`` and
+    ``control_outcome`` are the run ladder's words (``assertion`` / ``exception`` / ``crash`` / an
+    unresolved code), ``None`` for a pass.
+
+      not_a_failure    the mutant's run was not a failure outcome: nothing to control.
+      control_passed   the original passes: the failure is the mutation's. The kill stands.
+      control_differs  the original fails, but not the same way (a crash where the mutant asserts, or the
+                       reverse, or an unresolved bound): the runs differ, so the kill stands.
+      control_same     the original fails the same way: the test detected nothing. NOT a kill -- the
+                       caller names it ``original_also_fails`` (unscored), never a survivor.
+    """
+    if mutant_outcome not in ("assertion", "exception", "crash"):
+        return "not_a_failure"
+    if control_outcome is None:
+        return "control_passed"
+    if control_outcome == mutant_outcome:
+        return "control_same"
+    return "control_differs"
+
+
+def _shared_arguments(test_functions: list[Callable[..., None]]) -> list[str]:
+    """The test arguments no evaluation could be handed a fresh copy of, named (#55).
+
+    Read off the tag `pytest_runner._make_item_callable` and `pytest_discovery._bind_item` put on each
+    callable they build. A callable built elsewhere (an inline or legacy test) has no parametrized
+    arguments and carries no tag: nothing to name, which is not a claim that anything was copied.
+    """
+    return sorted(
+        {
+            entry
+            for test in test_functions
+            for entry in getattr(test, "__wesker_shared_arguments__", ())
+        }
+    )
+
+
 def _outcome_on_original(
     test_fn: Callable[..., None],
     original_func: Callable[..., Any],
     module_saved: list[tuple[Any, Any]],
     func_name: str | None,
     remaining_ms: float,
+    binding: tuple[Any, ...] | None = None,
 ) -> str | None:
     """Re-run ``test_fn`` against the ORIGINAL and return its outcome — the attribution
     control for a test the mutant could not be patched INTO.
@@ -7564,6 +7640,18 @@ def _outcome_on_original(
         # prevent. `None` cannot equal the caller's `result` (it checks `is not None` first),
         # so declining here preserves the kill rather than silently erasing it.
         return None
+    # The mutant may ALSO be installed in the test's own namespace (`binding`, the arguments of the
+    # `_patch_mutant_into_test` call that installed it). The control must see the original there too,
+    # so that binding is lifted for the run and put back verbatim after (#55). It goes first: it was
+    # installed AFTER the module-qualified bindings, so what it saved is already the module-patched
+    # state, and the module restore below is what turns that into the original.
+    lifted: Any = None
+    proof: Any = None
+    patch_target: Any = None
+    if binding is not None and binding[1]:
+        proof, _patched, saved_binding, patch_target = binding[:4]
+        lifted = _read_patched_binding(patch_target, func_name)
+        _unpatch_mutant(proof, True, saved_binding, patch_target, func_name)
     live: list[tuple[Any, Any]] = []
     for target, saved in module_saved:
         try:
@@ -7583,6 +7671,22 @@ def _outcome_on_original(
             # BLE001/S110: re-installing one binding must not skip the rest
             except Exception:  # noqa: BLE001, S110
                 pass
+        if patch_target is not None:
+            _unpatch_mutant(proof, True, lifted, patch_target, func_name)
+
+
+def _read_patched_binding(patch_target: Any, func_name: str) -> Any:
+    """What ``patch_target`` holds under ``func_name`` right now, in the shapes
+    :func:`_unpatch_mutant` writes back (a namespace dict, a closure cell, an owner object)."""
+    if isinstance(patch_target, dict):
+        return patch_target.get(func_name)
+    if (
+        isinstance(patch_target, tuple)
+        and len(patch_target) == 2
+        and patch_target[0] == "closure_cell"
+    ):
+        return patch_target[1].cell_contents
+    return _get_raw_attr(patch_target, func_name)
 
 
 def _is_declared_failure(exc: BaseException) -> bool:
@@ -8348,6 +8452,21 @@ def _isolated_result(
             blocked_writes=list(run.blocked_writes),
             elapsed_ms=elapsed_ms,
         )
+    if run.original_also_fails and run.constructed and not run.killed_by:
+        # #55: every node that failed under the mutant fails the same way against the ORIGINAL in the
+        # same process state (the worker's control), so none of them detected a difference. pytest's
+        # exit code reads `failed`; that failure is not the mutation's. Named, never a kill and never
+        # a survivor -- the same code the in-process loop gives it.
+        return MutantResult(
+            mutant=mutant,
+            killed=False,
+            contained=run.contained,
+            installed=run.installed,
+            entered=entered,
+            refusal=ORIGINAL_ALSO_FAILS,
+            refused_test=run.original_also_fails[0],
+            elapsed_ms=elapsed_ms,
+        )
     verdict = mutant_verdict(run.outcome)
     if not run.constructed or verdict == "harness":
         return MutantResult(
@@ -8528,6 +8647,13 @@ def _evaluate_isolated(
     if run.test_name:
         run = replace(
             run, test_name=identities.get(selector_key(run.test_name), run.test_name)
+        )
+    if run.original_also_fails:
+        run = replace(
+            run,
+            original_also_fails=tuple(
+                identities.get(selector_key(n), n) for n in run.original_also_fails
+            ),
         )
     return _isolated_result(mutant, run, _elapsed(t0)), worker, run
 
@@ -9530,6 +9656,7 @@ def run_function_profiling(
         tests_discovered=len(test_functions),
         operator_census=_operator_census,
         trace_truncated=sorted(_trace_truncated),
+        shared_arguments=_shared_arguments(test_functions),
         containment_lost=_containment_lost(_baseline_uncontained, _uncontained_results),
     )
 
@@ -10617,5 +10744,6 @@ def run_function_converged(
         budget_exhausted=budget_exhausted,
         elapsed_ms=_elapsed(start),
         trace_truncated=sorted(_trace_truncated),
+        shared_arguments=_shared_arguments(test_functions),
         containment_lost=_containment_lost(_baseline_uncontained, list(seen.values())),
     )

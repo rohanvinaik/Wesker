@@ -472,6 +472,17 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
                 "evidence, while another test's kill of the same mutant still stands"
             ),
             (
+                "every evaluation, the original's and each mutant's, in either execution mode, "
+                "receives the test's arguments as the suite authored them: parametrize values "
+                "(direct, indirect and fixture params) are deep-copied from a snapshot taken "
+                "before any test body ran, and an argument that cannot be copied stays shared "
+                "and is named; a kill is a difference from the original on the same input, so a "
+                "test that fails under a mutant is re-run against the original in the same "
+                "process state, and a failure the original reproduces is the unscored outcome "
+                "original_also_fails — never a kill and never survival evidence, while another "
+                "test's kill of the same mutant still stands"
+            ),
+            (
                 "survivors probe synthesized boundary inputs for likely equivalence "
                 f"under a loop budget (the original's {STEP_PROBE_CAP} iterations, the "
                 "mutant's the cap above); an input the original cannot finish inside its "

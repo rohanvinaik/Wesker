@@ -21,9 +21,27 @@ changed twice, so the policy id moved twice.
   before its test ran. Binding now honours the advertised signature where the actual one also binds,
   and on 3.14 reads parameter shape without evaluating deferred annotations. (`3e98ad8`, W#47)
 
+- **A kill is a difference from the original on the same, authored input.** One isolated worker runs
+  every mutant in one process, and a module-level `parametrize` row is the same object for all of
+  them, so a mutant that wrote into its argument altered the row for every later mutant. Those later
+  failures counted as kills (a mutant identical to the original read "killed by assertion" and
+  Detective printed `✓ COMPLETE` over it), and in-process the altered row lost real crash kills.
+  Now, in both modes: (1) every evaluation, the original's and each mutant's, gets a fresh deep copy
+  of the test's parametrize values (direct, indirect and fixture params) from a snapshot taken before
+  any test body ran; an argument that cannot be copied stays shared and is named in the profile
+  (`shared_arguments`); (2) a test that fails under a mutant is re-run against the original in the
+  same process state, and a failure the original reproduces is the unscored outcome
+  `original_also_fails`, never a kill and never a survivor. Both modes read one decision,
+  `engine.original_control_standing`. The in-process control used to cover only the tests the mutant
+  could not be patched into; it now covers every failure. (W#55; Detective #127)
+
 Policy id: `8.dcc355186875` → `8.68a525594c46` → `8.51a0c2a545b5`; two-sign
 `8+neg.671d835828bf` → `8+neg.40ae45e28e39` → `8+neg.8d34cddbefca`. Detective's verdict cache keys
 on the id, so rows recorded under an older observation rule are not reused.
+
+W#55 moves it again, on the policy-9 universe (categories and counts unchanged): `9.261d14e34119` →
+`9.415d3755221e`; two-sign `9+neg.f5a15364c11d` → `9+neg.001902a9950c`. Receipts and cached verdicts
+recorded under the old id are not reused.
 
 ### The two-sign policy (μ⁻)
 

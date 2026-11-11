@@ -49,7 +49,12 @@ from Wesker.trace_evidence import item_run_status
 from Wesker.write_authority import declared_roots, session_write_roots
 from Wesker.write_authority import install as install_write_authority
 
-__all__ = ["run_in_session", "session_callables"]
+__all__ = [
+    "FreshArguments",
+    "argument_copy_standing",
+    "run_in_session",
+    "session_callables",
+]
 
 try:  # pytest is an OPTIONAL dependency — this module degrades to a no-op without it.
     import pytest as _pytest
@@ -165,6 +170,121 @@ def _reset_item(item: Any) -> None:
     init = getattr(item, "_initrequest", None)
     if init is not None:
         init()
+
+
+def argument_copy_standing(
+    copy_raised: bool, compare_raised: bool, copy_equals: bool
+) -> str:
+    """Whether ONE test argument may be handed out as a fresh copy (#55, pure — pinned).
+
+    A kill is a DIFFERENCE FROM THE ORIGINAL ON THE SAME, AUTHORED INPUT (KNOWABILITY Def. 2.3), so
+    every evaluation must receive the argument as the suite authored it. A module-level
+    ``parametrize`` row is ONE object for every mutant, and a mutant that writes into it changes what
+    every later evaluation (and the original's control) is given. The remedy is a fresh deep copy of a
+    pristine snapshot per evaluation; this decides, per argument, whether that copy is trustworthy.
+
+      copy            the copy was made and compares equal to the original: hand out copies.
+      uncopyable      ``deepcopy`` raised (a lock, a file handle, a generator): the argument stays
+                      SHARED. Named by the caller, never skipped silently — the original control (the
+                      isolated worker's and the in-process loop's) is what still guards it.
+      uncomparable    the copy exists but ``==`` raised or has no truth value (an array): nothing
+                      says the copy is the same value, so it stays shared, named.
+      identity_bearing  the copy is NOT equal to the original (a sentinel ``object()``, a plain
+                      instance compared by identity): a test that checks ``is``/``==`` against the
+                      authored object would fail on the original itself, so the argument stays
+                      shared, named — a broken suite is worse than a named gap.
+    """
+    if copy_raised:
+        return "uncopyable"
+    if compare_raised:
+        return "uncomparable"
+    return "copy" if copy_equals else "identity_bearing"
+
+
+class FreshArguments:
+    """Fresh test arguments for every evaluation (#55).
+
+    pytest hands a parametrized test the objects its ``callspec.params`` hold, and those objects are
+    the module-level ones: the same for every mutant, in one process, for the life of the process. This
+    keeps a PRISTINE deep copy of each item's parameters, taken the first time the item is seen (before
+    any test body has run in this process), and puts a new deep copy of it into ``callspec.params``
+    before each evaluation's setup. ``callspec.params`` is what direct parametrize arguments, indirect
+    ones, and ``@pytest.fixture(params=...)`` fixtures all read, so the one assignment reaches every
+    argument object pytest hands the test that survives across evaluations.
+
+    The arguments of ONE item are copied together (one memo), so two parameters naming the same object
+    still name one object. An argument :func:`argument_copy_standing` does not clear stays shared and is
+    NAMED in :attr:`shared`, ``"<nodeid> :: <argument> (<standing>)"``: the protection is not silently
+    absent. Shared state a copy cannot reach (module globals, class attributes, files) is guarded by the
+    original control instead.
+    """
+
+    def __init__(self) -> None:
+        self._pristine: dict[str, dict[str, Any]] = {}
+        self._shared: dict[str, dict[str, str]] = {}
+
+    @staticmethod
+    def _params(item: Any) -> dict[str, Any] | None:
+        params = getattr(getattr(item, "callspec", None), "params", None)
+        return params if isinstance(params, dict) and params else None
+
+    def capture(self, item: Any) -> None:
+        """Snapshot this item's parameters, once. A second sight of the item changes nothing: by then
+        an earlier evaluation may already have altered the live objects."""
+        import copy
+
+        key = str(getattr(item, "nodeid", ""))
+        params = self._params(item)
+        if params is None or key in self._pristine:
+            return
+        try:
+            together: dict[str, Any] | None = copy.deepcopy(params)
+        # BLE001: an arbitrary user object refuses copying in arbitrary ways; each is named below
+        except Exception:  # noqa: BLE001
+            together = None
+        pristine: dict[str, Any] = {}
+        shared: dict[str, str] = {}
+        for name, value in params.items():
+            if together is not None:
+                snap, raised = together[name], False
+            else:
+                try:
+                    snap, raised = copy.deepcopy(value), False
+                # BLE001: as above, per argument
+                except Exception:  # noqa: BLE001
+                    snap, raised = None, True
+            compare_raised, equal = False, False
+            if not raised:
+                try:
+                    equal = bool(snap == value)
+                # BLE001: an array-valued or raising __eq__ is "uncomparable", a named fact
+                except Exception:  # noqa: BLE001
+                    compare_raised = True
+            standing = argument_copy_standing(raised, compare_raised, equal)
+            if standing == "copy":
+                pristine[name] = snap
+            else:
+                shared[name] = standing
+        self._pristine[key] = pristine
+        self._shared[key] = shared
+
+    def refresh(self, item: Any) -> None:
+        """Replace this item's copyable parameters with a new deep copy of the pristine snapshot."""
+        import copy
+
+        params = self._params(item)
+        pristine = self._pristine.get(str(getattr(item, "nodeid", "")))
+        if params is None or not pristine:
+            return
+        params.update(copy.deepcopy(pristine))
+
+    def shared(self) -> list[str]:
+        """The arguments left shared, each named with its standing, sorted."""
+        return sorted(
+            f"{nodeid} :: {name} ({standing})"
+            for nodeid, names in self._shared.items()
+            for name, standing in names.items()
+        )
 
 
 def _cheap_failure_repr(excinfo: Any, *_args: Any, **_kwargs: Any) -> str:
@@ -294,6 +414,11 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
     # kill under a mutant — so the distinction the baseline needs travels beside the return, never in
     # it. Reset at the start of every run, so a stopped run reads `unobserved`, not a stale verdict.
     status = _ItemStatus()
+    # Fresh arguments for EVERY run of this item (#55): the original's, the baseline's and each
+    # mutant's. The snapshot is taken now, at wrapping time, before any run has had a chance to alter
+    # the module-level objects the item's parameters are.
+    fresh = FreshArguments()
+    fresh.capture(item)
 
     def run(  # type: ignore[no-untyped-def]
         *,
@@ -303,9 +428,11 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
         _reset=_reset_item,
         _status=status,
         _classify=_reports_status,
+        _fresh=fresh,
     ) -> None:
         _cap.last.pop(_item.nodeid, None)
         _status.value = "unobserved"
+        _fresh.refresh(_item)
         _reset(_item)
         reports = _rtp(_item, nextitem=None, log=False)
         _status.value = _classify(reports)
@@ -334,6 +461,8 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
     run.__name__ = name
     run.__qualname__ = str(getattr(item, "nodeid", name))
     run.__wesker_item_status__ = status  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+    # The arguments left shared, named (#55): read by the profile, never silently absent.
+    run.__wesker_shared_arguments__ = tuple(fresh.shared())  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     if mod is not None:
         # inspect.getmodule() fallback in _patch_mutant_into_test keys off __module__.
         run.__module__ = getattr(mod, "__name__", run.__module__)

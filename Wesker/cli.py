@@ -88,13 +88,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--isolated",
         action="store_true",
-        help="Run mutant evaluation in isolated worker subprocesses with memory boundaries (#45)",
+        help="Run each mutant in a killable worker subprocess with a memory cap (#45). Without "
+        "it NO per-mutant memory bound exists: a mutant that allocates without bound is stopped "
+        "only by the wall clock, which cannot interrupt one huge allocation",
     )
     parser.add_argument(
         "--mem-limit-mb",
         type=int,
-        default=512,
-        help="Memory limit in MB for isolated workers (default: 512)",
+        default=None,
+        help="Memory cap in MB for isolated workers (default under --isolated: 512). Applies ONLY "
+        "with --isolated, and only where the OS accepts RLIMIT_AS (Linux does; macOS may refuse): "
+        "the summary says when the cap was not applied. A mutant over the cap is a named cut, "
+        "never a kill",
     )
     parser.add_argument("--exclude", nargs="*", default=[], help="Files to exclude")
     parser.add_argument("--quiet", action="store_true", help="Minimal output")
@@ -104,8 +109,13 @@ def main(argv: list[str] | None = None) -> int:
         help="delete regeneratable .wesker/ cruft from old runs and exit",
     )
     args = parser.parse_args(argv)
-    if args.mem_limit_mb <= 0:
+    if args.mem_limit_mb is not None and args.mem_limit_mb <= 0:
         parser.error("--mem-limit-mb must be a positive integer")
+
+    if args.isolated and args.mem_limit_mb is None:
+        from Wesker.memory_guard import _DEFAULT_WORKER_PEAK
+
+        args.mem_limit_mb = _DEFAULT_WORKER_PEAK // (1024 * 1024)
 
     if args.purge:
         from Wesker.memory_guard import purge_caches
@@ -197,7 +207,11 @@ def main(argv: list[str] | None = None) -> int:
             # A cut or no-verdict function's mutants are missing from both sides of the ratio
             # below. Say so before the number, in the renderer `Wesker.metrics` shares (W#51):
             # this summary used to print the bare kill rate and exit 0 with the cause unnamed.
-            from Wesker.ci import completeness_warnings, describe_harness
+            from Wesker.ci import (
+                completeness_warnings,
+                describe_harness,
+                describe_memory,
+            )
 
             warnings = completeness_warnings(result)
             if warnings:
@@ -208,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             # Mutants the harness kept out of the ratio above, beside it (W#54).
             print(describe_harness(result))
+            print(describe_memory(result))
             # DOF coverage — the claim a bounded run can actually make. Under
             # singleton cover sets the greedy reaches min(picks, D) of D dimensions
             # exactly, so this is measured coverage, not an estimate.

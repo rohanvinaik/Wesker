@@ -237,7 +237,7 @@ def _summary_markdown(report: dict, scope_note: str) -> str:
     item: it can afford to say WHY the number means something, and saying it here rather than
     on the front reads as conviction rather than salesmanship.
     """
-    from Wesker.ci import describe_harness
+    from Wesker.ci import describe_harness, describe_memory
 
     spec = report.get("spec_pct", 0)
     pinned = report.get("total_dof_pinned", 0)
@@ -263,6 +263,7 @@ def _summary_markdown(report: dict, scope_note: str) -> str:
         "",
         "```",
         describe_harness(report),
+        describe_memory(report),
         "```",
         "",
         "<details><summary>Why this number is comparable and a kill rate is not</summary>",

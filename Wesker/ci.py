@@ -2019,6 +2019,80 @@ def harness_standing(recorded: bool, harness_mutants: int) -> str:
     return "left_ratio" if harness_mutants > 0 else "none"
 
 
+def memory_rollup_standing(isolated: bool, limit_mb: int, standings: list[str]) -> str:
+    """What the run can say about memory, as one named code (W#45, pure — pinned).
+
+    ``standings`` is each function's own ``memory_standing`` (``enforced``, ``telemetry_only``, ``cut``
+    or ``n/a``); a ``cut`` function held its cap, which is how it was cut. ``limit_mb`` is the cap the
+    caller passed (0 when none). The codes carry different remedies and never share a sign:
+
+      "unbounded"       not isolated, no cap given: no per-mutant memory bound exists on this path.
+      "limit_ignored"   not isolated but a cap was given: the cap was NOT applied.
+      "no_limit"        isolated without a cap: the workers run uncapped.
+      "enforced"        isolated; the OS accepted the cap for every function that ran a worker.
+      "telemetry_only"  isolated; the OS refused the cap for every function: observed, not bounded.
+      "partial"         isolated; some functions held the cap and some did not.
+      "none_measured"   isolated with a cap, and no function recorded a standing.
+    """
+    if not isolated:
+        return "limit_ignored" if limit_mb > 0 else "unbounded"
+    if limit_mb <= 0:
+        return "no_limit"
+    held = sum(1 for s in standings if s in ("enforced", "cut"))
+    refused = sum(1 for s in standings if s == "telemetry_only")
+    if held and refused:
+        return "partial"
+    if held:
+        return "enforced"
+    return "telemetry_only" if refused else "none_measured"
+
+
+def describe_memory(mutation: dict) -> str:
+    """The memory line that stands beside the kill rate (W#45, pure).
+
+    Says what bounds a runaway mutant on THIS run, and when a requested cap did not land says that it
+    was not applied and what that means. Absence is not a value: a report with no record says so.
+    """
+    code = mutation.get("memory_standing")
+    if not code:
+        return "Memory: not recorded in this report — nothing is claimed about a memory bound."
+    mb = mutation.get("memory_limit_mb") or 0
+    counts = mutation.get("memory_standings") or {}
+    refused = counts.get("telemetry_only", 0)
+    if code == "unbounded":
+        return (
+            "Memory: NOT bounded. This run is not --isolated, so no per-mutant memory cap exists; a "
+            "mutant that allocates without bound in a callee or in C is stopped only by the wall "
+            "clock (the per-mutant timeout and --budget), which cannot interrupt one huge allocation "
+            "and can exhaust this machine. `--isolated --mem-limit-mb N` is the per-mutant bound."
+        )
+    if code == "limit_ignored":
+        return (
+            f"Memory: --mem-limit-mb {mb} was NOT applied: it takes effect only with --isolated, so "
+            "no per-mutant memory cap exists on this run (the wall clock is the only bound)."
+        )
+    if code == "no_limit":
+        return "Memory: isolated workers ran with NO memory cap (no limit was given)."
+    if code == "enforced":
+        return (
+            f"Memory: enforced at {mb} MB per isolated worker. A mutant over the cap is a named "
+            "cut, never a kill."
+        )
+    if code == "telemetry_only":
+        return (
+            f"Memory: the {mb} MB cap was requested but NOT applied on this platform (the OS refused "
+            "RLIMIT_AS) — memory is observed, not bounded. A runaway mutant is not stopped by the "
+            "cap, will not be recorded as a memory cut, and can exhaust this machine. Run where the "
+            "OS accepts the limit (Linux) or inside a container with a memory limit."
+        )
+    if code == "partial":
+        return (
+            f"Memory: the {mb} MB cap held for some functions and was NOT applied for {refused} "
+            "(the OS refused RLIMIT_AS): those functions' memory was observed, not bounded."
+        )
+    return f"Memory: a {mb} MB cap was requested; no function recorded whether it held."
+
+
 # What each harness disposition means for the reader of a kill rate, and what a named `not_entered` cause
 # asks of them. None is a test result: the mutant never reached a verdict about the suite.
 _HARNESS_MEANINGS = (
@@ -2113,7 +2187,12 @@ _TRUNCATION_REMEDIES = (
     ),
     (
         "memory",
-        "A mutant hit the isolated worker's memory cap. Raise the worker's memory limit.",
+        (
+            "A mutant hit the isolated worker's memory cap (`--mem-limit-mb`). It is a named cut, "
+            "never a kill: that mutant is neither killed nor survived, and the function's remaining "
+            "mutants were not evaluated. A runaway mutant (unbounded allocation) is rightly cut; "
+            "raise `--mem-limit-mb` only if the cap is below what the tests legitimately need."
+        ),
     ),
     (
         "budget",
@@ -2157,6 +2236,22 @@ def _describe_containment_lost(lost: list[dict], limit: int = 3) -> list[str]:
     return lines
 
 
+def _describe_memory_cut(lost: list[dict], limit: int = 3) -> list[str]:
+    """The lines naming the mutant that hit the memory cap (W#45, pure).
+
+    The cap stopped the mutant; nothing was left unstoppable, so `_describe_containment_lost`'s
+    "could not stop" would say the opposite of what happened.
+    """
+    lines = [
+        f"    hit the cap: mutant {e.get('mutant') or e.get('mutant_id') or '?'} "
+        f"(line {e.get('mutated_line', '?')})"
+        for e in lost[:limit]
+    ]
+    if len(lost) > limit:
+        lines.append(f"    … and {len(lost) - limit} more")
+    return lines
+
+
 def describe_truncation(truncated: list[dict], limit: int = 20) -> str:
     """The cut functions, grouped by cause, each group under the remedy it needs (pure).
 
@@ -2183,7 +2278,12 @@ def describe_truncation(truncated: list[dict], limit: int = 20) -> str:
                 f"  {t.get('function_key') or '?'} — {seconds:.1f} s, "
                 f"{t.get('tested', 0)}/{t.get('universe', 0)} mutants evaluated"
             )
-            lines.extend(_describe_containment_lost(t.get("containment_lost") or []))
+            lost = t.get("containment_lost") or []
+            lines.extend(
+                _describe_memory_cut(lost)
+                if cause == "memory"
+                else _describe_containment_lost(lost)
+            )
         if len(group) > limit:
             lines.append(f"  … and {len(group) - limit} more")
         blocks.append("\n".join(lines))
@@ -2399,6 +2499,7 @@ def profile_codebase(
     truncated_functions: list[dict] = []
     unresolved_functions: list[dict] = []
     harness_functions: list[dict] = []
+    memory_standings: list[str] = []
     total_universe = 0
     total_dof = 0
     total_dof_covered = 0
@@ -2463,6 +2564,7 @@ def profile_codebase(
             # function, a cut one included: the cut below names the function's unevaluated mutants,
             # these were evaluated and are outside the ratio for another reason.
             harness_functions.extend(_harness_entries(r))
+            memory_standings.append(str(r.get("memory_standing", "n/a")))
             cause = truncation_cause(
                 r.get("coverage_depth", ""),
                 bool(r.get("budget_exhausted")),
@@ -2615,6 +2717,15 @@ def profile_codebase(
         "harness_mutants": _harness_totals(harness_functions),
         "total_harness": len({e["function_key"] for e in harness_functions}),
         "harness_functions": harness_functions,
+        # What bounded memory on this run (W#45), from each function's own `memory_standing`.
+        "isolated": isolated,
+        "memory_limit_mb": worker_mem_limit_mb or 0,
+        "memory_standing": memory_rollup_standing(
+            isolated, worker_mem_limit_mb or 0, memory_standings
+        ),
+        "memory_standings": {
+            s: memory_standings.count(s) for s in sorted(set(memory_standings))
+        },
         "passes": passes,
         "elapsed_ms": round(elapsed),
         # Progress lines this run could not write (W#52): its stream was closed or redirected under

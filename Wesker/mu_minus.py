@@ -95,14 +95,53 @@ def _yield_wrapper(fn: Callable[..., Any], mode: str) -> Callable[..., Any]:
     return _like(gen, fn)
 
 
+#: The number of test boundaries crossed so far in this process (#49). Whoever RUNS tests against a
+#: mutant (the in-process evaluator, the isolated worker) calls :func:`begin_test` as each test starts;
+#: a stale wrapper compares it with the boundary it last answered in. A counter rather than a flag so
+#: that nothing needs to remember to clear it, and an unmanaged caller (the wrapper used directly, an
+#: equivalence probe) sees one unchanging epoch, which is the wrapper's previous behaviour.
+_TEST_EPOCH = [0]
+
+
+def begin_test() -> None:
+    """Mark a test boundary: no stale wrapper carries a previous return across it (#49)."""
+    _TEST_EPOCH[0] += 1
+
+
+def stale_memory_standing(last_epoch: int | None, epoch: int) -> str:
+    """Whether a stale wrapper may answer with the previous call's return (#49, pure — pinned).
+
+    Def. 11.8(i): ``p_stale`` rules out "the output is a pure function of *this* call, carrying no leaked
+    state or accidental memoization". A TEST detects it by calling the function twice and seeing two
+    results. The wrapper used to hold its previous return for the whole evaluation, across every test
+    the evaluation ran, so two tests that each call once and each pass alone killed it together, the
+    kill was credited to whichever ran second, and the verdict changed with test order and with which
+    subset ran. That is state the HARNESS leaks across a test boundary, not a property of the function.
+
+      first    the wrapper has answered no call yet: nothing to carry. The first call of a mutant has no
+               previous one, and answering it with None would repeat return_none's question.
+      reset    a new test has begun since the last call: the memory ends with the test that made it.
+      carry    the same test is still running: the previous return stands, and a second call in it that
+               returns a different result is the detection.
+    """
+    if last_epoch is None:
+        return "first"
+    return "carry" if last_epoch == epoch else "reset"
+
+
 def _stale_wrapper(fn: Callable[..., Any]) -> Callable[..., Any]:
-    # The previous call's return, held from one call to the next for as long as this mutant lives:
-    # one evaluation of it, across every test that evaluation runs. Empty until a call returns, so
-    # the FIRST call returns its own value. A first call has no previous one, and answering it with
-    # None would merely repeat return_none's question.
+    # The previous call's return, held from one call to the next WITHIN ONE TEST (#49): it is dropped
+    # at every test boundary (`begin_test`), so a stale kill needs two calls in one test, is credited to
+    # that test, and does not depend on test order. Empty until a call returns, so the FIRST call of a
+    # test returns its own value.
     previous: list = []
+    last_epoch: list = [None]
 
     def swap(value: Any) -> Any:
+        epoch = _TEST_EPOCH[0]
+        if stale_memory_standing(last_epoch[0], epoch) == "reset":
+            previous.clear()
+        last_epoch[0] = epoch
         out = previous[0] if previous else value
         previous[:] = [value]
         return out

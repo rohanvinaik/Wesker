@@ -180,14 +180,22 @@ def test_stale_is_killed_by_a_second_call_and_survives_a_single_one(tmp_path):
         def second():
             assert mod.f(3) == 6
 
+        def twice():
+            assert mod.f(2) == 4
+            assert mod.f(3) == 6
+
         # One call cannot see a previous call: the suite has not pinned that f carries no state.
         alone = evaluate_mutant(m, [first], mod.f, qualname="f", source_path=path)
         assert alone.constructed and alone.installed and not alone.killed
-        # A second call with a different result can, by ASSERTION.
-        both = evaluate_mutant(
-            m, [first, second], mod.f, qualname="f", source_path=path
-        )
+        # Two TESTS that call once each do not either (W#49): the wrapper's memory ends with the test
+        # that made it, so neither test, run alone, detects stale, and the pair does not by leaking.
+        for order in ([first, second], [second, first]):
+            pair = evaluate_mutant(m, order, mod.f, qualname="f", source_path=path)
+            assert pair.constructed and pair.installed and not pair.killed, order
+        # A second call with a different result, in ONE test, can, by ASSERTION, credited to it.
+        both = evaluate_mutant(m, [twice], mod.f, qualname="f", source_path=path)
         assert both.killed and both.killed_by == "assertion"
+        assert both.test_name is not None and both.test_name.endswith("twice")
     finally:
         sys.modules.pop("mu_stale", None)
 
@@ -370,21 +378,30 @@ def test_an_isolated_worker_measures_the_yield_mutant_not_the_original(tmp_path)
         worker.close()
 
 
-def test_an_isolated_worker_measures_stale_across_two_tests(tmp_path):
+def test_an_isolated_worker_measures_stale_by_two_calls_in_one_test(tmp_path):
     (tmp_path / "t.py").write_text("def f(x):\n    return x * 2\n")
     (tmp_path / "test_t.py").write_text(
         "from t import f\n\n\n"
         "def test_a():\n    assert f(2) == 4\n\n\n"
-        "def test_b():\n    assert f(3) == 6\n"
+        "def test_b():\n    assert f(3) == 6\n\n\n"
+        "def test_twice():\n    assert f(2) == 4\n    assert f(3) == 6\n"
     )
     m = _form_b("def f(x):\n    return x * 2\n")["return_stale"]
     assert isolated_mutant_node(m) is m.mutated_node  # already source
-    worker = IsolatedMutantWorker(
-        str(tmp_path), ["test_t.py::test_a", "test_t.py::test_b"], "t.py", "f"
-    )
+    source = ast.unparse(m.mutated_node)
+    worker = IsolatedMutantWorker(str(tmp_path), [], "t.py", "f")
     try:
-        r = worker.evaluate(ast.unparse(m.mutated_node), 30.0)
+        # Two tests, one call each, in either order: survived (W#49).
+        for nodes in (
+            ["test_t.py::test_a", "test_t.py::test_b"],
+            ["test_t.py::test_b", "test_t.py::test_a"],
+        ):
+            r = worker.evaluate(source, 30.0, node_ids=nodes)
+            assert mutant_verdict(r.outcome) == "survived", nodes
+        # Two calls in one test: killed by assertion, by that test.
+        r = worker.evaluate(source, 30.0, node_ids=["test_t.py::test_twice"])
         assert mutant_verdict(r.outcome) == "killed"
         assert r.killed_by == "assertion"
+        assert r.test_name and r.test_name.endswith("test_twice")
     finally:
         worker.close()

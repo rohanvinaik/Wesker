@@ -391,7 +391,10 @@ def _categories(two_sign: bool = False) -> dict[str, dict[str, Any]]:
                 "in its types (Fork 2, output_mode_applies), and never raises there. "
                 "B — the target's own definition with Wesker.mu_minus.form_b(<mode>) "
                 "applied innermost, so every evaluator, the isolated worker included, "
-                "builds it from source."
+                "builds it from source. return_stale holds the previous call's return only "
+                "within one test: the memory ends at every test boundary, in either execution "
+                "mode, so a stale kill needs two calls in one test, is credited to that test, "
+                "and does not depend on test order or on which subset ran (Def. 11.8(i))."
             ),
         }
     return cats

@@ -112,7 +112,8 @@ GOLDEN_FINGERPRINT = {
 # table enters the manifest) -> 9+neg.8144c37b1638 (Form B and the unbuilt catalog) ->
 # 9+neg.f5a15364c11d (integrated with W#27's loop budget and #105's write authority, both
 # observation texts the one-sign golden records) -> 9+neg.001902a9950c (W#55's fresh-argument and
-# original-control observation text).
+# original-control observation text) -> 9+neg.89326e7f549c (W#49: the stale wrapper's memory ends at
+# a test boundary; the one-sign id is unchanged by it).
 GOLDEN_TWO_SIGN_OUTPUT = {
     "fp_annotations": 4,
     "fp_value": 3,

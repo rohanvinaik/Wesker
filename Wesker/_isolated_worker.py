@@ -35,6 +35,7 @@ from typing import Any
 import pytest
 
 from Wesker.isolation import aggregate_kill_reason, classify_kill_reason
+from Wesker.mu_minus import begin_test
 from Wesker.pytest_runner import FreshArguments, _install_cheap_failure_repr
 from Wesker.write_authority import (
     contain_writes,
@@ -231,6 +232,10 @@ class _MutantPlugin(_FreshArgumentsPlugin):
         #: no kill reason: its failure is the guard's, never the mutant's.
         self.write_blocked: str | None = None
         self.blocked_writes: list[str] = []
+
+    def pytest_runtest_logstart(self, nodeid: str, location: Any) -> None:
+        """A test boundary (#49): a Form B wrapper's memory (stale) ends with the test that made it."""
+        begin_test()
 
     def pytest_collection_modifyitems(self, items: list[Any]) -> None:
         """A continuation round runs only what an earlier round did not (#55)."""

@@ -91,7 +91,7 @@ read off the function's OWN body (nested scopes excluded):
 | a heterogeneous return forgoes what a branch cannot take | Fork 2's subset condition | `tests/test_mu_minus_families_intent.py::test_a_heterogeneous_return_forgoes_every_mode_one_branch_cannot_take` |
 | count == generation (#9) | the denominator must count what is generated | `tests/test_mu_minus_families_intent.py::test_count_equals_generation_under_every_observed_type`, `tests/test_mu_minus_form_b_intent.py::test_count_equals_generation_with_form_b` |
 | killed by assertion on a pinning test | the kill is a value distinction, not a perturbation crash | `tests/test_mu_minus_families_intent.py::test_each_family_dies_by_assertion_on_a_pinning_test`, `tests/test_mu_minus_form_b_intent.py::test_stale_is_killed_by_a_second_call_and_survives_a_single_one`, `tests/test_mu_minus_form_b_intent.py::test_swallow_is_killed_by_a_test_that_pins_the_raise` |
-| the isolated worker measures the mutant, not the original | isolated verdicts back the certificate | `tests/test_mu_minus_form_b_intent.py::test_an_isolated_worker_measures_the_yield_mutant_not_the_original`, `tests/test_mu_minus_form_b_intent.py::test_an_isolated_worker_measures_stale_across_two_tests` |
+| the isolated worker measures the mutant, not the original | isolated verdicts back the certificate | `tests/test_mu_minus_form_b_intent.py::test_an_isolated_worker_measures_the_yield_mutant_not_the_original`, `tests/test_mu_minus_form_b_intent.py::test_an_isolated_worker_measures_stale_by_two_calls_in_one_test` |
 | a Form B mutant is never bytecode-equivalent | TCE would otherwise mark every Form B survivor equivalent unrun | `tests/test_mu_minus_form_b_intent.py::test_a_form_b_mutant_is_never_bytecode_equivalent_to_the_original` |
 | the engine's interrupts are never swallowed | Abandoned, MeasurementRefused and StepBudgetExceeded are BaseException | `tests/test_mu_minus_form_b_intent.py::test_swallow_returns_none_for_an_ordinary_raise_only` |
 | the call shape survives | sync, async, method, classmethod, staticmethod, property, async generator | `tests/test_mu_minus_form_b_intent.py::test_methods_and_descriptors_bind_once_under_the_innermost_decorator`, `tests/test_mu_minus_form_b_intent.py::test_async_functions_stay_awaitable`, `tests/test_mu_minus_form_b_intent.py::test_an_async_generator_stays_an_async_generator` |
@@ -141,8 +141,10 @@ arguments or passes one through.
   (latin-1), bool -> int, int/float -> Decimal. The coercion preserves `==` for the numeric cases,
   so only a type pin kills it. Detective writes one (`assert type(result) is int`,
   NEGATIVE_SPECIFICATION Prop. 11.14).
-- **stale.** Each call returns the previous call's return within one evaluation; the first call
-  returns its own. It is killed only by a second call with a different result. Where every call
+- **stale.** Each call returns the previous call's return within one test; the first call of a test
+  returns its own, and the memory ends at the test boundary (W#49), so the verdict does not depend on
+  test order or on which subset ran. It is killed only by a second call with a different result in
+  one test, credited to that test. Two tests that call once each do not kill it. Where every call
   returns the same value it is a true no-op, which `check_equivalent`'s sequential boundary calls
   detect. It is not an output operator in the adequacy sense (it reads a prior call). It remains a μ⁻
   fence for leaked state and accidental memoization, an axis the positive policy misses.
@@ -310,10 +312,12 @@ observed return type is in its set.
 
 ## What is not closed
 
-- **stale needs two calls with different results.** Detective's witness pool may reach the body with
-  only one input. The measured case is an un-annotated str parameter: one harvested value, then
-  integer probes that all raise. There stale reads "candidate-equivalent", although a second `--input`
-  with a different result kills it. Measured on five one-test fixtures (str, list, set, dict, date),
+- **stale needs two calls with different results in ONE test.** Detective's witness pool may reach the
+  body with only one input. The measured case is an un-annotated str parameter: one harvested value,
+  then integer probes that all raise. There stale reads "candidate-equivalent". Before W#49 a second
+  `--input` with a different result killed it, written as a second test; the wrapper's memory now ends
+  with each test, so that no longer does: the pin must call the function twice in one test. Measured
+  on five one-test fixtures (str, list, set, dict, date),
   each reading "COMPLETE modulo 1 unproven-equivalent". `next_day` takes a date, which has no
   literal form, so its remedy is a second test rather than an `--input`. The fix belongs to
   Detective: the witness search needs a second exercising input before it can see a history-

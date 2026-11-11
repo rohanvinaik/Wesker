@@ -34,6 +34,15 @@ changed twice, so the policy id moved twice.
   `original_also_fails`, never a kill and never a survivor. Both modes read one decision,
   `engine.original_control_standing`. The in-process control used to cover only the tests the mutant
   could not be patched into; it now covers every failure. (W#55; Detective #127)
+- **A stale kill needs two calls in one test.** The stale wrapper (Form B `return_stale`) held the
+  previous call's return for the whole evaluation, across tests. Two tests that each call once, and
+  each pass alone, killed it together, the kill was credited to whichever ran second, and the verdict
+  depended on test order and on which subset ran. Def. 11.8 (i) says stale stands for an output that
+  is not a pure function of this call; a test detects it by calling twice and seeing two results. The
+  wrapper's memory now ends at every test boundary, in both modes: two calls with different results
+  in one test kill it by assertion and are credited to that test; two tests with one call each
+  survive, in either order. Detective's pins that write one test per `--input` therefore no longer
+  kill it; a pin must call the function twice in one test. (W#49)
 
 Policy id: `8.dcc355186875` → `8.68a525594c46` → `8.51a0c2a545b5`; two-sign
 `8+neg.671d835828bf` → `8+neg.40ae45e28e39` → `8+neg.8d34cddbefca`. Detective's verdict cache keys
@@ -41,7 +50,8 @@ on the id, so rows recorded under an older observation rule are not reused.
 
 W#55 moves it again, on the policy-9 universe (categories and counts unchanged): `9.261d14e34119` →
 `9.415d3755221e`; two-sign `9+neg.f5a15364c11d` → `9+neg.001902a9950c`. Receipts and cached verdicts
-recorded under the old id are not reused.
+recorded under the old id are not reused. W#49 moves only the two-sign id, `9+neg.001902a9950c` →
+`9+neg.89326e7f549c`: its rule is a two-sign Form B operator's, so the one-sign id and its receipts stand.
 
 ### The two-sign policy (μ⁻)
 

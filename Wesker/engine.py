@@ -61,7 +61,7 @@ from .memory_guard import over_budget as _over_budget
 from .memory_guard import reclaim as _reclaim
 from .memory_guard import resolve_budget as _resolve_budget
 from .memory_guard import run_baseline_bytes as _mem_baseline
-from .mu_minus import GENERATOR_MATERIALIZE_CAP, YIELD_MODES, form_b
+from .mu_minus import GENERATOR_MATERIALIZE_CAP, YIELD_MODES, begin_test, form_b
 from .subsumption import distinct_obligations as _distinct_obligations
 from .subsumption import redundancy_groups
 from .swap_plan import SWAP_PAIR_BUDGET, swap_label, swap_plan
@@ -7324,6 +7324,8 @@ def evaluate_mutant(
                 # run's failure — or its pass, if the target swallowed the guard — is the guard's.
                 # The original-control below runs the ORIGINAL with every installed binding restored,
                 # so it stays unarmed, like the baseline.
+                # A test boundary (#49): a Form B wrapper's memory (stale) ends with the test that made it.
+                begin_test()
                 with contain_writes() as blocked:
                     result = _run_test_with_timeout(
                         test_fn,

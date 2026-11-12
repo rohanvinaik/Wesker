@@ -119,7 +119,6 @@ def test_value_survived_still_excludes_exception():
         killed_by_exception=1,
         killed_by_crash=1,
         survived=1,
-        timed_out=0,
     )
     assert cr.value_survived == 2  # survived + crash — never the exception kill
 

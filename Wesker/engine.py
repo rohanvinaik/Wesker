@@ -211,7 +211,9 @@ class MutantResult:
 
     mutant: Mutant
     killed: bool = False
-    killed_by: str | None = None  # "assertion" | "exception" | "crash" | "timeout"
+    # A kill reason ("assertion" | "exception" | "crash") when `killed`; otherwise the unscored
+    # outcome that ended the observation ("diverged" | "undetermined"), never a kill.
+    killed_by: str | None = None
     test_name: str | None = None  # first killing test (first-killer mode)
     elapsed_ms: float = 0.0
     equivalent: bool = False
@@ -228,7 +230,7 @@ class MutantResult:
     killer_scan: str = ""
     # False when a timed-out worker could not be stopped — blocked outside the interpreter
     # (subprocess/socket/C-extension), where the async-exception injection cannot land (#14). The
-    # kill still counts as a run-only timeout, but the measurement is UNCONTAINED: the runaway may
+    # observation is `undetermined`, never a kill, and the measurement is UNCONTAINED: the runaway may
     # still be executing and mutating shared state, so a profile that contains it is not gateable.
     contained: bool = True  # all killers (full-matrix mode)
     # WHICH test's timed-out worker could not be stopped, when `contained` is False: its id in the kill
@@ -494,7 +496,6 @@ class CategoryResult:
     killed_by_assertion: int = 0
     killed_by_exception: int = 0
     killed_by_crash: int = 0
-    timed_out: int = 0
     equivalent: int = 0
     # Mutants whose outcome measured the HARNESS, not the suite (issue #18): never built,
     # never installed at any call site, never entered by the test, or cut mid-measurement.
@@ -516,7 +517,7 @@ class CategoryResult:
         function does on that input as precisely as ``== 3`` states it elsewhere. Raising IS
         the return behaviour of an error path.
 
-        Only crash/timeout are excluded, and for the original reason: they prove the code RAN,
+        Only a crash is excluded, and for the original reason: it proves the code RAN,
         not WHAT it did. Counting a declared failure among them read a pin as a gap — and since
         an error path can be pinned ONLY this way, it made every input-validating function
         permanently unspecifiable rather than merely unspecified."""
@@ -524,9 +525,9 @@ class CategoryResult:
 
     @property
     def value_survived(self) -> int:
-        """Value-unspecified DOF: survivors PLUS crash/timeout kills. For specification
-        these are equivalent — none pins the return value."""
-        return self.survived + self.killed_by_crash + self.timed_out
+        """Value-unspecified DOF: survivors PLUS crash kills. For specification
+        these are equivalent — neither pins the return value."""
+        return self.survived + self.killed_by_crash
 
 
 @dataclass
@@ -740,8 +741,8 @@ class ProfilingResult:
     operator_census: dict = field(default_factory=dict)
 
     # --- Value-specification view -------------------------------------------------
-    # An assertion kill pins WHAT the function returns; a crash/timeout kill only proves
-    # it RUNS. For SPECIFICATION only assertion kills count, so crash/timeout kills are
+    # An assertion kill pins WHAT the function returns; a crash kill only proves
+    # it RUNS. For SPECIFICATION only assertion kills count, so crash kills are
     # unspecified value-DOF. Derived (not stored) so they can never drift from the record
     # of record — any ProfilingResult, however constructed, reports the split correctly.
 
@@ -803,13 +804,13 @@ class ProfilingResult:
 
     @property
     def value_survived(self) -> int:
-        """Value-unspecified DOF: true survivors PLUS crash/timeout kills."""
+        """Value-unspecified DOF: true survivors PLUS crash kills."""
         return sum(cr.value_survived for cr in self.per_category)
 
     @property
     def value_survivor_records(self) -> list[dict]:
         """Survivor-shaped record for every value-unspecified mutant — the true survivors
-        plus each crash/timeout kill (reshaped from ``killed_records``, carrying its diff)
+        plus each crash kill (reshaped from ``killed_records``, carrying its diff)
         so a value-distinguishing witness can be sought for behavior the tests only ran.
 
         Carries ``mutated_line``, ``dimension`` and ``change`` through from the kill record.
@@ -960,7 +961,7 @@ class ProfilingResult:
             }
         if self.survivor_records:
             d["survivor_records"] = self.survivor_records
-        # The value-unspecified set: true survivors PLUS crash/timeout kills. This is what a
+        # The value-unspecified set: true survivors PLUS crash kills. This is what a
         # SPECIFICATION consumer wants — `spec_pct` counts assertion kills alone, so a report
         # that listed only `survivor_records` would claim a gap and then name none of it, and
         # the SARIF/annotations built from it would show a clean diff under a red badge.
@@ -7471,9 +7472,7 @@ def evaluate_mutant(
         scan_reasons: dict[str, str] = {}
         scan_unresolved: list[str] = []
         decided: dict[str, Any] | None = None
-        first_reason: str | None = (
-            None  # provisional crash/timeout kill (no assertion yet)
-        )
+        first_reason: str | None = None  # provisional crash kill (no assertion yet)
         first_killer: str | None = None
         saw_uncontained = False  # a timed-out worker that could not be stopped (#14)
         uncontained_test: str | None = None  # the first test whose worker that was
@@ -8483,7 +8482,7 @@ def _run_test_with_timeout(
         # `abandon` injects an async exception that CANNOT land while the worker is blocked OUTSIDE
         # the interpreter (subprocess/socket/C-extension) — it only lands at the next bytecode. If
         # the thread is still alive after the unwind allowance, the timed-out work is UNCONTAINED:
-        # it may still be running and mutating shared state, so reporting it as a clean "timeout"
+        # it may still be running and mutating shared state, so reporting it as a clean `undetermined`
         # is a false measurement. The caller must refuse to gate on it (#14).
         timed_out, contained = bounded_join(
             thread, timeout_ms / 1000.0, unwind_s=_ABANDON_UNWIND_S
@@ -8760,7 +8759,8 @@ def _isolated_result(
         )
     _entered_map = {"entered": True, "not_entered": False, "unobserved": None}
     entered = _entered_map[entry_disposition(run.ran, run.entered_probe)]
-    if run.timed_out:
+    verdict = mutant_verdict(run.outcome)
+    if verdict == "undetermined":
         return MutantResult(
             mutant=mutant,
             killed=False,
@@ -8802,7 +8802,6 @@ def _isolated_result(
             refused_test=run.original_also_fails[0],
             elapsed_ms=elapsed_ms,
         )
-    verdict = mutant_verdict(run.outcome)
     if not run.constructed or verdict == "harness":
         return MutantResult(
             mutant=mutant,
@@ -8942,8 +8941,8 @@ def _evaluate_isolated(
     THE TIMEOUT IS THE CONFIGURED CAP, NOT THE IN-PROCESS ADAPTIVE ALLOWANCE. The allowance the loop
     tightens per mutant is calibrated for a bare in-process function CALL (microseconds); the isolated
     worker runs a whole pytest invocation per mutant (tens to hundreds of ms), so the allowance
-    expires mid-collection and every slower mutant reads as a spurious `timeout` KILL — inflating
-    adequacy, the one direction that must never happen. The cap, floored to cover pytest startup, is
+    expires mid-collection and every slower mutant reads as a spurious `undetermined` — a verdict
+    that depends on how fast the machine happened to be. The cap, floored to cover pytest startup, is
     the hang bound instead; `select` returns the instant the worker answers, so the generous floor
     costs a normal mutant nothing and only bounds a true runaway.
     """
@@ -9669,8 +9668,6 @@ def run_function_profiling(
                     cr.killed_by_exception += 1
                 elif result.killed_by == "crash":
                     cr.killed_by_crash += 1
-                elif result.killed_by == "timeout":
-                    cr.timed_out += 1
                 if result.test_name:
                     kill_matrix.setdefault(mutant.description, []).append(
                         result.test_name
@@ -9685,7 +9682,7 @@ def run_function_profiling(
                         relation_seen,
                         relation_mutants,
                     )
-                # Carry diff_summary on EVERY kill: a crash/timeout kill is a value-survivor
+                # Carry diff_summary on EVERY kill: a crash kill is a value-survivor
                 # (see ProfilingResult.value_survivor_records) and needs the diff for a
                 # value-distinguishing witness search downstream.
                 killed_records.append(
@@ -9938,8 +9935,6 @@ def run_function_profiling(
                 _cr.killed_by_exception += 1
             elif _res.killed_by == "crash":
                 _cr.killed_by_crash += 1
-            elif _res.killed_by == "timeout":
-                _cr.timed_out += 1
             survivor_records[:] = [
                 r for r in survivor_records if r["mutant_id"] != _mid
             ]
@@ -11280,8 +11275,6 @@ def run_function_converged(
                 cr.killed_by_exception += 1
             elif result.killed_by == "crash":
                 cr.killed_by_crash += 1
-            elif result.killed_by == "timeout":
-                cr.timed_out += 1
         elif result.equivalent:
             cr.total += 1
             cr.equivalent += 1

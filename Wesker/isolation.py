@@ -173,7 +173,7 @@ class IsolatedRun:
     stdout: str
     #: The kill vocabulary the worker classified for this mutant (assertion/exception/crash), or
     #: None. Set only on the server path, where a mutant's failure reasons cross back as data; the
-    #: one-shot and timeout paths leave it None (a timeout's reason is named by `mutant_verdict`).
+    #: one-shot and timeout paths leave it None (a timed-out run has no kill reason: it is `undetermined`).
     killed_by: str | None = None
     #: False when the mutant would not compile — the worker installed nothing, so the outcome
     #: measures the harness, not the suite (#18). The engine scores that `harness_error`, outside
@@ -315,16 +315,19 @@ def mutant_verdict(outcome: str) -> str:
     The worker runs the covering node IDs against the mutant; pytest's exit is the verdict.
 
     * ``failed`` — a node FAILED under the mutant: the suite detected the mutation → ``killed``.
-    * ``timeout`` — the mutant made a node hang past its budget: a run-only kill, detected by time
-      → ``killed`` (the worker was terminated; containment travels separately on the run).
+    * ``timeout`` — the mutant made a node hang past its wall: nothing was established. A wall
+      bound is liveness only, never detection (W#27) → ``undetermined``, neither killed nor
+      survived (the worker was terminated; containment travels separately on the run).
     * ``passed`` — every node passed under the mutant: nothing distinguished it → ``survived``.
     * ``no_tests`` / ``error`` — no node ran, or the run could not collect: this measures the
       HARNESS, not the suite, and belongs on NEITHER side of the denominator → ``harness``, the
       same discipline ``engine.mutant_disposition`` keeps for the in-process path so a collection
       failure never inflates a kill score.
     """
-    if outcome in ("failed", "timeout"):
+    if outcome == "failed":
         return "killed"
+    if outcome == "timeout":
+        return "undetermined"
     if outcome == "passed":
         return "survived"
     return "harness"
@@ -767,7 +770,7 @@ class IsolatedMutantWorker:
 
     A single mutant that hangs terminates the whole process GROUP — the worker AND any child — and
     marks this worker dead, so the caller recycles a fresh one; the hung mutant's result is a
-    contained timeout kill.
+    contained wall-bound stop: ``timed_out``, which is `undetermined`, never a kill.
     """
 
     def __init__(
@@ -858,7 +861,7 @@ class IsolatedMutantWorker:
         ready, _, _ = select.select([self._proc.stdout], [], [], timeout_s)
         if not ready:
             # The mutant hung the worker. Kill the whole group and retire it — a fresh worker takes
-            # the next mutant, and this one is a contained timeout kill.
+            # the next mutant, and this one is a contained wall-bound stop (`undetermined`, never a kill).
             contained = self._reap()
             self._alive = False
             return IsolatedRun(-9, True, contained, "")

@@ -361,6 +361,30 @@ def child_wait_disposition(found: int, gone: bool) -> str:
     return "released" if gone else "survived"
 
 
+# The stop path runs INSIDE the measuring process, between the tests it measures, and a test may have
+# replaced `subprocess.Popen` or `subprocess.run` with a stand-in when its worker is stopped (#29). The
+# names are therefore bound here, at import, and never looked up on the module again: the first whole-
+# codebase run with this path ended on `isinstance() arg 2 must be a type` from a patched `Popen`.
+_REAL_POPEN = subprocess.Popen
+_REAL_RUN = subprocess.run
+_REAL_SUBPROCESS_ERROR = subprocess.SubprocessError
+
+
+def _is_unreaped_child(value: Any) -> bool:
+    """Whether ``value`` is a real ``Popen`` still waiting on its child. Never raises: a local that is a
+    proxy, a mock or a half-built object answers False, since it names no child to stop."""
+    try:
+        # `pid` is None until the spawn returns: a Popen caught mid-construction names no child
+        return (
+            isinstance(value, _REAL_POPEN)
+            and value.returncode is None
+            and isinstance(value.pid, int)
+        )
+    # BLE001: any object a test left in a frame may raise from an attribute; it names no child
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _popen_pids(thread: Any) -> list[int]:
     """Process ids of the unreaped ``subprocess.Popen`` objects the thread's own frames hold.
 
@@ -379,13 +403,7 @@ def _popen_pids(thread: Any) -> list[int]:
         except Exception:  # noqa: BLE001
             values = []
         for value in values:
-            # `pid` is None until the spawn returns: a Popen caught mid-construction names no child
-            if (
-                isinstance(value, subprocess.Popen)
-                and value.returncode is None
-                and isinstance(value.pid, int)
-                and value.pid not in pids
-            ):
+            if _is_unreaped_child(value) and value.pid not in pids:
                 pids.append(value.pid)
         frame = frame.f_back
     return pids
@@ -412,14 +430,14 @@ def _children_map() -> dict[int, list[int]]:
             parents[int(name)] = int(tail[1])
     if not parents:
         try:
-            listing = subprocess.run(
+            listing = _REAL_RUN(
                 ["ps", "-A", "-o", "pid=,ppid="],
                 capture_output=True,
                 text=True,
                 timeout=5,
                 check=False,
             ).stdout
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, _REAL_SUBPROCESS_ERROR):
             listing = ""
         for line in listing.splitlines():
             fields = line.split()
@@ -441,10 +459,15 @@ def release_child_waits(thread: Any, grace_s: float = CHILD_WAIT_GRACE_S) -> boo
     worker's own children and everything beneath them (``process_tree_members``), never the measuring
     process.
     """
-    roots = _popen_pids(thread)
-    members = process_tree_members(
-        roots, _children_map() if roots else {}, [os.getpid()]
-    )
+    try:
+        roots = _popen_pids(thread)
+        members = process_tree_members(
+            roots, _children_map() if roots else {}, [os.getpid()]
+        )
+    # BLE001: finding the children reads state the measured tests can change (a patched `open`, a
+    # frame that raises); a search that fails found no child, and must not end the measurement
+    except Exception:  # noqa: BLE001
+        roots, members = [], []
     sig = signal.SIGTERM if sys.platform == "win32" else signal.SIGKILL
     for pid in members:
         with contextlib.suppress(OSError):

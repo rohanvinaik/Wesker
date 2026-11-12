@@ -6575,22 +6575,68 @@ _MUTANT_ALLOWANCE_MULTIPLIER = 50.0
 
 
 def _adaptive_allowance(
-    baseline_ms: float | None, cap_ms: float, remaining_ms: float
+    baseline_ms: float | None,
+    cap_ms: float,
+    remaining_ms: float,
+    slowdown: float = 1.0,
 ) -> float:
-    """The wall-clock a single mutant evaluation gets (#13).
+    """The wall-clock a single UNARMED mutant observation gets (#13, W#27, pure — pinned).
 
     ``baseline_ms`` is the ORIGINAL's live runtime over the same tests, or None when no trustworthy
     baseline exists (no original, or a red one) — then fall back to the configured cap rather than
     invent precision. The allowance is at least the floor and at most the cap, and it NEVER exceeds
     ``remaining_ms``, the remaining aggregate deadline, which is always the final upper bound.
+
+    ``slowdown`` is the calibrated factor of the liveness bound (`monitoring.harness_slowdown`). The
+    floor and the cap are reference-machine milliseconds, and without the factor they were the one
+    part of this wall that did not move with the machine: a slow machine met the floor, and the cap,
+    sooner in proportion to its work and read a terminating mutant `undetermined`. The multiplier
+    needs none: the baseline it multiplies was measured live on this machine. ``remaining_ms`` is a
+    real deadline and is never scaled. A factor below 1 is read as 1.
     """
+    scale = max(slowdown, 1.0)
+    cap = cap_ms * scale
     if baseline_ms is None:
-        base = cap_ms
+        base = cap
     else:
         base = max(
-            _MUTANT_ALLOWANCE_FLOOR_MS, baseline_ms * _MUTANT_ALLOWANCE_MULTIPLIER
+            _MUTANT_ALLOWANCE_FLOOR_MS * scale,
+            baseline_ms * _MUTANT_ALLOWANCE_MULTIPLIER,
         )
-    return min(base, cap_ms, remaining_ms)
+    return min(base, cap, remaining_ms)
+
+
+def _unbounded_ceiling_ms(per_mutant_timeout_ms: float) -> float:
+    """The stand-in for "no aggregate deadline" in an allowance, in ms (W#27).
+
+    Where the caller set no deadline the per-mutant ask stood in for the remaining time, so the cap
+    was also the ceiling above it. It is reference time like the cap, and follows the same slowdown;
+    left unscaled it would hold a slow machine's scaled cap back to the reference one.
+    """
+    from Wesker.monitoring import machine_slowdown
+
+    return per_mutant_timeout_ms * max(machine_slowdown()[0], 1.0)
+
+
+def _machine_allowance(
+    baseline_ms: float | None, cap_ms: float, remaining_ms: float
+) -> float:
+    """`_adaptive_allowance` under this machine's calibrated slowdown (W#27)."""
+    from Wesker.monitoring import machine_slowdown
+
+    return _adaptive_allowance(baseline_ms, cap_ms, remaining_ms, machine_slowdown()[0])
+
+
+def _original_count_wall_ms(timeout_ms: float) -> float:
+    """The wall the ORIGINAL's counted run of a test gets, in ms (W#27).
+
+    A reference-time floor stretched by the calibrated slowdown, like every other wall that can
+    decide a verdict: an original that reaches the wall is `original_undetermined` and leaves its
+    test unarmed, so a fixed wall made whether a test is budgeted depend on the machine.
+    """
+    from Wesker.monitoring import machine_slowdown
+
+    return max(timeout_ms, _ORIGINAL_COUNT_FLOOR_MS) * machine_slowdown()[0]
 
 
 def _live_collection_identity() -> tuple[
@@ -7482,7 +7528,7 @@ def evaluate_mutant(
                     original_codes,
                     module_saved,
                     func_name,
-                    max(timeout_ms, _ORIGINAL_COUNT_FLOOR_MS),
+                    _original_count_wall_ms(timeout_ms),
                 )
                 allowance_t0 += spent_ms / 1000.0
                 remaining_ms = timeout_ms - _elapsed(allowance_t0)
@@ -8831,7 +8877,7 @@ def _isolated_step_caps(
         [call for call, _selector in selected],
         original_func,
         original_codes,
-        max(per_mutant_timeout_ms, _ORIGINAL_COUNT_FLOOR_MS),
+        _original_count_wall_ms(per_mutant_timeout_ms),
     )
     caps: dict[str, int] = {}
     cost_ms = 0.0
@@ -9157,13 +9203,13 @@ def _complete_relation_rows(
         remaining = (
             budget_ms - _elapsed(start)
             if budget_ms is not None
-            else per_mutant_timeout_ms
+            else _unbounded_ceiling_ms(per_mutant_timeout_ms)
         )
         res = evaluate_mutant(
             mutant,
             extra,
             original_func,
-            timeout_ms=_adaptive_allowance(
+            timeout_ms=_machine_allowance(
                 baseline_ms, per_mutant_timeout_ms, remaining
             ),
             qualname=qualname,
@@ -9490,9 +9536,9 @@ def run_function_profiling(
             remaining_ms = (
                 budget_ms - _elapsed(start)
                 if budget_ms is not None
-                else per_mutant_timeout_ms
+                else _unbounded_ceiling_ms(per_mutant_timeout_ms)
             )
-            allowance_ms = _adaptive_allowance(
+            allowance_ms = _machine_allowance(
                 baseline_ms, per_mutant_timeout_ms, remaining_ms
             )
             # The list this mutant is evaluated against, kept: a `not_entered` cause is a claim about
@@ -9800,13 +9846,13 @@ def run_function_profiling(
             _remaining_ms = (
                 budget_ms - _elapsed(start)
                 if budget_ms is not None
-                else per_mutant_timeout_ms
+                else _unbounded_ceiling_ms(per_mutant_timeout_ms)
             )
             _res = evaluate_mutant(
                 _mutant,
                 _tests_for(_mutant),
                 original_func,
-                timeout_ms=_adaptive_allowance(
+                timeout_ms=_machine_allowance(
                     baseline_ms, per_mutant_timeout_ms, _remaining_ms
                 ),
                 qualname=qualname,
@@ -10862,7 +10908,7 @@ def run_function_converged(
                         mutant,
                         scoped,
                         original_func,  # type: ignore[arg-type]
-                        timeout_ms=_adaptive_allowance(None, _cap_ms, _remaining_ms),
+                        timeout_ms=_machine_allowance(None, _cap_ms, _remaining_ms),
                         qualname=qualname,
                         record_all_killers=full_matrix,
                         source_path=source_path,
@@ -11084,7 +11130,7 @@ def run_function_converged(
                         _mutant,
                         _scoped,
                         original_func,  # type: ignore[arg-type]
-                        timeout_ms=_adaptive_allowance(None, _cap_ms, _remaining_ms),
+                        timeout_ms=_machine_allowance(None, _cap_ms, _remaining_ms),
                         qualname=qualname,
                         record_all_killers=full_matrix,
                         source_path=source_path,

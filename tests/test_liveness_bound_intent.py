@@ -93,6 +93,16 @@ def test_the_compute_budget_setting():
         assert parse_compute_budget(bad) == (LIVENESS_BUDGET_S, "invalid"), bad
 
 
+def test_a_blank_setting_is_the_default_and_not_an_invalid_one():
+    # Alone on purpose: a mutant that crashes on None fails `test_the_compute_budget_setting` at its
+    # first line, so the blank-string assertion there never runs under it and pins nothing.
+    assert parse_compute_budget("  ") == (LIVENESS_BUDGET_S, "default")
+
+
+def test_a_number_is_a_set_budget_and_not_the_default():
+    assert parse_compute_budget("25") == (25.0, "set")
+
+
 def test_an_invalid_budget_is_refused_not_ignored(monkeypatch):
     monkeypatch.setenv(COMPUTE_BUDGET_ENV, "plenty")
     with pytest.raises(ValueError, match=COMPUTE_BUDGET_ENV):

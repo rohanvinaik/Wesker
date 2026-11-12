@@ -226,6 +226,12 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/isolation.py::mutant_verdict": {
+    "cut_reasons": [],
+    "function_digest": "d1dd1fb2e1c7c5f9",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/memory_guard.py::speculative_address_cap": {
     "cut_reasons": [],
     "function_digest": "27c6be4e5615cca0",
@@ -238,6 +244,18 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/monitoring.py::liveness_action": {
+    "cut_reasons": [],
+    "function_digest": "84fc865c2278550c",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/monitoring.py::liveness_bound_ms": {
+    "cut_reasons": [],
+    "function_digest": "bcb96cc362858980",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/monitoring.py::mutant_step_cap": {
     "cut_reasons": [],
     "function_digest": "c980617f8669da44",
@@ -247,6 +265,12 @@
   "Wesker/monitoring.py::original_step_observation": {
     "cut_reasons": [],
     "function_digest": "a524a0ff758823f3",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/monitoring.py::parse_compute_budget": {
+    "cut_reasons": [],
+    "function_digest": "2a658bd95e062820",
     "refusal": "",
     "standing": "complete"
   },

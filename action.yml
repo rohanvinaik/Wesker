@@ -17,6 +17,13 @@ inputs:
       [tool.wesker] source_dir, [tool.coverage.run], hatch packages, or an src/ layout.
     required: false
     default: ""
+  shard:
+    description: >-
+      Measure one shard of a sharded run, as i/N, with `targets` set to that shard's group. The run
+      then records what it was asked to measure and how it ended in .wesker/shard_report.json, for the
+      merge (`python -m Wesker.action --merge`). Leave empty for an ordinary run.
+    required: false
+    default: ""
   threshold:
     description: "Fail if specification completeness (%) is below this. 0 disables."
     required: false
@@ -136,6 +143,7 @@ runs:
         WESKER_THRESHOLD: ${{ inputs.threshold }}
         WESKER_ALLOW_TRUNCATION: ${{ inputs.allow-truncation }}
         WESKER_BUDGET: ${{ inputs.budget }}
+        WESKER_SHARD: ${{ inputs.shard }}
       run: |
         ARGS=()
         [ -n "$WESKER_BASE_REF" ] && ARGS+=(--base-ref "$WESKER_BASE_REF")
@@ -145,6 +153,7 @@ runs:
         [ -n "$WESKER_SARIF" ] && ARGS+=(--sarif "$WESKER_SARIF")
         [ "$WESKER_THRESHOLD" != "0" ] && ARGS+=(--threshold "$WESKER_THRESHOLD")
         [ "$WESKER_ALLOW_TRUNCATION" = "true" ] && ARGS+=(--allow-truncation)
+        [ -n "$WESKER_SHARD" ] && ARGS+=(--shard "$WESKER_SHARD")
         ARGS+=(--budget "$WESKER_BUDGET")
 
         # One run. It writes GITHUB_OUTPUT, GITHUB_STEP_SUMMARY, annotations, JSON and SARIF

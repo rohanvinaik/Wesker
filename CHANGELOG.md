@@ -126,6 +126,16 @@ functions with a single input, where stale reads as candidate-equivalent.
   `spec-full.yml` sets it to 900, bounds the job at 180 minutes (liveness, never the measurement's
   budget) and lets a newer push supersede a running measurement. Every push of 2026-10-24 had run
   that job for six hours with no output after the file count. (`9362bc5`, W#29)
+- **The Action can measure a codebase as shards and merge them into the number one run would give.**
+  `python -m Wesker.action --plan-shards N` prints the matrix for the targets an unsharded run would
+  measure (a deterministic split by source size, no empty group); `--shard i/N` measures one group; every
+  run now writes `.wesker/shard_report.json` (its files, commit, policy id, Wesker version, shard
+  index/count, report, and the refusal it ended in, if any); `--merge --plan P reports...` sums the counts,
+  computes each percentage once, and refuses, naming the cause and publishing no number, for a missing
+  shard, disagreeing commit/policy/version, a file in two shards, a union that is not the plan, or any
+  shard's own refusal. `spec-full.yml` is now plan, a `fail-fast: false` measure matrix and an aggregate
+  job; the per-job limits, the stack dumps and the pinned actions are kept. Adds an action input `shard`;
+  no verdict and no policy id changes. (W#29, B1)
 
 ## 1.2.2 — 2026-10-24
 

@@ -32,8 +32,11 @@ from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeGuard
 from .interrupt import (
     JoinedWorker,
     MeasurementRefused,
+    abandoned_site,
+    abandoned_standing,
     acquire_unstranded,
     bounded_join,
+    claim_abandoned,
     mark_refusal,
     starter_chain,
 )
@@ -1003,21 +1006,27 @@ def _containment_lost(
     cannot name the same loss differently. A baseline name may be a marker rather than a test,
     ``session_baseline`` or ``baseline_sizing``, when no single test is known.
     """
-    lost: list[dict] = [
-        {"phase": "baseline", "test": name} for name in sorted(baseline)
-    ]
+    lost: list[dict] = []
+    for name in sorted(baseline):
+        entry = {"phase": "baseline", "test": name}
+        # Where the worker is parked (W#29), when the join that gave up on it recorded it: a test
+        # name says whose it is, the site says what it is blocked on, and that is the remedy.
+        if where := abandoned_site(name):
+            entry["where"] = where
+        lost.append(entry)
     for r in results:
         if r.contained:
             continue
-        lost.append(
-            {
-                "phase": "mutation",
-                "test": r.uncontained_test or "",
-                "mutant_id": r.mutant.mutant_id,
-                "mutant": r.mutant.description,
-                "mutated_line": r.mutant.mutated_line,
-            }
-        )
+        entry = {
+            "phase": "mutation",
+            "test": r.uncontained_test or "",
+            "mutant_id": r.mutant.mutant_id,
+            "mutant": r.mutant.description,
+            "mutated_line": r.mutant.mutated_line,
+        }
+        if where := abandoned_site(r.uncontained_test or ""):
+            entry["where"] = where
+        lost.append(entry)
     return tuple(lost)
 
 
@@ -4530,12 +4539,22 @@ def build_session_baseline(
     # Tests whose reach the tracer could not fully observe (#17): a thread they started outlived
     # their traced run. Their missing lines are unknown, never "not reached".
     incomplete_reach: dict[str, str] = {}
+
+    def _claim_after_each(done: int, total: int, elapsed_ms: float) -> None:
+        # `trace_suite` reports a test once its trace is over, and runs one test at a time: a worker
+        # a bounded join left running since the last report is THAT test's (W#29). The trace's own
+        # join cannot name it, so the name is attached here, where the loop is known.
+        if 0 < done <= len(test_functions):
+            claim_abandoned(callable_test_id(test_functions[done - 1]))
+        if trace_progress is not None:
+            trace_progress(done, total, elapsed_ms)
+
     traced = _trace_suite(
         test_functions,
         target_files,
         trace_budget_s,
         truncated,
-        trace_progress,
+        _claim_after_each,
         trace_session_budget_s,
         cache,
         uncontained,
@@ -4618,6 +4637,11 @@ def build_session_baseline(
             typed = prior_status[test_id]
         else:
             outcome = _run_test_with_timeout(test_fn, None, True, timeout_ms)
+            # A worker this run could not stop is still alive in this process, and the trace pass
+            # above is not the only place one is made: this pass used to file it as an ordinary
+            # failing test and say nothing (W#29, the #14 class).
+            if baseline_probe_disposition(outcome) == "uncontained":
+                uncontained.add(test_id)
             # Read the live item's own category right after the run it describes (#17): the runner
             # returns normally for a skip and an expected failure, so `outcome` alone reads both
             # as a pass.
@@ -5117,7 +5141,17 @@ def _build_test_scope(
         # (#19 wired it into the exhaustive one only), so routing it through the shared scope
         # builder is what stops the two drifting apart again.
         if session.uncontained and uncontained is not None:
-            uncontained.add("session_baseline")
+            # NAMED, and only while the worker lives (W#29). This used to add the marker
+            # "session_baseline", which names no test, for every function of the session, and kept
+            # it for the life of the process: one test in the baseline's trace made 572 functions
+            # partial. The names are on the baseline already. A worker that has since ended shares
+            # nothing with a measurement that begins now; one that has not is named, with the
+            # place it is parked, in every function it can still touch.
+            uncontained.update(
+                name
+                for name in sorted(session.uncontained)
+                if abandoned_standing(name) != "ended"
+            )
     elif original_func is not None:
         line_cov = _trace_line_coverage(
             test_functions,
@@ -6587,9 +6621,10 @@ def _measure_scoped_baseline(
     test_functions: list[Callable[..., None]],
     original_func: Callable[..., Any] | None,
     cap_ms: float,
-) -> tuple[float | None, bool]:
+) -> tuple[float | None, str]:
     """The ORIGINAL's live wall-clock over ``test_functions``, UNTRACED like the mutant loop, for
-    sizing an adaptive per-mutant allowance (#13), AND whether any probe went uncontained.
+    sizing an adaptive per-mutant allowance (#13), AND the id of the test whose probe went
+    uncontained ("" when none did; W#29 named it, it was a bool).
 
     The clock is None when there is no trustworthy baseline — no original, no tests, or a test
     that does not pass cleanly on the original (a red baseline is not a clock). Each test is
@@ -6602,17 +6637,19 @@ def _measure_scoped_baseline(
     fix for one issue opened a new door into another (#14).
     """
     if original_func is None or not test_functions:
-        return None, False
+        return None, ""
+    from Wesker.ci import callable_test_id
+
     t0 = time.monotonic()
     for test_fn in test_functions:
         disposition = baseline_probe_disposition(
             _run_test_with_timeout(test_fn, original_func, True, cap_ms)
         )
         if disposition == "uncontained":
-            return None, True
+            return None, callable_test_id(test_fn)
         if disposition != "usable":
-            return None, False
-    return _elapsed(t0), False
+            return None, ""
+    return _elapsed(t0), ""
 
 
 # PROCESS-WIDE EXECUTION LOCK (#19). Mutant evaluation monkey-patches a module global, runs a
@@ -8349,6 +8386,11 @@ def _run_test_with_timeout(
         )
 
     if timed_out and not contained:
+        # The join recorded the worker it could not stop without a name; this site knows the test
+        # (W#29), so a refusal can say whose it was and where it is parked.
+        from Wesker.ci import callable_test_id
+
+        claim_abandoned(callable_test_id(test_fn))
         return "uncontained"
     # THE SIDE CHANNEL (#28): read after the join, where nothing the test or pytest caught can
     # have erased it. `result_box` says "crash" (or whatever the test made of the refusal).
@@ -9264,7 +9306,7 @@ def run_function_profiling(
         _sizing_tests, original_func, per_mutant_timeout_ms
     )
     if _sizing_uncontained:
-        _baseline_uncontained.add("baseline_sizing")
+        _baseline_uncontained.add(_sizing_uncontained)
 
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
     kill_matrix: dict[str, list[str]] = {}

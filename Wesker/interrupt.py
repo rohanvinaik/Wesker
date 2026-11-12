@@ -23,6 +23,15 @@ until that call returns on its own. `abandon` returns False there rather than cl
 did not make. Bounding that for real needs process isolation, which is a different engine than an
 in-process one.
 
+WHAT IS STILL STOPPABLE THERE (W#29). Most of what a test blocks on outside the interpreter in this
+pair's own suite is a CHILD PROCESS: ``subprocess.run`` parked in ``selector.poll``. That wait ends the
+moment the child does, and the injection already pending then lands, so the thread unwinds. A worker
+found parked in such a wait has its children killed (:func:`release_child_waits`), and only a worker
+that is STILL alive after that is reported uncontained. What remains (a lock, a socket, a sleep, a C
+extension) is recorded with the place it is parked (:func:`note_abandoned`), so a refusal can name it,
+and its standing is a fact about a LIVE thread (:func:`abandoned_standing`): it lapses when the thread
+ends.
+
 THE STRANDED LOCK (W#29). The injection lands at the target's next eval-breaker check, and the
 check right after a call returns is one of them. A thread parked in a CONTENDED acquire releases
 the GIL, so the injection is made while it waits; the lock is then handed to it, the acquire
@@ -50,7 +59,12 @@ the lock's orphan channels, never prevented.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import os
+import signal
+import subprocess
+import sys
 import threading
 import weakref
 from typing import Any
@@ -289,14 +303,254 @@ def abandon(thread: Any) -> bool:
     return not thread.is_alive()
 
 
+# How long a worker whose child processes were just killed is given to unwind. The kill ends the wait
+# the instant the kernel delivers it and the injection already pending lands at the next bytecode, so
+# this is a ceiling for a loaded machine, paid only on a timeout and only when a child wait was found.
+CHILD_WAIT_GRACE_S = 2.0
+
+
+def process_tree_members(
+    roots: list[int], children_of: dict[int, list[int]], protected: list[int]
+) -> list[int]:
+    """The process ids to stop for a worker parked on ``roots``: each root and everything beneath it (#29, pure — pinned).
+
+    A child the worker waits on may have children of its own (a test that runs a whole pytest session
+    in a subprocess does), and one that inherited the pipe keeps the wait alive after its parent dies,
+    so the root alone is not enough. Split from :func:`release_child_waits` because the process table
+    cannot be supplied as a literal; this takes the table as a ``dict``.
+
+    Never a process this decision must not name: ``protected`` (the measuring process itself, whose id
+    a stale or forged table could place under a root), ids ``<= 1`` (init, or a group id passed by
+    mistake), and anything beneath a protected id. A cycle in the table ends the walk instead of
+    looping. Sorted, so the same table always gives the same answer.
+    """
+    guarded = set(protected)
+    seen: set[int] = set()
+    frontier = list(roots)
+    # Generation by generation, with a bound no table can exceed (every id is entered once, so the
+    # depth is at most the number of ids): a malformed table ends the walk, and a mutant of the
+    # guards below cannot make it loop without end.
+    for _ in range(len(children_of) + len(roots) + 1):
+        following: list[int] = []
+        for pid in frontier:
+            if pid <= 1 or pid in guarded or pid in seen:
+                continue
+            seen.add(pid)
+            following.extend(children_of.get(pid, ()))
+        frontier = following
+    return sorted(seen)
+
+
+def child_wait_disposition(found: int, gone: bool) -> str:
+    """What stopping a worker's child processes achieved (#29, pure — pinned).
+
+      "no_child_wait"  the worker was parked on no child process, so there was nothing to stop and
+                       the worker is exactly as uncontained as it was
+      "released"       its children were stopped and the worker has since ended
+      "survived"       its children were stopped and the worker is STILL alive: it is blocked on
+                       something else as well (or on the child's pipe, held by a process outside the
+                       tree), and stays uncontained
+
+    ``found`` is how many child processes the worker's own frames named; ``gone`` whether the worker
+    had ended after they were stopped. Three states rather than a bool: "nothing to release" and "I
+    released and it did not help" have different remedies, and only the second says that the tree
+    walk missed a holder.
+    """
+    if found <= 0:
+        return "no_child_wait"
+    return "released" if gone else "survived"
+
+
+def _popen_pids(thread: Any) -> list[int]:
+    """Process ids of the unreaped ``subprocess.Popen`` objects the thread's own frames hold.
+
+    A worker parked in ``subprocess.run`` / ``communicate`` / ``wait`` holds its child in a local of
+    ``run`` and as ``self`` of ``communicate``, so the frames name exactly the children THIS worker
+    is waiting on and no other process: not a sibling's, not the measuring process's own helpers.
+    A child already reaped (``returncode`` set) is skipped, since its id may belong to someone else.
+    Best-effort: a frame that will not give up its locals names nothing.
+    """
+    frame = sys._current_frames().get(getattr(thread, "ident", None))
+    pids: list[int] = []
+    while frame is not None:
+        try:
+            values = list(frame.f_locals.values())
+        # BLE001: a frame that cannot be read names no child; it must not fail the stop
+        except Exception:  # noqa: BLE001
+            values = []
+        for value in values:
+            # `pid` is None until the spawn returns: a Popen caught mid-construction names no child
+            if (
+                isinstance(value, subprocess.Popen)
+                and value.returncode is None
+                and isinstance(value.pid, int)
+                and value.pid not in pids
+            ):
+                pids.append(value.pid)
+        frame = frame.f_back
+    return pids
+
+
+def _children_map() -> dict[int, list[int]]:
+    """``{parent: [children]}`` for every process, from ``/proc`` or else ``ps``; empty when neither answers."""
+    parents: dict[int, int] = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        names = []
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        # the command name sits in parentheses and may hold spaces; the fields after it do not
+        tail = data.rsplit(b")", 1)[-1].split()
+        if len(tail) > 1 and tail[1].isdigit():
+            parents[int(name)] = int(tail[1])
+    if not parents:
+        try:
+            listing = subprocess.run(
+                ["ps", "-A", "-o", "pid=,ppid="],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            listing = ""
+        for line in listing.splitlines():
+            fields = line.split()
+            if len(fields) == 2 and all(f.isdigit() for f in fields):
+                parents[int(fields[0])] = int(fields[1])
+    children: dict[int, list[int]] = {}
+    for pid, ppid in parents.items():
+        children.setdefault(ppid, []).append(pid)
+    return children
+
+
+def release_child_waits(thread: Any, grace_s: float = CHILD_WAIT_GRACE_S) -> bool:
+    """Stop the child processes ``thread`` is parked on, and say whether the thread then ended (#29).
+
+    Called after :func:`abandon` has left an exception pending on a thread that did not unwind. A wait
+    on a child ends when the child does, and the pending exception then lands, so killing the children
+    is what actually delivers the stop ``abandon`` could not. True only when the thread is confirmed
+    gone; ``child_wait_disposition`` names the other two outcomes. The kill is ``SIGKILL`` on the
+    worker's own children and everything beneath them (``process_tree_members``), never the measuring
+    process.
+    """
+    roots = _popen_pids(thread)
+    members = process_tree_members(
+        roots, _children_map() if roots else {}, [os.getpid()]
+    )
+    sig = signal.SIGTERM if sys.platform == "win32" else signal.SIGKILL
+    for pid in members:
+        with contextlib.suppress(OSError):
+            os.kill(pid, sig)
+    if roots:
+        thread.join(timeout=grace_s)
+    return child_wait_disposition(len(roots), not thread.is_alive()) == "released"
+
+
+def blocked_site(thread: Any) -> str:
+    """Where ``thread`` is parked, as ``file:line in function`` for its innermost frame, and the
+    innermost frame OUTSIDE the standard library and site-packages (the test's own line) when that is
+    a different one; "" when the thread has no frame (#29)."""
+    frame = sys._current_frames().get(getattr(thread, "ident", None))
+    if frame is None:
+        return ""
+    stdlib = os.path.dirname(os.__file__)
+    inner = f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno} in {frame.f_code.co_name}"
+    while frame is not None:
+        path = frame.f_code.co_filename
+        if not path.startswith(stdlib) and "site-packages" not in path:
+            own = f"{path}:{frame.f_lineno} in {frame.f_code.co_name}"
+            return inner if own.endswith(inner) else f"{inner}, called from {own}"
+        frame = frame.f_back
+    return inner
+
+
+class _Abandoned:
+    """One worker a bounded join gave up on while it was still running (#29)."""
+
+    __slots__ = ("label", "thread", "where")
+
+    def __init__(self, thread: Any, where: str, label: str) -> None:
+        self.thread = thread
+        self.where = where
+        self.label = label
+
+
+# Every worker a bounded join left running, oldest first. Never pruned: an entry whose thread has
+# since ended is how `abandoned_standing` tells "it ended" from "it was never observed".
+_ABANDONED: list[_Abandoned] = []
+
+
+def note_abandoned(thread: Any, where: str, label: str = "") -> None:
+    """Record a worker left running past its stop, with the place it is parked (#29).
+
+    ``label`` names the test it was running when the caller knows it; the baseline trace's join does
+    not, and :func:`claim_abandoned` labels those after the fact.
+    """
+    _ABANDONED.append(_Abandoned(thread, where, label))
+
+
+def claim_abandoned(label: str) -> None:
+    """Give ``label`` to every recorded worker that has none yet (#29).
+
+    Called by the owner of a loop that runs ONE test at a time (the baseline trace), straight after
+    each test: whatever was left running since the last call is that test's.
+    """
+    for record in _ABANDONED:
+        if not record.label:
+            record.label = label
+
+
+def abandoned_worker_standing(recorded: int, alive: int) -> str:
+    """Whether the workers left running under one label are still a hazard (#29, pure — pinned).
+
+    "unobserved"  no worker was recorded under the label: nothing is known about it, so it is
+                  treated as live. Absence of a record is not evidence that it ended.
+    "live"        at least one is still alive: it shares this process's working directory,
+                  environment, standard streams and patched module attributes, and runs the
+                  unwinding of its test (monkeypatch undo, fixture teardown) whenever its blocking
+                  call returns. No measurement taken while it lives is clean.
+    "ended"       every recorded worker has since ended: the hazard lapsed. A measurement that
+                  began after the last one ended shares nothing with it.
+    """
+    if recorded <= 0:
+        return "unobserved"
+    return "live" if alive > 0 else "ended"
+
+
+def abandoned_standing(label: str) -> str:
+    """:func:`abandoned_worker_standing` for the workers recorded under ``label``, read now."""
+    mine = [r for r in _ABANDONED if r.label == label]
+    return abandoned_worker_standing(
+        len(mine), sum(1 for r in mine if r.thread.is_alive())
+    )
+
+
+def abandoned_site(label: str) -> str:
+    """Where the (most recent) worker recorded under ``label`` was parked, or "" when none was."""
+    for record in reversed(_ABANDONED):
+        if record.label == label:
+            return record.where
+    return ""
+
+
 def bounded_join(
-    thread: Any, timeout_s: float | None, unwind_s: float = 0.0
+    thread: Any, timeout_s: float | None, unwind_s: float = 0.0, label: str = ""
 ) -> tuple[bool, bool]:
     """Wait for ``thread`` at most ``timeout_s`` (``None`` = unbounded) and, on EVERY way out, leave
     no runaway behind. Returns ``(timed_out, contained)``: ``timed_out`` when the wait expired with
     the thread still running; ``contained`` when it is confirmed gone afterwards (``abandon``'s
-    honest answer — False for a thread blocked outside the interpreter). ``unwind_s`` is extra
-    settling time the caller grants after the injection, on top of ``abandon``'s own.
+    honest answer, then :func:`release_child_waits` for a worker parked on a child process — False
+    for a thread blocked outside the interpreter on anything else). ``unwind_s`` is extra
+    settling time the caller grants after the injection, on top of ``abandon``'s own. A worker that
+    is still running is recorded (:func:`note_abandoned`) under ``label`` with where it is parked.
 
     THE ORPHAN (measured 2026-09-06, `detective converge` on its own engine): a bounded join is often
     NESTED — the classifier's `_outcome` joins a runaway mutant from inside a test that the traced
@@ -318,9 +572,14 @@ def bounded_join(
         timed_out = thread.is_alive()
         if timed_out:
             contained = abandon(thread)
-            if unwind_s > 0 and not contained:
-                thread.join(timeout=unwind_s)
-                contained = not thread.is_alive()
+            if not contained:
+                where = blocked_site(thread)
+                contained = release_child_waits(thread)
+                if unwind_s > 0 and not contained:
+                    thread.join(timeout=unwind_s)
+                    contained = not thread.is_alive()
+                if not contained:
+                    note_abandoned(thread, where, label)
     return timed_out, contained
 
 

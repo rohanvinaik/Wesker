@@ -2193,9 +2193,13 @@ _TRUNCATION_REMEDIES = (
     (
         "uncontained",
         (
-            "A timed-out test could not be stopped (it was blocked outside the interpreter), so "
-            "the profile stopped there. A larger budget will not help: bound the blocking call, "
-            "or run that test in a killable process."
+            "A timed-out test could not be stopped (it was blocked outside the interpreter, and not "
+            "on a child process, which Wesker kills), so it is STILL RUNNING in this process. It "
+            "shares the working directory, environment, standard streams and patched module "
+            "attributes, and runs the unwinding of its test (monkeypatch undo, fixture teardown) "
+            "whenever its blocking call returns, so no measurement taken while it lives is clean. "
+            "A larger budget will not help: bound the blocking call at the place named, or run "
+            "that test in a killable process (`--isolated`)."
         ),
     ),
     (
@@ -2224,6 +2228,12 @@ _BASELINE_MARKERS = {
 }
 
 
+def _blocked_at(entry: dict) -> str:
+    """``" — blocked at <site>"`` when the entry says where its worker is parked, else "" (W#29, pure)."""
+    site = str(entry.get("where") or "")
+    return f" — blocked at {site}" if site else ""
+
+
 def _describe_containment_lost(lost: list[dict], limit: int = 3) -> list[str]:
     """The lines naming what could not be stopped for one cut function (pure).
 
@@ -2237,12 +2247,12 @@ def _describe_containment_lost(lost: list[dict], limit: int = 3) -> list[str]:
             where = _BASELINE_MARKERS.get(test) or (
                 (test or "an unnamed test") + ", in the baseline trace"
             )
-            lines.append(f"    could not stop: {where}")
+            lines.append(f"    could not stop: {where}{_blocked_at(entry)}")
         else:
             lines.append(
                 f"    could not stop: {test or 'an unnamed test'}, running mutant "
                 f"{entry.get('mutant') or entry.get('mutant_id') or '?'} "
-                f"(line {entry.get('mutated_line', '?')})"
+                f"(line {entry.get('mutated_line', '?')}){_blocked_at(entry)}"
             )
     if len(lost) > limit:
         lines.append(f"    … and {len(lost) - limit} more")

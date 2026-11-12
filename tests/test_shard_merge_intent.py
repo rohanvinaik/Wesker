@@ -163,6 +163,8 @@ def _run(args: list[str], cwd: Path, *, sha: str | None = SHA, extra=None):
         k: v
         for k, v in os.environ.items()
         if not k.startswith(("GITHUB_", "WESKER_", "PYTEST_"))
+        # CI does not export it and a container may: buffering must not change what the log shows
+        and k != "PYTHONUNBUFFERED"
     }
     env["HOME"] = str(cwd / "home")
     env["PYTHONPATH"] = os.pathsep.join(
@@ -491,6 +493,16 @@ def test_a_shard_that_measured_fewer_files_than_planned_refuses(world, tmp_path)
     def mutate(records):
         records[2]["targets"] = records[2]["targets"][:-1] or ["pkg/x.py"]
 
+    _refused(_merge(world, mutate, tmp_path=tmp_path), "measured_set_differs")
+
+
+def test_files_swapped_between_shards_refuse_though_the_union_is_right(world, tmp_path):
+    def mutate(records):
+        records[0]["targets"], records[1]["targets"] = (
+            records[1]["targets"],
+            records[0]["targets"],
+        )
+
     _refused(_merge(world, mutate, tmp_path=tmp_path), "shard_files_differ")
 
 
@@ -806,7 +818,11 @@ def test_merge_standing_codes():
     assert (
         merge_standing(plan, with_(1, targets=["b.py", "a.py"])) == "file_in_two_shards"
     )
-    assert merge_standing(plan, with_(1, targets=["z.py"])) == "shard_files_differ"
+    assert merge_standing(plan, with_(1, targets=["z.py"])) == "measured_set_differs"
+    swapped = with_(0, targets=["b.py"])
+    swapped[1]["targets"] = ["a.py", "c.py"][:1]
+    swapped[2]["targets"] = ["c.py"]
+    assert merge_standing(plan, swapped) == "shard_files_differ"
     assert merge_standing(plan, with_(1, stray=["z.py"])) == "shard_files_differ"
     assert merge_standing(plan, with_(2, refusal="worker_lost")) == "worker_lost"
     # the lowest-index refusal names the result
@@ -817,3 +833,9 @@ def test_merge_standing_codes():
     broken = with_(1, commit="x")
     broken[2]["refusal"] = "truncated"
     assert merge_standing(plan, broken) == "commit_disagree"
+
+
+def test_a_summary_missing_its_shard_count_is_a_loud_key_error_not_a_default():
+    """Absence is not a value: a summary `summarize` did not build is refused by name, never defaulted."""
+    with pytest.raises(KeyError, match="count"):
+        merge_standing([["x"]], [{}])

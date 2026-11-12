@@ -189,9 +189,9 @@ def merge_standing(planned: list[list[str]], shards: list[dict]) -> str:
       "commit_missing" / "commit_disagree", "policy_id_*", "wesker_version_*"
                                shards must name, and agree on, what they measured with
       "file_in_two_shards"     one file measured by two shards (it would be summed twice)
-      "shard_files_differ"     a shard's files are not its planned group, or it measured a file it was
-                               not asked for
       "measured_set_differs"   the union of the shards' files is not the planned set
+      "shard_files_differ"     the union is right but a shard's files are not its planned group (files
+                               swapped between shards), or it measured a file it was not asked for
       <a SHARD_REFUSALS code>  the first shard (by index) that ended in a refusal, AS ITSELF
       "merged"                 every rule holds: the totals may be summed
     """
@@ -216,11 +216,11 @@ def merge_standing(planned: list[list[str]], shards: list[dict]) -> str:
     measured = [f for s in shards for f in s["targets"]]
     if len(set(measured)) != len(measured):
         return "file_in_two_shards"
+    if set(measured) != {f for group in planned for f in group}:
+        return "measured_set_differs"
     for s in shards:
         if sorted(s["targets"]) != sorted(planned[s["index"] - 1]) or s["stray"]:
             return "shard_files_differ"
-    if set(measured) != {f for group in planned for f in group}:
-        return "measured_set_differs"
     for s in sorted(shards, key=lambda s: s["index"]):
         if s["refusal"]:
             return str(s["refusal"])

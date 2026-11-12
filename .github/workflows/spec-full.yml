@@ -23,7 +23,7 @@
 #              the group. Each shard pays the suite's baseline once, writes a record of what it was
 #              asked to measure, the commit, the policy id and the Wesker version, and uploads it
 #              (whatever its outcome) with its SARIF under its own code-scanning category.
-#   aggregate  `needs: [plan, measure]`, `if: always()`: downloads every record and merges them
+#   aggregate  `needs: [plan, measure]`, `if: !cancelled()`: downloads every record and merges them
 #              (`--merge`). Totals are SUMS of the shards' counts and the percentage is computed once
 #              from them. The merge REFUSES, and publishes no number, when a planned shard did not
 #              report, when shards disagree on commit, policy or version, when a file was measured
@@ -175,7 +175,9 @@ jobs:
     name: Specification completeness
     needs: [plan, measure]
     # Runs after a failed shard too: it must read that shard's recorded refusal, not be skipped by it.
-    if: always()
+    # Not after a cancellation: a newer push superseded this run, and merging the shards it never
+    # finished would report a missing shard for code nobody is asking about any more.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

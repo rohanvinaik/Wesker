@@ -95,10 +95,9 @@ def quarantined_output() -> Iterator[bool]:
                 with contextlib.suppress(Exception):
                     stream.flush()
             try:
-                (
-                    os.fstat(1),
-                    os.fstat(2),
-                )  # a closed descriptor has nothing to quarantine
+                # A closed descriptor has nothing to quarantine: either probe raising OSError leaves both alone.
+                os.fstat(1)
+                os.fstat(2)
                 sink = os.open(os.devnull, os.O_WRONLY)
                 saved = [os.dup(1), os.dup(2)]
                 os.dup2(sink, 1)

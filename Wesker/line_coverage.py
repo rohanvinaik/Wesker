@@ -146,6 +146,41 @@ def _target_matcher(target_files: set[str]) -> Callable[[str], str | None]:
     return match
 
 
+# (#17) The audited operations that create a process. The child runs OUTSIDE this interpreter, where
+# no monitoring tool can follow it, so a test that makes one has reach that is unknown. The hook is
+# installed once (CPython has no way to remove one) and is a single dict lookup while no trace is
+# active; it records only the creating THREAD, never blocks or alters the operation.
+_PROCESS_CREATION_EVENTS = frozenset(
+    {
+        "subprocess.Popen",
+        "_posixsubprocess.fork_exec",
+        "os.system",
+        "os.exec",
+        "os.posix_spawn",
+        "os.spawn",
+        "os.fork",
+        "os.forkpty",
+    }
+)
+_spawn_watchers: dict[int, tuple[Callable[[int], bool], list[int]]] = {}
+_spawn_hook_installed = False
+
+
+def _spawn_audit_hook(event: str, _args: tuple) -> None:
+    if event in _PROCESS_CREATION_EVENTS and _spawn_watchers:
+        ident = threading.get_ident()
+        for owns, spawned in list(_spawn_watchers.values()):
+            if owns(ident):
+                spawned.append(ident)
+
+
+def _install_spawn_hook() -> None:
+    global _spawn_hook_installed
+    if not _spawn_hook_installed:
+        sys.addaudithook(_spawn_audit_hook)
+        _spawn_hook_installed = True
+
+
 def _trace_one(
     test_fn: Callable[..., None],
     target_file: str,
@@ -349,6 +384,9 @@ def _trace_one_multi(
         if capture_arcs and frame is not None:
             frame_last.pop(id(frame), None)
 
+    spawned: list[int] = []
+    _install_spawn_hook()
+    _spawn_watchers[token] = (_owns_thread, spawned)
     handles = []
     try:
         handles.append(
@@ -393,6 +431,7 @@ def _trace_one_multi(
                 )
             )
     except BaseException:
+        _spawn_watchers.pop(token, None)
         retire_run_token(token)
         for h in handles:
             h.close()
@@ -412,6 +451,7 @@ def _trace_one_multi(
                         for t in threading.enumerate()
                     ),
                     bool(preexisting_hit),
+                    bool(spawned),
                 )
                 if code != "complete":
                     reach.append(code)
@@ -423,6 +463,7 @@ def _trace_one_multi(
             thread, budget_s if budget_s and budget_s > 0 else None
         )
     finally:
+        _spawn_watchers.pop(token, None)
         retire_run_token(token)
         for h in handles:
             h.close()

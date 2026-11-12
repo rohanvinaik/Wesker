@@ -28,7 +28,9 @@ Each item carries what that qualification needs, and nothing is inferred from ab
     window may run target code nobody observed, so that item's reach is ``incomplete_thread`` and
     the lines it lacks are UNKNOWN, never a negative. A thread that was alive BEFORE the test and
     ran target code during it (a pool warmed in a fixture) cannot be attributed to this test, so
-    the row is ``incomplete_preexisting_thread``: same rule, its absences are unknown.
+    the row is ``incomplete_preexisting_thread``, and a test that creates a process is
+    ``incomplete_subprocess`` (the child's lines are outside this interpreter): same rule, the
+    absences are unknown. Several causes join with ``+`` (:func:`reach_qualification`).
 """
 
 from __future__ import annotations
@@ -114,27 +116,36 @@ def baseline_outcome(run_code: str | None, item_status: str) -> str:
     return "passed"
 
 
-def reach_qualification(outlived_thread: bool, preexisting_thread_ran: bool) -> str:
+def reach_qualification(
+    outlived_thread: bool, preexisting_thread_ran: bool, spawned_process: bool = False
+) -> str:
     """The reach-completeness code of ONE traced test (#17, pure — pinned).
 
-    Split out of the tracer's worker, which holds thread objects the literal-input allowlist cannot
-    express; the tracer keeps the thread handling and this holds the decision. Two independent
-    facts make absences unknown, and they have different remedies, so they never share a code:
+    Split out of the tracer's worker, which holds thread objects and audit events the literal-input
+    allowlist cannot express; the tracer keeps that handling and this holds the decision. Three
+    independent facts make absences unknown, and they have different remedies, so they never share
+    a name. The answer is ``complete`` when none holds, else the names of the facts that hold,
+    joined by ``+`` in this fixed order:
 
     * ``incomplete_thread`` — a thread THIS test started outlived its traced window, so code it ran
       afterwards was never observed.
     * ``incomplete_preexisting_thread`` — a thread alive BEFORE the test ran target code during it
       (a pool warmed in a fixture or at import): that work cannot be attributed to this test.
-    * ``incomplete_thread_and_preexisting_thread`` — both.
-    * ``complete`` — neither: absence in ``lines`` is a measured negative.
+    * ``incomplete_subprocess`` — the test (or a thread it started) created a process (the audit
+      events ``subprocess.Popen`` / ``os.fork`` / ``os.exec*`` / ``os.posix_spawn`` / ...). Code the
+      child ran is outside this interpreter and was never observed.
+    * ``complete`` — none: absence in ``lines`` is a measured negative.
     """
-    if outlived_thread and preexisting_thread_ran:
-        return "incomplete_thread_and_preexisting_thread"
-    if outlived_thread:
-        return "incomplete_thread"
-    if preexisting_thread_ran:
-        return "incomplete_preexisting_thread"
-    return "complete"
+    causes = [
+        name
+        for name, held in (
+            ("incomplete_thread", outlived_thread),
+            ("incomplete_preexisting_thread", preexisting_thread_ran),
+            ("incomplete_subprocess", spawned_process),
+        )
+        if held
+    ]
+    return "+".join(causes) if causes else "complete"
 
 
 def trace_admissibility(
@@ -232,7 +243,8 @@ class TraceEvidence:
     #: Whether everything this item executed was VISIBLE to the tracer (#17): ``complete``, or
     #: ``incomplete_thread`` when a thread it started outlived its traced window, so code that thread
     #: ran afterwards was never observed, or ``incomplete_preexisting_thread`` when a thread alive
-    #: before the test ran target code during it (unattributable, so not in ``lines``). It qualifies ABSENCE only: the lines that were observed
+    #: before the test ran target code during it (unattributable, so not in ``lines``), or
+    #: ``incomplete_subprocess`` when the test created a process; causes join with ``+``. It qualifies ABSENCE only: the lines that were observed
     #: stay exactly as admissible as ``reason`` says, while a line missing from ``lines`` is
     #: "not observed", never "not reached".
     reach: str = "complete"

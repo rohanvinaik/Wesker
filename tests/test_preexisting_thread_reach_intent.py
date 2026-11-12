@@ -159,7 +159,7 @@ def test_an_outliving_thread_and_a_pool_call_are_named_together_never_one_of_the
         release.set()
         pool.shutdown()
     (test_id,) = traced
-    assert incomplete == {test_id: "incomplete_thread_and_preexisting_thread"}
+    assert incomplete == {test_id: "incomplete_thread+incomplete_preexisting_thread"}
 
 
 def test_reach_qualification_names_each_state():
@@ -168,4 +168,7 @@ def test_reach_qualification_names_each_state():
     assert reach_qualification(False, False) == "complete"
     assert reach_qualification(True, False) == "incomplete_thread"
     assert reach_qualification(False, True) == "incomplete_preexisting_thread"
-    assert reach_qualification(True, True) == "incomplete_thread_and_preexisting_thread"
+    assert (
+        reach_qualification(True, True)
+        == "incomplete_thread+incomplete_preexisting_thread"
+    )

@@ -4059,6 +4059,7 @@ class LazySessionBaseline:
         "_regime_digest",
         "_target_files",
         "_value",
+        "build_seconds",
     )
 
     def __init__(
@@ -4074,6 +4075,10 @@ class LazySessionBaseline:
         self._build = build
         self._value: SessionBaseline | None = None
         self._built = False
+        # Wall seconds the FIRST build took (W#29). The baseline is a once-per-session cost, built
+        # lazily by whichever function is profiled first, so that function's own budget used to pay
+        # for the whole suite's trace (`_build_mutant`: 1035.9 s, 0/62 mutants, in the badge run).
+        self.build_seconds = 0.0
         self._budgets = budgets
         # Cells held back by `expand(..., persist=False)`, written once by `flush()`.
         self._pending: list[PendingPersist] = []
@@ -4109,8 +4114,10 @@ class LazySessionBaseline:
         the broken memo instead of returning `None` to a caller annotated `SessionBaseline`.
         """
         if not self._built:
+            began = time.monotonic()
             self._value = self._build()
             self._built = True
+            self.build_seconds = time.monotonic() - began
         if self._value is None:
             raise RuntimeError(
                 "LazySessionBaseline memo is inconsistent: built but empty. "
@@ -4372,6 +4379,17 @@ class LazySessionBaseline:
 _SESSION_BASELINE: ContextVar[LazySessionBaseline | None] = ContextVar(
     "wesker_session_baseline", default=None
 )
+
+
+def baseline_build_seconds() -> float:
+    """Seconds the live session's baseline took to build, or 0.0 before it is built or outside a session (W#29).
+
+    Read before and after a function's first scope is built: the difference is a once-per-session
+    cost that function did not incur on its own account, and its per-function budget must not be
+    charged for it.
+    """
+    holder = _SESSION_BASELINE.get()
+    return holder.build_seconds if isinstance(holder, LazySessionBaseline) else 0.0
 
 
 def session_baseline() -> SessionBaseline | None:
@@ -9156,6 +9174,7 @@ def run_function_profiling(
             both execution modes.
     """
     start = time.monotonic()
+    _baseline_cost_before = baseline_build_seconds()
     # Reuse a caller's already-generated mutant list when given (an adaptive probe generates
     # once and hands the same list to both the probe and the follow-up run), else generate.
     # Deterministic, so the reused list is identical to a fresh generation here.
@@ -9217,6 +9236,10 @@ def run_function_profiling(
         reach_out=_scope_reach,
         unscreened_out=_unscreened,
     )
+    # The session baseline is built once, by whichever function is profiled first (W#29): that cost is
+    # the session's, not this function's, so it is not charged to this function's budget or reported as
+    # its elapsed time.
+    start += baseline_build_seconds() - _baseline_cost_before
     # Before the mutation loop: re-observe this function's covering tests fresh, so a warm run's
     # replayed reach is promoted back to admissible and the certificate rests on this session (#20).
     # If it spliced, RE-DERIVE the whole scope from the freshened basis with FRESH containers — else
@@ -10604,6 +10627,7 @@ def run_function_converged(
       - "sampled" otherwise
     """
     start = time.monotonic()
+    _baseline_cost_before = baseline_build_seconds()
     universe = estimate_universe_size(func_node, categories)
     dof_total = dof_universe(func_node, categories)
     qualname = (
@@ -10643,6 +10667,10 @@ def run_function_converged(
         _baseline_uncontained,
         unscreened_out=_unscreened,
     )
+    # The session baseline is built once, by whichever function is profiled first (W#29): that cost is
+    # the session's, not this function's, so it is not charged to this function's budget or reported as
+    # its elapsed time.
+    start += baseline_build_seconds() - _baseline_cost_before
     # Before the mutation loop: re-observe this function's covering tests fresh (same seam as the
     # profiling path), so a warm run's replayed reach is promoted back to admissible (#20). If it
     # spliced, RE-DERIVE the scope from the freshened basis with FRESH containers (see the profiling

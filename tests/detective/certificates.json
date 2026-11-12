@@ -113,6 +113,12 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/engine.py::equivalence_probe_standing": {
+    "cut_reasons": [],
+    "function_digest": "43e4d4bc55bbbb92",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/engine.py::execution_lock_disposition": {
     "cut_reasons": [],
     "function_digest": "30afa2daf0abb2dc",
@@ -185,6 +191,30 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/engine.py::survivor_reach": {
+    "cut_reasons": [],
+    "function_digest": "160fe760fd254bb7",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/interrupt.py::abandoned_worker_standing": {
+    "cut_reasons": [],
+    "function_digest": "ab396a2dc6f25ad2",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/interrupt.py::child_wait_disposition": {
+    "cut_reasons": [],
+    "function_digest": "d79a4471e8914ea1",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/interrupt.py::process_tree_members": {
+    "cut_reasons": [],
+    "function_digest": "81c19977c758ec2d",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/isolation.py::decided_kill_reason": {
     "cut_reasons": [],
     "function_digest": "83ad56c5fd007309",
@@ -193,6 +223,12 @@
   },
   "Wesker/isolation.py::isolated_test_selection": {
     "function_digest": "cd8a3be413a6f79c",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/memory_guard.py::speculative_address_cap": {
+    "cut_reasons": [],
+    "function_digest": "27c6be4e5615cca0",
     "refusal": "",
     "standing": "complete"
   },

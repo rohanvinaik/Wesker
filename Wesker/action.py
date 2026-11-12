@@ -44,6 +44,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from typing import IO
 
+from Wesker.shards import completeness_code, shard_setting
+
 _DETECTIVE_PKG = "detective-spec"
 
 
@@ -801,19 +803,56 @@ def main(argv: list[str] | None = None) -> int:
         help="Report a budget-limited sample instead of failing (the number is then not a "
         "completeness measurement)",
     )
+    parser.add_argument(
+        "--shard",
+        default="",
+        help="Measure one shard of a sharded run, as i/N (the targets are that shard's group)",
+    )
+    parser.add_argument(
+        "--plan-shards",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Print the matrix JSON that splits the targets into N groups, and measure nothing",
+    )
+    parser.add_argument(
+        "--plan-out",
+        default="",
+        help="With --plan-shards: also write the full plan here",
+    )
+    parser.add_argument(
+        "--merge",
+        action="store_true",
+        help="Merge the shard reports named as arguments into the report one unsharded run would "
+        "give (needs --plan)",
+    )
+    parser.add_argument(
+        "reports",
+        nargs="*",
+        metavar="REPORT",
+        help="With --merge: the shard report files",
+    )
+    parser.add_argument(
+        "--plan", default="", help="With --merge: the plan the shards were cut from"
+    )
     args = parser.parse_args(argv)
 
-    from Wesker.metrics import _discover_targets, _load_config
+    if args.plan_shards is not None:
+        return _plan_main(args)
+    if args.merge:
+        return _merge_main(args)
+    shard_code, shard_index, shard_count = shard_setting(args.shard)
+    if shard_code == "invalid":
+        return _fail(f"--shard must be i/N with 1 <= i <= N, got '{args.shard}'.")
+
+    from Wesker.metrics import _load_config
     from Wesker.sarif import to_sarif
     from Wesker.self_profile import profiler_for_targets
 
     config = _load_config()
-    targets = list(args.targets) or _discover_targets(config)
+    targets = _resolve_targets(args.targets, config)
     if not targets:
-        return _fail(
-            "no source files found.\n"
-            "Set [tool.wesker] source_dir in pyproject.toml, or pass targets explicitly."
-        )
+        return _fail(_NO_TARGETS)
 
     scope_note = f"Whole codebase — {len(targets)} file(s)."
     if args.base_ref:
@@ -841,21 +880,40 @@ def main(argv: list[str] | None = None) -> int:
     report, lost = _profile_live(
         profiler_for_targets(targets), targets, args.budget, config
     )
+
+    def refuse(code: str, reason: str) -> int:
+        # #29: a refusal is recorded under its name, with the files it concerns, so a merge can
+        # re-state it instead of finding a shard that "did not report".
+        _write_shard_record(shard_index, shard_count, targets, code, reason, report)
+        return _fail(reason)
+
     if lost:
-        return _fail(lost)
+        return refuse("worker_lost", lost)
     if report is None:
-        return _fail(
-            gate_execution_mode({"execution_mode": "legacy-direct-call"}) or ""
+        return refuse(
+            "no_live_session",
+            gate_execution_mode({"execution_mode": "legacy-direct-call"}) or "",
         )
     report["execution_mode"] = "pytest-live"
 
-    for gate in (gate_execution_mode(report), gate_suite_health(report)):
+    for code, gate in (
+        ("execution_mode", gate_execution_mode(report)),
+        ("suite_health", gate_suite_health(report)),
+    ):
         if gate:
-            return _fail(gate)
+            return refuse(code, gate)
     refusal = _completeness_refusal(report, args.allow_truncation)
     if refusal:
-        return _fail(refusal)
+        return refuse(
+            completeness_code(
+                report.get("total_truncated", 0),
+                report.get("total_unresolved", 0),
+                args.allow_truncation,
+            ),
+            refusal,
+        )
 
+    _write_shard_record(shard_index, shard_count, targets, "", "", report)
     Path(".wesker").mkdir(exist_ok=True)
     Path(".wesker/mutation_report.json").write_text(json.dumps(report, indent=2))
     if args.sarif:
@@ -877,6 +935,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"SARIF: {sarif_path}")
 
     _annotate(report)
+    return _conclude(report, scope_note, args.threshold)
+
+
+def _conclude(report: dict, scope_note: str, threshold: int) -> int:
+    """Outputs, step summary, banner and the threshold gate: what a passing report ends with."""
     _write_outputs(report)
     _write_github_file("GITHUB_STEP_SUMMARY", _summary_markdown(report, scope_note))
 
@@ -887,14 +950,138 @@ def main(argv: list[str] | None = None) -> int:
         f"({report.get('total_dof_pinned', 0)}/{report.get('total_dof', 0)} dimensions)\n"
         f"{'=' * 60}"
     )
-    if args.threshold and spec < args.threshold:
+    if threshold and spec < threshold:
         print(
             f"\n::error::Specification completeness {spec}% is below the "
-            f"{args.threshold}% threshold",
+            f"{threshold}% threshold",
             file=sys.stderr,
         )
         return 1
     return 0
+
+
+# ── Sharding (#29) ───────────────────────────────────────────────
+
+_NO_TARGETS = (
+    "no source files found.\n"
+    "Set [tool.wesker] source_dir in pyproject.toml, or pass targets explicitly."
+)
+
+
+def _resolve_targets(explicit: list[str], config: dict) -> list[str]:
+    """The files a run measures: the explicit list, else auto-detection (one rule, shared by the plan)."""
+    from Wesker.metrics import _discover_targets
+
+    return list(explicit) or _discover_targets(config)
+
+
+def _write_shard_record(
+    index: int,
+    count: int,
+    targets: list[str],
+    refusal: str,
+    detail: str,
+    report: dict | None,
+) -> None:
+    """Write ``.wesker/shard_report.json``: what a merge needs to verify and sum this run."""
+    from Wesker import __version__
+    from Wesker.policy import mutation_policy
+    from Wesker.shards import environment_commit, shard_record
+
+    record = shard_record(
+        index=index,
+        count=count,
+        targets=targets,
+        commit=environment_commit(),
+        policy_id=mutation_policy().policy_id,
+        version=__version__,
+        refusal=refusal,
+        detail=detail,
+        report=report,
+    )
+    Path(".wesker").mkdir(exist_ok=True)
+    Path(".wesker/shard_report.json").write_text(json.dumps(record, indent=2))
+
+
+def _plan_main(args: argparse.Namespace) -> int:
+    """``--plan-shards N``: print the matrix for the targets an unsharded run would measure."""
+    from Wesker.metrics import _load_config
+    from Wesker.shards import build_plan, matrix_json
+
+    targets = _resolve_targets(args.targets, _load_config())
+    if not targets:
+        return _fail(_NO_TARGETS)
+    try:
+        plan = build_plan(targets, args.plan_shards)
+    except ValueError as exc:
+        return _fail(
+            f"cannot plan {len(targets)} file(s) into {args.plan_shards} shard(s): {exc}"
+        )
+    if args.plan_out:
+        Path(args.plan_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.plan_out).write_text(json.dumps(plan, indent=2))
+    print(matrix_json(plan))
+    return 0
+
+
+def _merge_main(args: argparse.Namespace) -> int:
+    """``--merge``: the shard reports, verified against the plan, as the report one run would give."""
+    from Wesker import shards
+
+    if not args.plan:
+        return _fail(
+            "plan_missing: --merge needs --plan, the plan the shards were cut from."
+        )
+    try:
+        plan = shards.read_json(args.plan)
+    except ValueError as exc:
+        return _fail(f"plan_unreadable: {exc}")
+    groups = plan.get("groups") if isinstance(plan, dict) else None
+    if (
+        not isinstance(groups, list)
+        or plan.get("kind") != shards.PLAN_KIND
+        or any(
+            not isinstance(g, list) or any(not isinstance(f, str) for f in g)
+            for g in groups
+        )
+    ):
+        return _fail(f"plan_unreadable: {args.plan} is not a shard plan.")
+
+    records: list[dict] = []
+    for path in args.reports:
+        try:
+            decoded = shards.read_json(path)
+        except ValueError as exc:
+            return _fail(f"report_unreadable: {exc}")
+        standing = shards.record_standing(decoded if isinstance(decoded, dict) else {})
+        if standing != "ok":
+            return _fail(f"{standing}: {path} is not a usable shard report.")
+        records.append(decoded)
+
+    summaries = [shards.summarize(r) for r in records]
+    code = shards.merge_standing(groups, summaries)
+    if code != "merged":
+        return _fail(f"{code}: {shards.describe_merge(code, groups, summaries)}")
+
+    ordered = sorted(records, key=lambda r: r["shard_index"])
+    report = shards.merge_reports([r["report"] for r in ordered])
+    for gate in (gate_execution_mode(report), gate_suite_health(report)):
+        if gate:
+            return _fail(gate)
+    refusal = _completeness_refusal(report, args.allow_truncation)
+    if refusal:
+        return _fail(
+            f"{shards.completeness_code(report['total_truncated'], report['total_unresolved'], args.allow_truncation)}: {refusal}"
+        )
+
+    Path(".wesker").mkdir(exist_ok=True)
+    Path(".wesker/mutation_report.json").write_text(json.dumps(report, indent=2))
+    n_files = sum(len(g) for g in groups)
+    scope_note = (
+        f"Whole codebase — {n_files} file(s), measured as {len(groups)} shard(s)."
+    )
+    print(f"Wesker — {scope_note}")
+    return _conclude(report, scope_note, args.threshold)
 
 
 def _version() -> str:

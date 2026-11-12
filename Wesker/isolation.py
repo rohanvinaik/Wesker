@@ -28,7 +28,8 @@ import select
 import signal
 import subprocess
 import sys
-from collections.abc import Sequence
+import threading
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -51,6 +52,78 @@ _SUBPROCESS_NAMES = frozenset(
 )
 _THREAD_NAMES = frozenset({"threading", "_thread", "Thread", "start_new_thread"})
 _SIGNAL_NAMES = frozenset({"signal", "setitimer", "sigwait", "pthread_kill"})
+
+
+# Who holds the output quarantine right now, as ``{"owner": (token, thread)}``; empty when nobody does.
+# One dict operation decides who enters (`setdefault` is atomic), so no lock can be stranded by an
+# injected exception, and an owner whose thread has died is taken over rather than waited on.
+_QUARANTINE: dict[str, tuple[object, threading.Thread]] = {}
+
+
+@contextlib.contextmanager
+def quarantined_output() -> Iterator[bool]:
+    """For the length of the block, the measuring process's file descriptors 1 and 2 are a sink
+    (Wesker #52); yields whether THIS entry took them.
+
+    Code under measurement writes where it likes: `print` is caught by `sys.stdout`'s redirect, but
+    `os.write(1, ...)`, a child process that inherits the descriptor, and a nested Action's re-entered
+    streams go straight to the descriptor, which is the run's own log. A line of a nested Action's banner
+    reached the badge run's job log this way, and in the plain CLI (which has no private progress
+    descriptor) the same bytes landed inside its own `[n/N]` line. What the tests print is discarded;
+    the owner's progress goes through a private duplicate taken before profiling, and the CLI prints
+    between evaluations, not inside one.
+
+    Entered by the thread that JOINS the code under measurement, never by the worker: a worker that
+    cannot be stopped would otherwise restore the descriptors whenever it finally ended. Nested entries
+    (the engine inside a test, a test inside a quarantined block) do nothing and yield False, so the
+    outermost entry restores exactly what it saved. A descriptor that is already closed degrades to
+    no quarantine rather than failing the run: the quarantine is a courtesy to the log, never a risk to
+    the measurement.
+    """
+    token = object()
+    me = threading.current_thread()
+    mine = False
+    saved: list[int] = []
+    sink = -1
+    try:
+        held = _QUARANTINE.get("owner")
+        if held is not None and not held[1].is_alive():
+            _QUARANTINE.pop("owner", None)  # its owner died inside the block: take over
+        mine = _QUARANTINE.setdefault("owner", (token, me))[0] is token
+        if mine:
+            for stream in (sys.stdout, sys.stderr):
+                with contextlib.suppress(Exception):
+                    stream.flush()
+            try:
+                (
+                    os.fstat(1),
+                    os.fstat(2),
+                )  # a closed descriptor has nothing to quarantine
+                sink = os.open(os.devnull, os.O_WRONLY)
+                saved = [os.dup(1), os.dup(2)]
+                os.dup2(sink, 1)
+                os.dup2(sink, 2)
+            except OSError:
+                # a closed or unusable descriptor: put back whatever was taken, and run unquarantined
+                _restore_descriptors(saved)
+                saved = []
+        yield mine and bool(saved)
+    finally:
+        if mine:
+            _restore_descriptors(saved)
+            if sink >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(sink)
+            _QUARANTINE.pop("owner", None)
+
+
+def _restore_descriptors(saved: list[int]) -> None:
+    """Put descriptors 1 and 2 back from the duplicates ``saved`` holds, and close the duplicates."""
+    for fd, copy in zip((1, 2), saved, strict=False):
+        with contextlib.suppress(OSError):
+            os.dup2(copy, fd)
+        with contextlib.suppress(OSError):
+            os.close(copy)
 
 
 def isolated_test_selection(node_id: str, has_plain_source: bool) -> str:

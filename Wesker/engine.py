@@ -49,6 +49,7 @@ from .isolation import (
     execution_mode_standing,
     fast_mode_standing,
     mutant_verdict,
+    quarantined_output,
     run_baseline_traced_isolated,
     scope_fast_mode_standing,
     should_recycle,
@@ -4558,29 +4559,44 @@ def build_session_baseline(
     # their traced run. Their missing lines are unknown, never "not reached".
     incomplete_reach: dict[str, str] = {}
 
-    def _claim_after_each(done: int, total: int, elapsed_ms: float) -> None:
-        # `trace_suite` reports a test once its trace is over, and runs one test at a time: a worker
-        # a bounded join left running since the last report is THAT test's (W#29). The trace's own
-        # join cannot name it, so the name is attached here, where the loop is known.
-        if 0 < done <= len(test_functions):
-            claim_abandoned(callable_test_id(test_functions[done - 1]))
-        if trace_progress is not None:
-            trace_progress(done, total, elapsed_ms)
+    # The traced tests' output is not the run's (W#52). The trace runs each test in a worker the trace's
+    # own join waits for, so the quarantine is held HERE, by the joining thread, and released around the
+    # progress report that follows each test: what the tests print is discarded, what the run says is not.
+    quarantine = contextlib.ExitStack()
+    quarantine.enter_context(quarantined_output())
 
-    traced = _trace_suite(
-        test_functions,
-        target_files,
-        trace_budget_s,
-        truncated,
-        _claim_after_each,
-        trace_session_budget_s,
-        cache,
-        uncontained,
-        arcs,
-        replayed,
-        within_run=within_run,
-        incomplete_reach=incomplete_reach,
-    )
+    def _claim_after_each(done: int, total: int, elapsed_ms: float) -> None:
+        nonlocal quarantine
+        quarantine.close()
+        try:
+            # `trace_suite` reports a test once its trace is over, and runs one test at a time: a worker
+            # a bounded join left running since the last report is THAT test's (W#29). The trace's own
+            # join cannot name it, so the name is attached here, where the loop is known.
+            if 0 < done <= len(test_functions):
+                claim_abandoned(callable_test_id(test_functions[done - 1]))
+            if trace_progress is not None:
+                trace_progress(done, total, elapsed_ms)
+        finally:
+            quarantine = contextlib.ExitStack()
+            quarantine.enter_context(quarantined_output())
+
+    try:
+        traced = _trace_suite(
+            test_functions,
+            target_files,
+            trace_budget_s,
+            truncated,
+            _claim_after_each,
+            trace_session_budget_s,
+            cache,
+            uncontained,
+            arcs,
+            replayed,
+            within_run=within_run,
+            incomplete_reach=incomplete_reach,
+        )
+    finally:
+        quarantine.close()
     failing: list[str] = []
     inert: set[int] = set()
     # `inert` is keyed by id() — a fact about THIS heap — so it can never be read from disk.
@@ -8369,6 +8385,7 @@ def _run_test_with_timeout(
     timed_out = False
     contained = True
     with (
+        quarantined_output(),
         contextlib.redirect_stdout(io.StringIO()),
         contextlib.redirect_stderr(io.StringIO()),
     ):

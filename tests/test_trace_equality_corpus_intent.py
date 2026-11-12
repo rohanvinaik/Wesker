@@ -434,6 +434,51 @@ def test_both_foreign_tools_together_change_nothing(corpus):
     assert again == base
 
 
+def test_a_foreign_setprofile_hook_and_cprofile_change_nothing(corpus):
+    import cProfile
+
+    base = _baseline(corpus)
+    calls = []
+
+    def foreign(frame, event, arg):
+        calls.append(event)
+
+    sys.setprofile(foreign)
+    try:
+        with_hook = _baseline(corpus)
+    finally:
+        sys.setprofile(None)
+    assert calls, (
+        "the foreign profile hook never fired: the comparison would be vacuous"
+    )
+    assert with_hook == base
+    prof = cProfile.Profile()
+    prof.enable()
+    try:
+        with_cprofile = _baseline(corpus)
+    finally:
+        prof.disable()
+    assert with_cprofile == base
+
+
+def test_a_running_coverage_py_changes_nothing(corpus, tmp_path):
+    import coverage
+
+    base = _baseline(corpus)
+    cov = coverage.Coverage(
+        data_file=str(tmp_path / ".coverage-foreign"), source=[str(tmp_path)]
+    )
+    cov.start()
+    try:
+        under = _baseline(corpus)
+    finally:
+        cov.stop()
+    assert under == base
+    assert cov.get_data().measured_files(), (
+        "coverage.py measured nothing: vacuous comparison"
+    )
+
+
 def test_in_process_and_isolated_credit_each_test_with_the_same_lines(corpus):
     """Lines only: the isolated worker records no arcs. Fixture projects (real pytest node ids)."""
     import ast

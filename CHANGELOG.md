@@ -10,6 +10,17 @@ changed twice, so the policy id moved twice.
 
 ### Correctness
 
+- **A trace row says when its reach is unknown, and what kind of non-pass a route cannot type.**
+  A test that reaches the target through a thread alive before it started (a pool warmed at import), or only
+  in a child process, used to read `reach=complete lines=()`: an admissible "reached nothing". Its
+  `TraceEvidence.reach` is now `incomplete_preexisting_thread` or `incomplete_subprocess` (causes join with
+  `+`, with `incomplete_thread`); the unobservable lines are never attributed and such a trace is never
+  cached. On the legacy direct-call route (no pytest phase) a non-pass that cannot be told apart (skip,
+  `xfail()`, setup error) or a callable carrying skip/xfail marks is the named outcome `untyped`, refused as
+  `refuse_untyped`, where it was typed `error` or, for an xfail-marked test, named a wrong expectation.
+  The `trace_evidence` docstring no longer claims same-line short-circuit operands stay apart. A failed
+  subscription setup whose rollback also fails no longer leaves its registration in the broker. Adds
+  fields and codes; no mutant's disposition changes and the policy id does not move. (W#17, W#32)
 - **One profile run can carry the per-test kill relation.** `run_function_profiling(full_matrix=True)`
   runs every test that reaches a mutant and returns, per killed mutant, every test that kills it with that
   test's own kill reason (`ProfilingResult.kill_relation`; `kill_relation_standing` says whether it is

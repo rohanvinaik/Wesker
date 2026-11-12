@@ -4694,7 +4694,9 @@ def build_session_baseline(
             )
             typed = prior_status[test_id]
         else:
-            outcome = _run_test_with_timeout(test_fn, None, True, timeout_ms)
+            outcome = _run_test_with_timeout(
+                test_fn, None, True, _stretched_wall_ms(timeout_ms)
+            )
             # A worker this run could not stop is still alive in this process, and the trace pass
             # above is not the only place one is made: this pass used to file it as an ordinary
             # failing test and say nothing (W#29, the #14 class).
@@ -4958,7 +4960,7 @@ def _baseline_failures(
                 )
                 try:
                     run_code = _run_test_with_timeout(
-                        test_fn, probe, patched, timeout_ms
+                        test_fn, probe, patched, _stretched_wall_ms(timeout_ms)
                     )
                     typed = baseline_outcome(run_code, callable_item_status(test_fn))
                     # A wrong expectation by the TYPED outcome, not the run code alone (#17).
@@ -6628,6 +6630,19 @@ def _machine_allowance(
     return _adaptive_allowance(baseline_ms, cap_ms, remaining_ms, machine_slowdown()[0])
 
 
+def _stretched_wall_ms(wall_ms: float) -> float:
+    """A reference-time wall, stretched by this machine's calibrated slowdown (W#27).
+
+    The baseline passes run every test of the suite against the unmutated function under a per-test
+    wall. A fixed wall there decides whether a test "fails on current code": a slow machine reached
+    it with a test that passes on a fast one and the run ended FAILING NOW, a verdict about the
+    suite that was really a verdict about the machine.
+    """
+    from Wesker.monitoring import machine_slowdown
+
+    return wall_ms * max(machine_slowdown()[0], 1.0)
+
+
 def _original_count_wall_ms(timeout_ms: float) -> float:
     """The wall the ORIGINAL's counted run of a test gets, in ms (W#27).
 
@@ -6635,9 +6650,7 @@ def _original_count_wall_ms(timeout_ms: float) -> float:
     decide a verdict: an original that reaches the wall is `original_undetermined` and leaves its
     test unarmed, so a fixed wall made whether a test is budgeted depend on the machine.
     """
-    from Wesker.monitoring import machine_slowdown
-
-    return max(timeout_ms, _ORIGINAL_COUNT_FLOOR_MS) * machine_slowdown()[0]
+    return _stretched_wall_ms(max(timeout_ms, _ORIGINAL_COUNT_FLOOR_MS))
 
 
 def _live_collection_identity() -> tuple[

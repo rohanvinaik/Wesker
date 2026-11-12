@@ -496,6 +496,13 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
                 "test's kill of the same mutant still stands"
             ),
             (
+                "in an isolated run a mutant that raises MemoryError under the worker's "
+                "address-space cap, whoever catches it, is the unscored outcome memory_cut — a "
+                "stop by a budget, never a kill, survival evidence or equivalence; it is one "
+                "mutant without a verdict, so the worker is replaced and the function's other "
+                "mutants are still evaluated"
+            ),
+            (
                 "survivors probe synthesized boundary inputs for likely equivalence "
                 f"under a loop budget (the original's {STEP_PROBE_CAP} iterations, the "
                 "mutant's the cap above); an input the original cannot finish inside its "

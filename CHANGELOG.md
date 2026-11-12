@@ -10,6 +10,24 @@ changed twice, so the policy id moved twice.
 
 ### Correctness
 
+- **A mutant over the memory cap is one mutant with no verdict, not a cut function, and its outcome no
+  longer depends on what ran before it.** Under `--isolated --mem-limit-mb` a mutant the cap stopped was
+  recorded `contained=False`, which the evaluation loops read as "a worker is still alive": the function
+  stopped after that one mutant (2 to 6 of 23 evaluated, 0.5 s of a 10 s budget spent), `--json` listed it
+  under `containment_lost`, the whole function was a `cut`, and which mutant came first decided how much
+  was measured (four runs of one command gave 10, 8, 7 and 8 mutants, one with an `equivalent`). It is now
+  the disposition `memory_cut`, beside `diverged` and `undetermined`: named in `unresolved_functions`
+  under its own remedy, unscored, never a kill, a survivor or an equivalent; the worker is replaced and
+  the function's other mutants are evaluated, so the function reads `profiled`. Three more defects were
+  behind the instability and are fixed with it: a worker kept after a cap was still full of what the
+  runaway allocated, so the NEXT mutants (`return None`) read as memory cuts; a `MemoryError` caught by the
+  code under test (`except Exception: return -1`) became an assertion KILL, so the cap manufactured kills
+  (the worker now watches for a raised `MemoryError`, caught or not); and category order within a function
+  followed set iteration order, so it changed with the process (ties now break by category name). The
+  truncation cause `memory` no longer exists: `truncation_cause` takes two arguments, and
+  `converged_coverage_depth` has no `memory_cut` parameter. Policy id moves (the observation clause names
+  the outcome; the universe and `POLICY_VERSION` do not): one-sign `9.10f8e602bf48` -> `9.5d2c6bafc8ae`,
+  two-sign `9+neg.de8c78c57407` -> `9+neg.fec711a421e9`. (W#45, W#39)
 - **The wall that bounds a mutant's liveness follows the machine, and a fired wall is retried once.**
   The isolated per-mutant wall was a fixed `max(per_mutant_timeout_ms, 10 s)`, so work no loop budget
   counts (a loop in a helper, a C builtin, another thread) read COMPLETE on a fast machine and

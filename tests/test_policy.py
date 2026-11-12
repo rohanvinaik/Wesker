@@ -64,7 +64,10 @@ from Wesker.policy import (
 # Wesker #27: the same policy-9 universe; the liveness wall is a compute budget stretched by the
 # machine's calibrated slowdown and a fired wall is retried once (counts verified unchanged:
 # GOLDEN_FINGERPRINT holds). 9.008828e5f6a9 -> 9.10f8e602bf48.
-GOLDEN_POLICY_ID = "9.10f8e602bf48"
+# Wesker #45: the same policy-9 universe; in an isolated run a mutant the worker's address-space cap
+# stops is the unscored outcome memory_cut, never a kill, survivor or equivalent (counts verified
+# unchanged: GOLDEN_FINGERPRINT holds). 9.10f8e602bf48 -> 9.5d2c6bafc8ae.
+GOLDEN_POLICY_ID = "9.5d2c6bafc8ae"
 
 # The same fact, readable: the engine's target counts over the fingerprint
 # corpus. A failure here names the category and function that moved.
@@ -119,7 +122,8 @@ GOLDEN_FINGERPRINT = {
 # original-control observation text) -> 9+neg.89326e7f549c (W#49: the stale wrapper's memory ends at
 # a test boundary; the one-sign id is unchanged by it). The identity-sensitivity rule above then moved
 # both ids: two-sign 9+neg.89326e7f549c -> 9+neg.1a13fddd1d5f. W#27's liveness-bound clause then
-# moved both again: two-sign 9+neg.1a13fddd1d5f -> 9+neg.de8c78c57407.
+# moved both again: two-sign 9+neg.1a13fddd1d5f -> 9+neg.de8c78c57407. W#45's memory_cut clause moved
+# both once more: two-sign 9+neg.de8c78c57407 -> 9+neg.fec711a421e9.
 GOLDEN_TWO_SIGN_OUTPUT = {
     "fp_annotations": 4,
     "fp_value": 3,

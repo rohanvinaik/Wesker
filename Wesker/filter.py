@@ -237,6 +237,9 @@ def prioritize_categories(
             prior = _DEFAULT_PRIOR
         priors.append(CategoryPrior(category=cat, prior=round(prior, 3)))
 
-    # Sort by prior descending — highest survival first for budget efficiency
-    priors.sort(key=lambda p: p.prior, reverse=True)
+    # Sort by prior descending — highest survival first for budget efficiency. Ties (every category
+    # when there is no cached state) break by category name (#45): ``relevant`` is a SET, so a stable
+    # sort alone kept its iteration order, which follows string hashing and changed with every process,
+    # so the order mutants ran in (and which one hit a memory cap first) was not reproducible.
+    priors.sort(key=lambda p: (-p.prior, p.category.value))
     return priors

@@ -8783,7 +8783,7 @@ def _isolated_result(
     if run.memory_cut:
         # W#21/W#45: the mutant hit the worker's address-space cap. ONE mutant with no verdict, the
         # shape `diverged` and `undetermined` have: named (`memory_cut`), unscored, never a kill and
-        # never a survivor. The cap CONTAINED it, so it is
+        # never a survivor. The cap CONTAINED it (the worker is retired by the caller), so it is
         # `contained=True`: `contained=False` means "a worker is still alive", which stopped the whole
         # function after one mutant and listed the mutant as `containment_lost`.
         return MutantResult(
@@ -8958,6 +8958,27 @@ def _named_run(
     return run
 
 
+def worker_succession(alive: bool, memory_cut: bool) -> str:
+    """What becomes of the isolated worker after one mutant (#45, pure — pinned).
+
+      "keep"                 the worker answered and holds nothing the next mutant could inherit.
+      "replace_dead"         the worker is gone (a wall killed its group, or it died): a fresh one.
+      "replace_memory_cut"   the worker's address-space cap stopped the mutant. The process lives, but
+                             what the runaway had allocated is not given back before it answers (the
+                             failing test's traceback keeps the frames that hold it), so the NEXT
+                             mutant starts inside a nearly full address space and reads as a memory cut
+                             for an allocation it never made. Measured on the hog fixture: a mutant
+                             that returns `None` was a memory cut after a runaway and an assertion kill
+                             before one, so which mutants were "cut" depended on the order they ran in.
+                             A fresh worker per cut makes a mutant's verdict its own.
+
+    A dead worker outranks a cut one: there is nothing to retire.
+    """
+    if not alive:
+        return "replace_dead"
+    return "replace_memory_cut" if memory_cut else "keep"
+
+
 def _evaluate_isolated(
     worker: IsolatedMutantWorker | None,
     mutant: Mutant,
@@ -9049,8 +9070,8 @@ def _evaluate_isolated(
             # The scan runs nodes the unscanned run stops before, and one of them hung or hit the
             # memory cap: that must not replace a verdict the unscanned run reaches (Detective #145).
             # Measure the mutant the way it is measured without the scan, on a fresh worker if the hang
-            # retired this one; the relation is then not claimed for it (`killer_scan="cut"`).
-            if not worker.alive:
+            # or the cap retired this one; the relation is then not claimed for it (`killer_scan="cut"`).
+            if worker_succession(worker.alive, run.memory_cut) != "keep":
                 worker.close()
                 worker = IsolatedMutantWorker(
                     root, [], target, qualname, mem_limit_bytes=mem_limit
@@ -9076,6 +9097,10 @@ def _evaluate_isolated(
         worker.close()
         raise
     run = _named_run(run, identities, selector_key)
+    if worker_succession(worker.alive, run.memory_cut) == "replace_memory_cut":
+        # Retired HERE, so the next mutant opens a fresh one (the caller threads `None` forward).
+        worker.close()
+        worker = None
     return _isolated_result(mutant, run, _elapsed(t0), full_matrix), worker, run
 
 

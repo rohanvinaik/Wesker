@@ -30,7 +30,7 @@ import io
 import json
 import os
 import sys
-from typing import Any
+from typing import Any, Self
 
 import pytest
 
@@ -120,6 +120,69 @@ class _FreshArgumentsPlugin:
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtest_setup(self, item: Any) -> None:
         _ARGUMENTS.refresh(item)
+
+
+def memory_cut_standing(
+    failed_with_memory_error: bool, raised_memory_error: bool
+) -> str:
+    """Whether the address-space cap stopped one node, and how we know (#45, pure — pinned).
+
+      "cap_failed_node"  the node FAILED with `MemoryError`: the cap's own signature.
+      "cap_swallowed"    a `MemoryError` was RAISED while the mutant ran and the node did not fail with
+                         it: the code under test (or a test) caught it, `except Exception: return -1`,
+                         and the node went on to fail some OTHER way, an assertion on the value that
+                         handler returned. That failure is the cap's, not the suite's: reading it as a
+                         value kill let the budget manufacture a kill.
+      "no_cap"           no `MemoryError` was raised.
+
+    The first two are the same fact to the engine (a stop by a budget proves nothing about the value),
+    so the node records no kill reason either way; the code keeps them apart so a test can show the
+    swallowed case is seen and not merely implied.
+    """
+    if failed_with_memory_error:
+        return "cap_failed_node"
+    return "cap_swallowed" if raised_memory_error else "no_cap"
+
+
+class _MemoryErrorWatch:
+    """Record whether a `MemoryError` was RAISED anywhere while armed, caught or not (#45).
+
+    Uses its own `sys.monitoring` tool id (RAISE, process-wide) for the extent of one node's call, so
+    it neither shares nor contends with the pair's subscription broker; when no id is free it records
+    nothing and `available` is False (the caller then has only the failing-node signal, as before).
+    """
+
+    def __init__(self) -> None:
+        self.hit = False
+        self.available = False
+        self._tool: int | None = None
+
+    def __enter__(self) -> Self:
+        mon = getattr(sys, "monitoring", None)
+        if mon is None:
+            return self
+        for candidate in (5, 4, 3, 2):
+            if mon.get_tool(candidate) is not None:
+                continue
+            mon.use_tool_id(candidate, "wesker-memory-watch")
+            mon.register_callback(candidate, mon.events.RAISE, self._raised)
+            mon.set_events(candidate, mon.events.RAISE)
+            self._tool = candidate
+            self.available = True
+            break
+        return self
+
+    def _raised(self, _code: Any, _offset: int, exc: BaseException) -> None:
+        if isinstance(exc, MemoryError):
+            self.hit = True
+
+    def __exit__(self, *_exc: object) -> None:
+        if self._tool is not None:
+            mon = sys.monitoring
+            mon.set_events(self._tool, 0)
+            mon.register_callback(self._tool, mon.events.RAISE, None)
+            mon.free_tool_id(self._tool)
+            self._tool = None
 
 
 def _node_failure_reason(outcome: Any, is_declared_failure: Any) -> str | None:
@@ -330,8 +393,10 @@ class _MutantPlugin(_FreshArgumentsPlugin):
                 *self._write_roots,
                 *session_write_roots(getattr(item, "config", None), create=False),
             )
+            watch = _MemoryErrorWatch()
             try:
                 with (
+                    watch,
                     arm,
                     declared_roots(roots),
                     contain_writes(_PROJECT_TREE or None) as blocked,
@@ -341,6 +406,16 @@ class _MutantPlugin(_FreshArgumentsPlugin):
                 _unpatch_mutant(proof, patched, saved, target, self._func_name)
                 for owner, original in reversed(module_saved):
                     setattr(owner, self._func_name, original)
+        excinfo = getattr(outcome, "excinfo", None)
+        failed_memory = excinfo is not None and isinstance(excinfo[1], MemoryError)
+        if memory_cut_standing(failed_memory, watch.hit) != "no_cap":
+            # The cap stopped this node (#45), caught or not: whatever the node went on to fail with is
+            # the budget's. No kill reason; the flag makes the whole mutant `memory_cut`, and the
+            # server stops running its remaining nodes in an address space the runaway filled.
+            self.memory_cut = True
+            if not self._full_matrix and getattr(item, "session", None) is not None:
+                item.session.shouldfail = "the memory cap stopped the mutant"
+            return
         if arm.stopped:
             # Budget-relative, never a kill (W#27): whatever pytest made of the stopped node.
             self.diverged_nodes.append(getattr(item, "nodeid", ""))

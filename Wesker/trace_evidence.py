@@ -2,8 +2,11 @@
 
 The baseline trace observes which test executed which line, and which branch EDGE: an arc is the
 ``(prev_line, cur_line)`` transition a line event completes inside one frame, so the two sides of a
-conditional, short-circuit operands and loop-zero-vs-entry — which line execution collapses — stay
-apart. "A trace observed this line" and "a baseline-green, contained test proves this line under the
+conditional on DIFFERENT lines, and loop-entry-vs-zero-iterations, which line execution collapses,
+stay apart. What an arc does NOT resolve is anything inside ONE line: the operands of ``a or b``
+written on one line share the single arc into the body whichever operand decided it, so a
+short-circuit path is not an obligation this ledger can discharge (an arc between lines is not an
+instruction-level branch edge). That is a stated limit, not a measured "all operands taken". "A trace observed this line" and "a baseline-green, contained test proves this line under the
 session" are different facts, and unioning coverage BEFORE qualifying it by outcome is how a failing
 test's reach came to close a line ledger (Detective #59's counterexample). This module holds the
 per-item ledger those two views derive from, without loss through early unioning:

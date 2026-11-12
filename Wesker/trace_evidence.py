@@ -26,7 +26,9 @@ Each item carries what that qualification needs, and nothing is inferred from ab
   * its REACH completeness — whether everything the item executed was VISIBLE to the tracer. The
     tracer follows threads a test starts while it runs; a thread that outlives the test's traced
     window may run target code nobody observed, so that item's reach is ``incomplete_thread`` and
-    the lines it lacks are UNKNOWN, never a negative.
+    the lines it lacks are UNKNOWN, never a negative. A thread that was alive BEFORE the test and
+    ran target code during it (a pool warmed in a fixture) cannot be attributed to this test, so
+    the row is ``incomplete_preexisting_thread``: same rule, its absences are unknown.
 """
 
 from __future__ import annotations
@@ -110,6 +112,29 @@ def baseline_outcome(run_code: str | None, item_status: str) -> str:
     if item_status in ("skipped", "xfailed"):
         return item_status
     return "passed"
+
+
+def reach_qualification(outlived_thread: bool, preexisting_thread_ran: bool) -> str:
+    """The reach-completeness code of ONE traced test (#17, pure — pinned).
+
+    Split out of the tracer's worker, which holds thread objects the literal-input allowlist cannot
+    express; the tracer keeps the thread handling and this holds the decision. Two independent
+    facts make absences unknown, and they have different remedies, so they never share a code:
+
+    * ``incomplete_thread`` — a thread THIS test started outlived its traced window, so code it ran
+      afterwards was never observed.
+    * ``incomplete_preexisting_thread`` — a thread alive BEFORE the test ran target code during it
+      (a pool warmed in a fixture or at import): that work cannot be attributed to this test.
+    * ``incomplete_thread_and_preexisting_thread`` — both.
+    * ``complete`` — neither: absence in ``lines`` is a measured negative.
+    """
+    if outlived_thread and preexisting_thread_ran:
+        return "incomplete_thread_and_preexisting_thread"
+    if outlived_thread:
+        return "incomplete_thread"
+    if preexisting_thread_ran:
+        return "incomplete_preexisting_thread"
+    return "complete"
 
 
 def trace_admissibility(
@@ -206,7 +231,8 @@ class TraceEvidence:
     baseline_outcome: str = "unrecorded"
     #: Whether everything this item executed was VISIBLE to the tracer (#17): ``complete``, or
     #: ``incomplete_thread`` when a thread it started outlived its traced window, so code that thread
-    #: ran afterwards was never observed. It qualifies ABSENCE only: the lines that were observed
+    #: ran afterwards was never observed, or ``incomplete_preexisting_thread`` when a thread alive
+    #: before the test ran target code during it (unattributable, so not in ``lines``). It qualifies ABSENCE only: the lines that were observed
     #: stay exactly as admissible as ``reason`` says, while a line missing from ``lines`` is
     #: "not observed", never "not reached".
     reach: str = "complete"

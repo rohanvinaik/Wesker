@@ -11,9 +11,9 @@ THE CONTRACT. Threads started while a test runs are traced into that test's reac
 runs. A thread that outlives the run may execute target code nobody observes, so that row's reach
 is `incomplete_thread`: its missing lines are UNKNOWN, never "not reached", and such a trace is not
 cached (a replayed cell has no field to carry that). `threading`'s own hook is handed back after
-every window. NOT closed here: a thread that existed BEFORE the run and is handed work (a
-module-level pool), and subprocesses — the per-run window cannot see either (#32's process-wide
-monitoring revisits threads; a subprocess runs the ORIGINAL from disk, so it never meets a mutant).
+every window. A thread that existed BEFORE the run and is handed work (a module-level pool) is
+`incomplete_preexisting_thread` (tests/test_preexisting_thread_reach_intent.py); subprocesses are
+the separate case (a subprocess runs the ORIGINAL from disk, so it never meets a mutant).
 """
 
 from __future__ import annotations

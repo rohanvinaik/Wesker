@@ -28,6 +28,7 @@ from types import CodeType
 from typing import Any
 
 from Wesker.interrupt import Abandoned, JoinedWorker, MeasurementRefused, bounded_join
+from Wesker.trace_evidence import reach_qualification
 
 
 def _traceable_lines(
@@ -279,6 +280,7 @@ def _trace_one_multi(
     frame_last: dict[int, int] = {}
 
     alive_before = set(threading.enumerate())
+    preexisting_hit: list[int] = []
     worker_holder: list[threading.Thread] = []
     token = allocate_run_token()
 
@@ -289,6 +291,25 @@ def _trace_one_multi(
         # Read CPython's existing registration without manufacturing an observer.
         registered = registered_thread(thread_id)
         return registered is not None and registered not in alive_before
+
+    def _is_preexisting_thread(thread_id: int) -> bool:
+        # A thread that was already alive when this test began, other than the one running it.
+        registered = registered_thread(thread_id)
+        return registered is not None and registered in alive_before
+
+    def _on_foreign_line(
+        code: CodeType,
+        lineno: int,
+        frame: Any = None,
+        run_token: int | None = None,
+    ) -> None:
+        # (#17) WITNESS only: a pre-existing thread cannot be attributed to THIS test (a pool
+        # warmed in a fixture serves whichever test submits), so its lines never enter the
+        # test's reach. That it ran target code during the window is recorded, so the row can
+        # say its reach is unknown instead of complete-and-empty.
+        filename = code.co_filename
+        if filename in target_files or match(filename) is not None:
+            preexisting_hit.append(lineno)
 
     def _on_line(
         code: CodeType,
@@ -334,6 +355,16 @@ def _trace_one_multi(
             subscribe(
                 [],
                 sys.monitoring.events.LINE,
+                _on_foreign_line,
+                run_token=token,
+                selectors=tuple(target_files),
+                thread_filter=_is_preexisting_thread,
+            )
+        )
+        handles.append(
+            subscribe(
+                [],
+                sys.monitoring.events.LINE,
                 _on_line,
                 run_token=token,
                 selectors=tuple(target_files),
@@ -374,11 +405,16 @@ def _trace_one_multi(
         except (Exception, Abandoned, MeasurementRefused):  # noqa: BLE001, S110
             pass
         finally:
-            if reach is not None and any(
-                t not in alive_before and t is not threading.current_thread()
-                for t in threading.enumerate()
-            ):
-                reach.append("incomplete_thread")
+            if reach is not None:
+                code = reach_qualification(
+                    any(
+                        t not in alive_before and t is not threading.current_thread()
+                        for t in threading.enumerate()
+                    ),
+                    bool(preexisting_hit),
+                )
+                if code != "complete":
+                    reach.append(code)
 
     thread = JoinedWorker(target=_worker, daemon=True)
     try:

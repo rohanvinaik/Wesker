@@ -10,6 +10,17 @@ changed twice, so the policy id moved twice.
 
 ### Correctness
 
+- **The wall that bounds a mutant's liveness follows the machine, and a fired wall is retried once.**
+  The isolated per-mutant wall was a fixed `max(per_mutant_timeout_ms, 10 s)`, so work no loop budget
+  counts (a loop in a helper, a C builtin, another thread) read COMPLETE on a fast machine and
+  `undetermined` on a slow one. The bound is now a compute budget (10 reference seconds;
+  `WESKER_COMPUTE_BUDGET_S` sets it, and an invalid value is refused, not ignored) times this machine's
+  measured slowdown on a fixed reference workload, taken once per process (`monitoring.harness_slowdown`,
+  `liveness_bound_ms`, whose code names the deciding term). A bound that fires is retried once on a fresh
+  worker, with the machine measured again, and a second fire is `undetermined`. The unarmed in-process
+  allowance's floor and cap and the original's counted-run wall follow the same slowdown. Policy id moves
+  (the observation clause names the bound; the universe and `POLICY_VERSION` do not): one-sign
+  `9.008828e5f6a9` -> `9.10f8e602bf48`, two-sign `9+neg.1a13fddd1d5f` -> `9+neg.de8c78c57407`. (W#27)
 - **A trace row says when its reach is unknown, and what kind of non-pass a route cannot type.**
   A test that reaches the target through a thread alive before it started (a pool warmed at import), or only
   in a child process, used to read `reach=complete lines=()`: an admissible "reached nothing". Its

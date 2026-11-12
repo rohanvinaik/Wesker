@@ -8646,12 +8646,30 @@ def run_function_sampling(
 # a verdict. Tunable; `should_recycle` treats 0 as "never recycle on count".
 _ISOLATED_WORKER_RECYCLE = 100
 
-# Floor for the isolated per-mutant timeout (#19). The isolated worker runs a full pytest invocation
-# per mutant — the first on a fresh worker paying interpreter+collection startup — so a cap tuned for
-# in-process microsecond calls would time out honest mutants and read them as false kills. `select`
-# returns as soon as the worker answers, so this floor never slows a normal mutant; it only sets how
-# long a genuine hang runs before the process group is killed.
-_ISOLATED_MIN_TIMEOUT_S = 10.0
+# The isolated per-mutant wall (#19, W#27) is a LIVENESS bound, sized by `liveness_bound_ms`: the
+# compute budget (10 reference seconds unless WESKER_COMPUTE_BUDGET_S says otherwise, which also covers
+# pytest startup in a fresh worker) stretched by how much slower this machine runs a fixed reference
+# workload, measured once per process. `select` returns as soon as the worker answers, so a generous
+# bound never slows a normal mutant; it only sets how long a genuine hang runs before the process
+# group is killed, and it moves with the machine so the same function reaches the same verdict on a
+# slow one as on a fast one.
+
+
+def _isolated_wall_s(
+    per_mutant_timeout_ms: float, armed_cost_ms: float, refresh: bool = False
+) -> float:
+    """The wall one isolated mutant observation runs under, in seconds (W#27).
+
+    Reads the calibrated slowdown and the compute budget and hands the arithmetic to
+    `liveness_bound_ms`. ``refresh`` re-measures the machine first (a wall just fired).
+    """
+    from Wesker.monitoring import compute_budget_s, liveness_bound_ms, machine_slowdown
+
+    slowdown, _ = machine_slowdown(refresh)
+    bound_ms, _ = liveness_bound_ms(
+        per_mutant_timeout_ms, compute_budget_s() * 1000.0, armed_cost_ms, slowdown
+    )
+    return bound_ms / 1000.0
 
 
 def _isolated_scan(full_matrix: bool, run: IsolatedRun) -> dict[str, Any]:
@@ -8885,6 +8903,7 @@ def _evaluate_isolated(
     """
     from Wesker.ci import callable_node_id, callable_origin, callable_test_id
     from Wesker.isolation import isolated_selector_key, isolated_test_selection
+    from Wesker.monitoring import liveness_action
 
     root, target, qualname, recycle_cap, mem_limit = iso_ctx
     node_ids = []
@@ -8931,11 +8950,9 @@ def _evaluate_isolated(
     # BLE001: an un-unparseable mutant is un-evaluable: conservative survivor
     except Exception:  # noqa: BLE001
         return MutantResult(mutant=mutant, killed=False, elapsed_ms=0.0), worker, None
-    timeout_s = max(per_mutant_timeout_ms / 1000.0, _ISOLATED_MIN_TIMEOUT_S)
-    if armed_cost_ms:
-        # The hang bound must not decide what a loop budget decides (W#27): cover reaching every
-        # armed node's cap on top of the floor that already covers pytest startup.
-        timeout_s = max(timeout_s, _ISOLATED_MIN_TIMEOUT_S + armed_cost_ms / 1000.0)
+    # The hang bound must not decide what a loop budget decides (W#27): an armed observation's wall
+    # covers reaching every cap on top of the compute budget that already covers pytest startup.
+    timeout_s = _isolated_wall_s(per_mutant_timeout_ms, armed_cost_ms)
     t0 = time.monotonic()
     try:
         run = worker.evaluate(
@@ -8957,6 +8974,20 @@ def _evaluate_isolated(
                 )
             run = worker.evaluate(
                 source, timeout_s, node_ids=node_ids, step_caps=step_caps or None
+            )
+        if liveness_action(run.timed_out, run.contained, 1) == "retry":
+            # A wall that fires once may have met a stall, not a mutant that never ends (W#27): the
+            # machine is measured again (keeping the slower reading) and the mutant is run once more
+            # on a fresh worker. A second fire is `undetermined`, below, in `_isolated_result`.
+            worker.close()
+            worker = IsolatedMutantWorker(
+                root, [], target, qualname, mem_limit_bytes=mem_limit
+            )
+            run = worker.evaluate(
+                source,
+                _isolated_wall_s(per_mutant_timeout_ms, armed_cost_ms, refresh=True),
+                node_ids=node_ids,
+                step_caps=step_caps or None,
             )
     except BaseException:
         worker.close()
@@ -9046,6 +9077,12 @@ def _measurement_boundary(fn):
                 assert owner is not None
                 mark_refusal(disposition, owner)
                 raise MeasurementRefused(disposition, owner)
+            # The harness is calibrated once, here, at the start of the first measurement and before
+            # the function's own clock starts (W#27): the reading costs a fraction of a second, which
+            # is not the budget of the profile that happens to be first.
+            from Wesker.monitoring import machine_slowdown
+
+            machine_slowdown()
             return fn(*args, **kwargs)
         finally:
             if registered:
@@ -10008,7 +10045,7 @@ def run_function_profiling(
         _dtarget = source_path or ""
         if _dnodes and _dtarget:
             _droot = _PROJECT_ROOT.get() or os.getcwd()
-            _dtimeout = max(per_mutant_timeout_ms / 1000.0, _ISOLATED_MIN_TIMEOUT_S)
+            _dtimeout = _isolated_wall_s(per_mutant_timeout_ms, 0.0)
             _la, _oa, _ca = run_baseline_traced_isolated(
                 _droot, _dnodes, _dtarget, _dtimeout
             )

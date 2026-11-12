@@ -25,6 +25,7 @@ import itertools
 import os
 import sys
 import threading
+import time
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass, field
 from types import CodeType
@@ -133,6 +134,177 @@ def armed_wall_ms(
         return wall_ms
     need = original_ms + cap * STEP_ITERATION_US / 1000.0
     return max(wall_ms, min(need, ceiling_ms))
+
+
+#: The compute budget of one mutant observation's wall, in REFERENCE seconds (W#27): the work a mutant
+#: may do that the loop budget cannot count (a loop in a helper, a C builtin, another thread) before
+#: the wall calls it `undetermined`. 10.0 is the floor the isolated wall always had (it covers pytest
+#: startup in a fresh worker); what changed is the unit. It is seconds on the reference machine, and
+#: the bound on any other machine is this times how much slower that machine runs the reference
+#: workload, so the same function reaches the same verdict on a slow machine as on a fast one.
+#: The user sets it with ``WESKER_COMPUTE_BUDGET_S``.
+LIVENESS_BUDGET_S = 10.0
+#: The slowdown a bound will follow, at most. Past it the machine is not slow, it is starved, and a
+#: bound that grows without limit is no bound; the code ``capped`` names that.
+LIVENESS_MAX_SLOWDOWN = 64
+#: Iterations of the reference workload (a pure-Python integer loop, the shape of the work no counter
+#: sees) and the time it takes the reference machine: 35.7 ms, the fastest of nine runs on the
+#: development container while its load average was 4.7 (a second set of nine agreed to 0.1 ms), so an idle machine of that class is no
+#: slower. A machine at least this fast has slowdown 1.0: the bound never shrinks below the budget.
+LIVENESS_REFERENCE_ITERATIONS = 1_000_000
+LIVENESS_REFERENCE_NS = 35_700_000
+COMPUTE_BUDGET_ENV = "WESKER_COMPUTE_BUDGET_S"
+
+
+def harness_slowdown(
+    measured_ns: int, reference_ns: int, max_slowdown: int
+) -> tuple[float, str]:
+    """How much slower than the reference machine this one runs, and why that number (pure — pinned).
+
+    ``measured_ns`` is this machine's time on the reference workload, ``reference_ns`` the reference
+    machine's. The result is ``(factor, code)``:
+
+    * ``unmeasured`` — no usable measurement or reference (zero or negative): factor 1.0. Absence is
+      not a value: the code says the bound is the reference bound because nothing was measured.
+    * ``reference``  — at least as fast as the reference: factor 1.0. A faster machine does not
+      shrink the bound; the budget is a floor.
+    * ``slower``     — slower than the reference: the ratio, so the bound grows with the machine.
+    * ``capped``     — slower than ``max_slowdown`` times: that cap, never more.
+    """
+    if measured_ns <= 0 or reference_ns <= 0 or max_slowdown < 1:
+        return 1.0, "unmeasured"
+    if measured_ns <= reference_ns:
+        return 1.0, "reference"
+    ratio = measured_ns / reference_ns
+    if ratio > max_slowdown:
+        return float(max_slowdown), "capped"
+    return ratio, "slower"
+
+
+def liveness_bound_ms(
+    requested_ms: float, budget_ms: float, armed_cost_ms: float, slowdown: float
+) -> tuple[float, str]:
+    """The wall that bounds LIVENESS of one isolated mutant observation (W#27, pure — pinned).
+
+    ``requested_ms`` is the caller's per-mutant ask and ``budget_ms`` the compute budget, both in
+    reference time; ``slowdown`` is :func:`harness_slowdown`'s factor, so both are stretched by how
+    slow this machine is. ``armed_cost_ms`` is what reaching every armed node's cap costs, already
+    measured on THIS machine (the original's own counted run plus ``cap`` iterations at
+    :data:`STEP_ITERATION_US`), so it is added unscaled: scaling it again would count the machine's
+    slowness twice. The bound is the largest term, and the code names which:
+
+    * ``armed``     — the budget plus the cost of reaching the caps decided: a budgeted observation
+      must reach its deterministic stop before the wall can.
+    * ``requested`` — the caller asked for more than the budget.
+    * ``budget``    — the compute budget decided (the usual case).
+    """
+    scale = max(slowdown, 1.0)
+    base = max(requested_ms, budget_ms) * scale
+    if armed_cost_ms > 0 and budget_ms * scale + armed_cost_ms >= base:
+        return budget_ms * scale + armed_cost_ms, "armed"
+    if requested_ms > budget_ms:
+        return base, "requested"
+    return base, "budget"
+
+
+def liveness_action(timed_out: bool, contained: bool, attempts: int) -> str:
+    """What a fired liveness wall asks for next (W#27, pure — pinned).
+
+    A wall that fires once may have met a stall (another process took the cores) and not a mutant
+    that never ends, so it is tried once more; a wall that fires again names the observation
+    `undetermined`. Never a kill, never survival evidence.
+
+    * ``accept``       — the wall did not fire: the run stands.
+    * ``retry``        — the first fire, and the stopped worker is confirmed dead: run it once more.
+    * ``undetermined`` — it fired again, or the runaway could not be stopped (running it again
+      beside a live runaway would measure the runaway): no verdict.
+    """
+    if not timed_out:
+        return "accept"
+    if attempts < 2 and contained:
+        return "retry"
+    return "undetermined"
+
+
+def parse_compute_budget(raw: str | None) -> tuple[float, str]:
+    """The compute budget a setting names, in reference seconds (W#27, pure — pinned).
+
+    * ``default``  — nothing set (None or blank): :data:`LIVENESS_BUDGET_S`.
+    * ``set``      — a finite positive number.
+    * ``invalid``  — anything else (not a number, zero, negative, infinite, NaN): the default
+      value, but named, so a caller can refuse a setting that was ignored instead of obeying it
+      silently.
+    """
+    if raw is None or not raw.strip():
+        return LIVENESS_BUDGET_S, "default"
+    try:
+        value = float(raw)
+    except ValueError:
+        return LIVENESS_BUDGET_S, "invalid"
+    if not (value > 0.0) or value == float("inf"):
+        return LIVENESS_BUDGET_S, "invalid"
+    return value, "set"
+
+
+def reference_workload(iterations: int) -> int:
+    """The fixed workload the harness is calibrated on: a pure-Python integer loop.
+
+    It is the shape of work the loop budget cannot count and the wall must bound, and its value is
+    returned so nothing can optimise it away.
+    """
+    acc = 0
+    i = 0
+    while i < iterations:
+        acc = (acc + i * 3) & 0xFFFF
+        i += 1
+    return acc
+
+
+_harness_ns: int | None = None
+
+
+def measure_harness_ns(repeats: int = 5) -> int:
+    """This machine's median wall time on the reference workload, in ns (impure).
+
+    Wall time, not CPU time: the bound it sizes is a wall bound, and a machine that is busy with
+    other work is exactly the slowness the bound must follow.
+    """
+    samples = []
+    for _ in range(max(1, repeats)):
+        t0 = time.perf_counter_ns()
+        reference_workload(LIVENESS_REFERENCE_ITERATIONS)
+        samples.append(time.perf_counter_ns() - t0)
+    samples.sort()
+    return samples[len(samples) // 2]
+
+
+def machine_slowdown(refresh: bool = False) -> tuple[float, str]:
+    """The calibrated slowdown of THIS machine, measured once per process (impure).
+
+    The first call measures; later calls reuse it. ``refresh=True`` measures again and keeps the
+    SLOWER of the two: it is asked for after a wall fired, because a machine that became busy since
+    the first measurement is the one cause a retry can cure, and a bound must not shrink back.
+    """
+    global _harness_ns
+    if _harness_ns is None or refresh:
+        now = measure_harness_ns()
+        _harness_ns = now if _harness_ns is None else max(_harness_ns, now)
+    return harness_slowdown(_harness_ns, LIVENESS_REFERENCE_NS, LIVENESS_MAX_SLOWDOWN)
+
+
+def compute_budget_s() -> float:
+    """The compute budget in force, from ``WESKER_COMPUTE_BUDGET_S`` (impure).
+
+    An invalid setting is refused rather than ignored: a bound the user thinks they raised and did
+    not is a verdict they cannot account for.
+    """
+    raw = os.environ.get(COMPUTE_BUDGET_ENV)
+    value, code = parse_compute_budget(raw)
+    if code == "invalid":
+        raise ValueError(
+            f"{COMPUTE_BUDGET_ENV}={raw!r} is not a finite positive number of seconds"
+        )
+    return value
 
 
 def mutant_step_cap(

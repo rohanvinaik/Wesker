@@ -52,7 +52,12 @@ from .engine import (
     _ValueMutator,
     estimate_universe_size,
 )
-from .monitoring import STEP_BUDGET_FACTOR, STEP_BUDGET_FLOOR, STEP_PROBE_CAP
+from .monitoring import (
+    LIVENESS_BUDGET_S,
+    STEP_BUDGET_FACTOR,
+    STEP_BUDGET_FLOOR,
+    STEP_PROBE_CAP,
+)
 from .mu_minus import MU_MINUS_CATALOG
 from .swap_plan import SWAP_PAIR_BUDGET
 
@@ -464,7 +469,11 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
                 "nontermination; a budgeted observation's wall bound covers reaching its "
                 "cap inside the aggregate deadline and its time is never charged to the "
                 "mutant's allowance, so wall-clock bounds bound liveness only and yield "
-                "undetermined, never kills or survival evidence"
+                "undetermined, never kills or survival evidence; a liveness bound is a "
+                f"compute budget of {LIVENESS_BUDGET_S:g} reference seconds stretched by how "
+                "much slower the measuring machine runs a fixed reference workload, so one "
+                "function reaches one verdict on a slow machine as on a fast one, and a bound "
+                "that fires is retried once before the observation is named undetermined"
             ),
             (
                 "each test run against a mutant writes only inside its write authority — "

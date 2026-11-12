@@ -96,10 +96,13 @@ def test_abandon_reports_false_for_a_thread_blocked_outside_the_interpreter():
     model does not account for. `abandon` is not wrong there — it stops the thread and reports True,
     which is the truth. What is wrong is the claim that it *cannot*.
 
-    THIS MATTERS BEYOND CI. Wesker installs `sys.settrace` itself, in `line_coverage._trace_one`,
-    around every test of the traced baseline pass — and `trace_budget_s` calls `abandon` from inside
-    it. So the untraced boundary asserted below is NOT the condition the engine's own hot path runs
-    under. Whether that is a gift (runaways in C become stoppable exactly where they were not) or a
+    THIS MATTERS BEYOND CI. Wesker no longer installs `sys.settrace` anywhere (#32): its line
+    coverage subscribes to `sys.monitoring` LINE events through the broker in `Wesker/monitoring.py`,
+    from `line_coverage._trace_one_multi`, around every test of the traced baseline pass — and
+    `trace_budget_s` calls `abandon` from inside it. The measurement above was taken under
+    `--cov` (a `sys.settrace`-class tracer), so whether a `sys.monitoring` subscription changes the
+    boundary the same way is NOT measured here. The untraced boundary asserted below is therefore
+    not known to be the condition the engine's own hot path runs under. Whether that is a gift (runaways in C become stoppable exactly where they were not) or a
     hazard (a stop lands somewhere the model says it cannot) is unknown, and worth knowing.
 
     Do not delete this skip to make the suite green. Delete it by explaining the mechanism.

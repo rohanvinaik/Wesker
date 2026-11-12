@@ -928,9 +928,22 @@ def callable_item_status(call: Any) -> str:
     right after the run it describes: the next run overwrites it. Any other callable shape — a plain
     function, a legacy closure — carries none and reads ``unobserved``, which leaves the engine's own
     run code to decide (``trace_evidence.baseline_outcome``).
+
+    ``marked`` (#17) is the one exception: a callable with no live status that carries pytest
+    ``skip`` / ``skipif`` / ``xfail`` marks. The route that produced it does not evaluate marks, so
+    running it says nothing about what pytest would have made of it, and the baseline types it
+    ``untyped`` rather than reading a clean return as a pass or a raise as a wrong expectation.
     """
     value = getattr(getattr(call, "__wesker_item_status__", None), "value", None)
-    return value if isinstance(value, str) else "unobserved"
+    if isinstance(value, str):
+        return value
+    marks = getattr(call, "pytestmark", None)
+    names = (
+        {getattr(m, "name", None) for m in marks} if isinstance(marks, list) else set()
+    )
+    if names & {"skip", "skipif", "xfail"}:
+        return "marked"
+    return "unobserved"
 
 
 def callable_base_name(call: Any) -> str:

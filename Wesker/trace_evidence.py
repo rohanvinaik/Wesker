@@ -43,7 +43,10 @@ from dataclasses import dataclass
 
 #: The typed baseline outcomes (#17): pytest's own terminal categories for one item's run on the
 #: UNMUTATED program. Only ``passed`` is green.
-BASELINE_OUTCOMES = ("passed", "failed", "skipped", "xfailed", "error")
+#: ``untyped`` is the one NAMED non-answer: a run on the legacy direct-call route (no pytest phase)
+#: that did not pass, or that carries skip/xfail marks the route does not evaluate, so its kind
+#: cannot be told (#17). It is never green and never one of the four typed kinds.
+BASELINE_OUTCOMES = ("passed", "failed", "skipped", "xfailed", "error", "untyped")
 
 
 def item_run_status(setup: str, call: str, teardown: str) -> str:
@@ -99,21 +102,29 @@ def baseline_outcome(run_code: str | None, item_status: str) -> str:
 
     * ``error`` when the run never reached a verdict (``timeout`` / ``uncontained``): whatever a
       report says about a run that was stopped is partial. Checked first.
+    * ``untyped`` when ``item_status`` is ``marked``: the callable carries skip/skipif/xfail marks
+      and runs on a route that does not evaluate them (the legacy direct-call route, outside a live
+      session), so whether pytest would have skipped it, expected it to fail or run it cannot be
+      said — a pass would be a claim about a test pytest might not have run.
     * pytest's ``error`` / ``failed`` when it reported one — it alone sees which PHASE failed, so a
       fixture's AssertionError is an error, not a wrong expectation.
-    * a RAISING callable with no report: ``assertion`` / ``exception`` (a declared failure) is
-      ``failed``; anything else is ``error``, never ``failed`` — under the direct-call contract a
-      crash is ambiguous (a missing fixture argument), the rule ``failing_on_baseline`` keeps by not
-      accusing such a test of a wrong expectation. An unrecognised code is ``error`` too: a new kill
-      reason is by construction "did not pass".
+    * a RAISING callable with no report (the legacy direct-call route): ``assertion`` /
+      ``exception`` (a declared failure) is ``failed``; anything else is ``untyped``. A crash there
+      is a missing fixture argument (a setup error), a ``pytest.skip()``, a ``pytest.xfail()`` or a
+      real exception, and the route has no phase to tell them apart. It was typed ``error``, which
+      printed a skip as a setup error; it is never ``failed`` either (the rule ``failing_on_baseline``
+      keeps by not accusing such a test of a wrong expectation). An unrecognised code is ``untyped``
+      too: a new kill reason is by construction "did not pass", and not known to be an error.
     * a clean return: pytest's ``skipped`` / ``xfailed`` when it reported one, else ``passed``.
     """
     if run_code in ("timeout", "uncontained"):
         return "error"
+    if item_status == "marked":
+        return "untyped"
     if item_status in ("error", "failed"):
         return item_status
     if run_code is not None:
-        return "failed" if run_code in ("assertion", "exception") else "error"
+        return "failed" if run_code in ("assertion", "exception") else "untyped"
     if item_status in ("skipped", "xfailed"):
         return item_status
     return "passed"
@@ -179,6 +190,10 @@ def trace_admissibility(
       or teardown, was skipped, or failed as expected. Each is named, never folded into
       ``refuse_failed``: "your expectation is wrong" and "this test never ran to a verdict" have
       different remedies.
+    * ``refuse_untyped`` — the item ran on a route that cannot say what its non-pass was (the
+      legacy direct-call route: a skip, an expected failure and a setup error look alike there) or
+      carries marks that route does not evaluate. Named apart from ``refuse_failed``: the remedy for
+      "your expectation is wrong" does not apply to a test nobody can say failed.
     * ``refuse_failed`` — the item is baseline-RED: its expectation does not hold on the unmutated
       program, so its execution proves nothing about the code under test. Also the answer whenever
       ``baseline_passed`` is False with no typed outcome to say more, and for an outcome this does
@@ -204,6 +219,8 @@ def trace_admissibility(
         return "refuse_skipped"
     if outcome == "xfailed":
         return "refuse_xfailed"
+    if outcome == "untyped":
+        return "refuse_untyped"
     if not baseline_passed or outcome not in ("passed", "unrecorded"):
         return "refuse_failed"
     if not fresh:

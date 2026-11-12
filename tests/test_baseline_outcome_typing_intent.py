@@ -92,12 +92,16 @@ def test_item_run_status_reads_the_phase_reports_the_way_pytest_does(
             "unobserved",
             "failed",
         ),  # a declared failure (pytest.fail / raises)
-        ("crash", "unobserved", "error"),  # ambiguous under direct call: never accused
+        (
+            "crash",
+            "unobserved",
+            "untyped",
+        ),  # #17: a skip, xfail() or setup error alike: said, not guessed
         ("timeout", "passed", "error"),  # a stopped run reached no verdict
         ("timeout", "failed", "error"),  # ...and its partial report is not one either
         ("uncontained", "failed", "error"),
         ("uncontained", "unobserved", "error"),
-        ("some_new_kill_reason", "unobserved", "error"),  # unrecognised -> not green
+        ("some_new_kill_reason", "unobserved", "untyped"),  # unrecognised -> not green
     ],
 )
 def test_baseline_outcome_never_reads_a_non_pass_as_passed(run_code, status, expected):

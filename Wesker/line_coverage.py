@@ -443,6 +443,13 @@ def _trace_one_multi(
             test_fn()
         except (Exception, Abandoned, MeasurementRefused):  # noqa: BLE001, S110
             pass
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        # BLE001: pytest's own outcomes (`Skipped`, `XFailed`, `Failed`) derive from BaseException; a
+        # test that raises one still contributes the lines it reached, and an unhandled one would
+        # escape this thread as a thread-exception warning that pytest turns into a failure (#17)
+        except BaseException:  # noqa: BLE001, S110
+            pass
         finally:
             if reach is not None:
                 code = reach_qualification(

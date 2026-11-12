@@ -39,29 +39,29 @@ from Wesker.filter import filter_categories
     (
         "budget_exhausted",
         "contained",
-        "memory_cut",
         "evaluated",
         "universe",
         "passes",
         "depth",
     ),
     [
-        (True, True, False, 9, 9, 1, "cut"),
-        (False, False, False, 9, 9, 1, "cut"),
-        (False, True, True, 9, 9, 1, "cut"),
-        (False, True, False, 9, 9, 1, "profiled"),
-        (False, True, False, 10, 9, 1, "profiled"),
-        (False, True, False, 5, 9, 2, "converged"),
-        (False, True, False, 5, 9, 1, "sampled"),
-        (False, True, False, 0, 0, 1, "sampled"),
+        (True, True, 9, 9, 1, "cut"),
+        (False, False, 9, 9, 1, "cut"),
+        # W#45: a memory cap that stopped one mutant is not a row here. It cannot cut the RUN: that
+        # mutant is evaluated, unscored and named (`memory_cut`), like `diverged`.
+        (False, True, 9, 9, 1, "profiled"),
+        (False, True, 10, 9, 1, "profiled"),
+        (False, True, 5, 9, 2, "converged"),
+        (False, True, 5, 9, 1, "sampled"),
+        (False, True, 0, 0, 1, "sampled"),
     ],
 )
 def test_only_a_run_that_stopped_short_is_cut(
-    budget_exhausted, contained, memory_cut, evaluated, universe, passes, depth
+    budget_exhausted, contained, evaluated, universe, passes, depth
 ):
     assert (
         converged_coverage_depth(
-            budget_exhausted, contained, memory_cut, evaluated, universe, passes
+            budget_exhausted, contained, evaluated, universe, passes
         )
         == depth
     )
@@ -196,9 +196,9 @@ def test_the_profiling_path_never_calls_a_no_verdict_mutant_a_cut(loop_target):
         "a mutant with no verdict must still keep the verdict ungateable"
     )
     record = result.to_dict()
-    assert truncation_cause(
-        record["coverage_depth"], record["budget_exhausted"], record["memory_standing"]
-    ) == ("not_truncated")
+    assert truncation_cause(record["coverage_depth"], record["budget_exhausted"]) == (
+        "not_truncated"
+    )
     assert set(unresolved_causes(record["unscored_by"])) & {"undetermined", "diverged"}
 
 

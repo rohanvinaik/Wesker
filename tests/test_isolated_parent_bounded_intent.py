@@ -230,8 +230,14 @@ def test_the_hog_fixture_under_isolated_keeps_the_parent_small_and_exits_clean(
     peak = int(done.stderr.rsplit("PEAK_MB", 1)[1].split()[0])
     assert peak < 1000, f"the parent peaked at {peak} MB"
     mutation = json.loads(done.stdout)["mutation"]
-    cuts = {t["function_key"]: t["cause"] for t in mutation["truncated_functions"]}
-    assert cuts == {"hog.py::collect": "memory"}
-    assert mutation["total_equivalent"] == 0, (
-        "a cut mutant is never declared equivalent"
-    )
+    # W#45: the capped mutants are named, unscored, and the function is NOT cut: its other mutants
+    # were evaluated (this run once stopped after the first capped mutant, so how many were
+    # evaluated and whether one equivalent survivor was reached depended on the order they ran in).
+    assert mutation["truncated_functions"] == []
+    named = {u["function_key"]: u for u in mutation["unresolved_functions"]}
+    assert set(named) == {"hog.py::collect"}
+    assert named["hog.py::collect"]["cause"] == "memory_cut"
+    cut_ids = set(named["hog.py::collect"]["mutants"])
+    assert cut_ids, "the runaway mutants are named"
+    survivors = {s["mutant_id"]: s for s in mutation["survivors"]}
+    assert not cut_ids & set(survivors), "a cut mutant is neither a survivor nor a kill"

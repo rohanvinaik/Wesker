@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import IO, Any
 
 from Wesker.engine import (
+    MEMORY_CUT,
     ORIGINAL_ALSO_FAILS,
     run_function_converged,
 )
@@ -1902,19 +1903,18 @@ def is_truncated_measurement(coverage_depth: str, budget_exhausted: bool) -> boo
     return coverage_depth == "cut" or budget_exhausted
 
 
-def truncation_cause(
-    coverage_depth: str, budget_exhausted: bool, memory_standing: str
-) -> str:
+def truncation_cause(coverage_depth: str, budget_exhausted: bool) -> str:
     """WHY one function's profile was cut, named for the remedy it needs (pure).
 
     `is_truncated_measurement` answers whether a profile may be counted. A refusal built on that
     alone can say how many functions were cut but not what to do about them, and the remedies
-    differ — one of them is not a budget at all:
+    differ — one of them is not a budget at all. (A mutant the memory cap stopped is NOT a cause here
+    since W#45: it is one mutant with no verdict, named by `unresolved_causes` as `memory_cut`; the
+    function's other mutants were evaluated.)
 
       "budget"         the function ran past its budget before its selected mutants were all
                        evaluated. When the budget ran out, containment is not recorded separately,
                        so this code makes no claim that the worker was contained.
-      "memory"         a mutant hit the isolated worker's address-space cap (W#21).
       "uncontained"    a timed-out test could not be stopped — blocked outside the interpreter — and
                        the profile stopped there (#14). More budget cannot fix it.
       "not_truncated"  a measurement the rollup counts.
@@ -1926,8 +1926,6 @@ def truncation_cause(
         return "not_truncated"
     if budget_exhausted:
         return "budget"
-    if memory_standing == "cut":
-        return "memory"
     return "uncontained"
 
 
@@ -1951,6 +1949,7 @@ def truncation_cause(
 UNSCORED_ROLLUP: tuple[tuple[str, str], ...] = (
     ("undetermined", "unresolved"),
     ("diverged", "unresolved"),
+    (MEMORY_CUT, "unresolved"),
     (WRITE_OUTSIDE_AUTHORITY, "unresolved"),
     (ORIGINAL_ALSO_FAILS, "unresolved"),
     ("cut", "truncated"),
@@ -1976,6 +1975,10 @@ def unresolved_causes(unscored_by: dict) -> tuple[str, ...]:
       "diverged"                 a mutant exceeded a deterministic step budget relative to the
                                  original's iterations: budget-relative evidence, never a kill and
                                  never proof of nontermination.
+      "memory_cut"               the isolated worker's address-space cap stopped a mutant (W#45): a stop
+                                 by a budget, which proves nothing about the value, so it is neither
+                                 a kill nor a survivor. One mutant, never the function: the worker is
+                                 replaced and the function's other mutants are evaluated.
       "write_outside_authority"  a test run against the mutant tried to write outside its write
                                  authority and the write was prevented before it landed, so the test
                                  was never observed to pass or fail (W#51).
@@ -2203,15 +2206,6 @@ _TRUNCATION_REMEDIES = (
         ),
     ),
     (
-        "memory",
-        (
-            "A mutant hit the isolated worker's memory cap (`--mem-limit-mb`). It is a named cut, "
-            "never a kill: that mutant is neither killed nor survived, and the function's remaining "
-            "mutants were not evaluated. A runaway mutant (unbounded allocation) is rightly cut; "
-            "raise `--mem-limit-mb` only if the cap is below what the tests legitimately need."
-        ),
-    ),
-    (
         "budget",
         (
             "The function ran past its budget, which applies to each function separately. Raise "
@@ -2259,22 +2253,6 @@ def _describe_containment_lost(lost: list[dict], limit: int = 3) -> list[str]:
     return lines
 
 
-def _describe_memory_cut(lost: list[dict], limit: int = 3) -> list[str]:
-    """The lines naming the mutant that hit the memory cap (W#45, pure).
-
-    The cap stopped the mutant; nothing was left unstoppable, so `_describe_containment_lost`'s
-    "could not stop" would say the opposite of what happened.
-    """
-    lines = [
-        f"    hit the cap: mutant {e.get('mutant') or e.get('mutant_id') or '?'} "
-        f"(line {e.get('mutated_line', '?')})"
-        for e in lost[:limit]
-    ]
-    if len(lost) > limit:
-        lines.append(f"    … and {len(lost) - limit} more")
-    return lines
-
-
 def describe_truncation(truncated: list[dict], limit: int = 20) -> str:
     """The cut functions, grouped by cause, each group under the remedy it needs (pure).
 
@@ -2301,12 +2279,7 @@ def describe_truncation(truncated: list[dict], limit: int = 20) -> str:
                 f"  {t.get('function_key') or '?'} — {seconds:.1f} s, "
                 f"{t.get('tested', 0)}/{t.get('universe', 0)} mutants evaluated"
             )
-            lost = t.get("containment_lost") or []
-            lines.extend(
-                _describe_memory_cut(lost)
-                if cause == "memory"
-                else _describe_containment_lost(lost)
-            )
+            lines.extend(_describe_containment_lost(t.get("containment_lost") or []))
         if len(group) > limit:
             lines.append(f"  … and {len(group) - limit} more")
         blocks.append("\n".join(lines))
@@ -2411,6 +2384,17 @@ _UNRESOLVED_REMEDIES = (
             "A mutant exceeded the deterministic step budget relative to the original's iterations "
             "— budget-relative evidence, never a kill and never proof of nontermination, so its "
             "question is missing from both sides of the ratio."
+        ),
+    ),
+    (
+        MEMORY_CUT,
+        (
+            "A mutant hit the isolated worker's memory cap (`--mem-limit-mb`) — a stop by a budget, "
+            "which proves nothing about the value: it is neither killed nor survived, so its "
+            "question is missing from both sides of the ratio. The worker was replaced and every "
+            "other mutant of the function was evaluated. A runaway mutant (unbounded allocation) "
+            "is rightly stopped; raise `--mem-limit-mb` only if the cap is below what the tests "
+            "legitimately need."
         ),
     ),
     (
@@ -2640,7 +2624,6 @@ def profile_codebase(
             cause = truncation_cause(
                 r.get("coverage_depth", ""),
                 bool(r.get("budget_exhausted")),
-                str(r.get("memory_standing", "n/a")),
             )
             if cause != "not_truncated":
                 truncated_functions.append(

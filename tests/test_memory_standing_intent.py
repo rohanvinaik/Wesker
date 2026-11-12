@@ -26,7 +26,7 @@ import pytest
 from Wesker import cli
 from Wesker.ci import (
     describe_memory,
-    describe_truncation,
+    describe_unresolved,
     memory_rollup_standing,
     profile_codebase,
 )
@@ -129,24 +129,22 @@ def test_a_cap_given_without_isolated_is_reported_ignored(monkeypatch):
 
 
 def test_a_memory_cut_is_named_with_its_remedy_and_never_as_a_kill():
-    text = describe_truncation(
+    """W#45: a mutant the cap stopped is ONE mutant with no verdict, named under `unresolved` like
+    `diverged`. It is no longer a cut of the function (the old `memory` truncation cause said the
+    function's other mutants were not evaluated, which was the defect)."""
+    text = describe_unresolved(
         [
             {
                 "function_key": "m.py::hog",
-                "cause": "memory",
-                "elapsed_ms": 200.0,
-                "tested": 2,
-                "universe": 23,
-                "containment_lost": [
-                    {"mutant": "M1: delete statement", "mutated_line": 10}
-                ],
+                "cause": "memory_cut",
+                "mutants": ["STMT_a", "BOUNDARY_b"],
             }
         ]
     )
     assert "--mem-limit-mb" in text
-    assert "never a kill" in text
-    assert "m.py::hog" in text
-    assert "hit the cap: mutant M1: delete statement (line 10)" in text
+    assert "neither killed nor survived" in text
+    assert "m.py::hog — STMT_a, BOUNDARY_b" in text
+    assert "every other mutant of the function was evaluated" in text
     assert "could not stop" not in text
 
 
@@ -276,8 +274,11 @@ def test_a_runaway_mutant_under_the_cap_is_a_named_memory_cut_and_the_parent_sur
     )
     assert done.returncode == 0, done.stderr[-2000:]
     mutation = json.loads(done.stdout)["mutation"]
-    cuts = {t["function_key"]: t["cause"] for t in mutation["truncated_functions"]}
-    assert cuts == {"hog.py::collect": "memory"}
+    # not a cut of the function (W#45): its other mutants were evaluated; the capped ones are named
+    assert mutation["truncated_functions"] == []
+    assert mutation["total_truncated"] == 0
+    named = {u["function_key"]: u["cause"] for u in mutation["unresolved_functions"]}
+    assert named == {"hog.py::collect": "memory_cut"}
     assert mutation["memory_standing"] == "enforced"
     assert mutation["memory_standings"] == {"cut": 1, "enforced": 1}
     assert mutation["total_functions"] == 2

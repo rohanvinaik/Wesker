@@ -25,28 +25,23 @@ from Wesker.ci import truncation_cause
 
 
 @pytest.mark.parametrize(
-    ("depth", "budget_exhausted", "memory_standing", "expected"),
+    ("depth", "budget_exhausted", "expected"),
     [
-        ("profiled", False, "n/a", "not_truncated"),
-        ("sampled", False, "n/a", "not_truncated"),
-        ("converged", False, "enforced", "not_truncated"),
-        ("cut", True, "n/a", "budget"),
-        ("sampled", True, "n/a", "budget"),
-        ("cut", False, "cut", "memory"),
-        ("cut", False, "n/a", "uncontained"),
-        ("cut", False, "enforced", "uncontained"),
-        ("cut", True, "cut", "budget"),
+        ("profiled", False, "not_truncated"),
+        ("sampled", False, "not_truncated"),
+        ("converged", False, "not_truncated"),
+        ("cut", True, "budget"),
+        ("sampled", True, "budget"),
+        ("cut", False, "uncontained"),
     ],
 )
-def test_each_cut_is_named_for_its_cause(
-    depth, budget_exhausted, memory_standing, expected
-):
-    """The engine marks a profile "cut" for three reasons: the budget ran out, a worker could not be
-    stopped, or (on the isolated path) the memory cap was hit, which also leaves the run uncontained.
-    So a cut that is neither the budget's nor the memory cap's is a worker that could not be stopped.
-    When the budget ran out, containment is not recorded separately, and the code claims no more
-    than "budget"."""
-    assert truncation_cause(depth, budget_exhausted, memory_standing) == expected
+def test_each_cut_is_named_for_its_cause(depth, budget_exhausted, expected):
+    """The engine marks a profile "cut" for two reasons: the budget ran out, or a worker could not be
+    stopped. A cut that is not the budget's is a worker that could not be stopped. When the budget ran
+    out, containment is not recorded separately, and the code claims no more than "budget". A mutant
+    the memory cap stopped is not a cut at all (W#45): it is one mutant with no verdict
+    (`test_memory_cut_is_one_mutant_intent`), so no memory standing reaches this decision."""
+    assert truncation_cause(depth, budget_exhausted) == expected
 
 
 def _cut(

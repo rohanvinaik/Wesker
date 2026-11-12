@@ -45,6 +45,7 @@ from Wesker.ci import (
     unresolved_causes,
 )
 from Wesker.engine import (
+    MEMORY_CUT,
     ORIGINAL_ALSO_FAILS,
     SCORED_DISPOSITIONS,
     mutant_disposition,
@@ -80,6 +81,7 @@ def _engine_dispositions() -> set[str]:
             "diverged",
             "undetermined",
             "timeout",
+            MEMORY_CUT,
         ),
     ):
         seen.add(

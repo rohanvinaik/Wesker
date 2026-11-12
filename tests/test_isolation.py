@@ -1165,12 +1165,14 @@ def test_the_worker_flags_a_memory_error_as_a_budget_cut_and_survives(tmp_path):
         worker.close()
 
 
-def test_a_memory_cut_maps_to_a_non_gateable_cut_disposition():
-    """The engine turns a worker memory cut into a non-gateable `cut` disposition — unscored, never a
-    kill or a survivor."""
+def test_a_memory_cut_maps_to_a_named_unscored_disposition_of_one_mutant():
+    """The engine turns a worker memory cut into the named `memory_cut` disposition (W#45) — unscored,
+    never a kill or a survivor, like `diverged`. It is CONTAINED (the cap stopped it; the worker is
+    retired), so it neither stops the function nor reads as `containment_lost`."""
     import ast
 
     from Wesker.engine import (
+        SCORED_DISPOSITIONS,
         _isolated_result,
         generate_mutants,
         mutant_disposition,
@@ -1183,14 +1185,18 @@ def test_a_memory_cut_maps_to_a_non_gateable_cut_disposition():
     res = _isolated_result(
         mutant, IsolatedRun(1, False, True, "", memory_cut=True), 0.0
     )
-    assert res.contained is False, "a memory cut must be non-gateable"
+    assert res.contained is True, "the cap contained it: no worker is left running"
     assert res.killed is False
-    assert (
-        mutant_disposition(
-            res.constructed, res.installed, res.entered, res.contained, res.killed
-        )
-        == "cut"
+    disposition = mutant_disposition(
+        res.constructed,
+        res.installed,
+        res.entered,
+        res.contained,
+        res.killed,
+        killed_by=res.killed_by,
     )
+    assert disposition == "memory_cut"
+    assert disposition not in SCORED_DISPOSITIONS
 
 
 def test_a_normal_isolated_run_reports_its_memory_capability_honestly(tmp_path):

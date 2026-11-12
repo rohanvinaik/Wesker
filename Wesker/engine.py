@@ -296,6 +296,17 @@ class MutantResult:
 # once it was built, installed, and entered; before that, an outcome measures the harness.
 SCORED_DISPOSITIONS = ("killed_after_entry", "survived_after_entry")
 
+# The mutant's `killed_by` AND its disposition when the isolated worker's address-space cap stopped it
+# (W#45): an outcome with no verdict, like `diverged`/`undetermined`, named, never a kill or a survivor.
+MEMORY_CUT = "memory_cut"
+
+# The `killed_by` values that end an observation WITHOUT a verdict: not a kill, not a survivor, and so
+# never probed for equivalence (an equivalence claim is a claim about a verdict). One tuple, read by
+# every loop that routes a result, so a new no-verdict outcome cannot be missed by one of them.
+NO_VERDICT_KILLED_BY = ("diverged", "undetermined", "timeout", MEMORY_CUT)
+# …and the dispositions those become (`timeout` is spelled `undetermined` there).
+NO_VERDICT_DISPOSITIONS = ("diverged", "undetermined", MEMORY_CUT)
+
 
 def mutant_disposition(
     constructed: bool,
@@ -333,9 +344,13 @@ def mutant_disposition(
       Reported as its own named outcome, never a value kill.
     * ``undetermined``   — a wall clock bound fired before any kill was established (issue #27).
       Liveness boundary only, never a kill.
+    * ``memory_cut``     — the isolated worker's address-space cap stopped it (W#45). Not a value
+      failure of the suite: a stop by a budget proves nothing about the value, so the mutant is
+      neither killed nor survived. Beside ``diverged`` and ``undetermined``, and for the same reason:
+      the cap stopped it, so nothing is left running (it is not a ``cut``).
     * ``not_entered``    — installed, but the test never called it. The classic decorator and
       registry capture: the namespace holds the mutant while the caller holds the original.
-    * ``cut``            — ran, but the measurement is truncated or uncontained, so its outcome
+    * ``cut``          — ran, but the measurement is truncated or uncontained, so its outcome
       is not evidence either way (the #14 boundary).
     * ``killed_after_entry`` / ``survived_after_entry`` — the only two that measure the SUITE,
       and the only two :data:`SCORED_DISPOSITIONS` admits to the denominator.
@@ -354,6 +369,8 @@ def mutant_disposition(
         return "diverged"
     if killed_by in ("undetermined", "timeout"):
         return "undetermined"
+    if killed_by == MEMORY_CUT:
+        return MEMORY_CUT
     if entered is False:
         return "not_entered"
     if not contained:
@@ -8764,11 +8781,19 @@ def _isolated_result(
     covering tests could not be collected — is `constructed=False`, scored `harness_error`.
     """
     if run.memory_cut:
-        # W#21: the mutant hit the worker's address-space cap. This is a budget CUT, not a kill —
-        # `contained=False` routes it to the `cut` disposition (unscored) and makes the run
-        # non-gateable via the same #14 path; the typed memory reason is surfaced on the result.
+        # W#21/W#45: the mutant hit the worker's address-space cap. ONE mutant with no verdict, the
+        # shape `diverged` and `undetermined` have: named (`memory_cut`), unscored, never a kill and
+        # never a survivor. The cap CONTAINED it, so it is
+        # `contained=True`: `contained=False` means "a worker is still alive", which stopped the whole
+        # function after one mutant and listed the mutant as `containment_lost`.
         return MutantResult(
-            mutant=mutant, killed=False, contained=False, elapsed_ms=elapsed_ms
+            mutant=mutant,
+            killed=False,
+            killed_by=MEMORY_CUT,
+            contained=True,
+            test_name=run.test_name,
+            installed=run.installed,
+            elapsed_ms=elapsed_ms,
         )
     _entered_map = {"entered": True, "not_entered": False, "unobserved": None}
     entered = _entered_map[entry_disposition(run.ran, run.entered_probe)]
@@ -9664,7 +9689,7 @@ def run_function_profiling(
                         )
                     )
                 unscored_records.append(_record)
-                if result.refusal or disposition in ("diverged", "undetermined"):
+                if result.refusal or disposition in NO_VERDICT_DISPOSITIONS:
                     # Still an OPEN OBLIGATION for the widen (#28): an unknown it traces may kill this
                     # mutant outright, as the full run over A∪B would — stopping the widen because the
                     # only open mutants are refused would make seed+expand disagree with that run.
@@ -10647,7 +10672,6 @@ def _probe_equivalence(
 def converged_coverage_depth(
     budget_exhausted: bool,
     contained: bool,
-    memory_cut: bool,
     evaluated: int,
     universe: int,
     passes: int,
@@ -10655,7 +10679,8 @@ def converged_coverage_depth(
     """How much of the mutant universe a converged run measured (W#27, pure — pinned).
 
     * ``cut``       — the RUN stopped short: the budget overran, a worker could not be contained
-      (#13/#14) or a mutant hit the worker's memory cap (W#21). An invalid measurement, never a
+      (#13/#14). A mutant the worker's memory cap stopped (W#45) is NOT a cut of the run: it is one
+      mutant with no verdict, evaluated and named like `diverged`. An invalid measurement, never a
       sample, so the codebase rollup and the CI gate drop it rather than count it.
     * ``profiled``  — every universe mutant was EVALUATED.
     * ``converged`` — a sample deepened over several passes.
@@ -10667,7 +10692,7 @@ def converged_coverage_depth(
     per-mutant outcomes #27 added were folded into "cut" — a universe Detective then reported as
     "cut before it was measured" beside "every operator-universe mutant tested" (Detective #80).
     """
-    if budget_exhausted or not contained or memory_cut:
+    if budget_exhausted or not contained:
         return "cut"
     if evaluated >= universe > 0:
         return "profiled"
@@ -10929,11 +10954,7 @@ def run_function_converged(
                     _unentered_scope[mutant.mutant_id] = scoped
 
                 # Integrated equivalence: check survivors immediately
-                if not result.killed and result.killed_by not in (
-                    "diverged",
-                    "undetermined",
-                    "timeout",
-                ):
+                if not result.killed and result.killed_by not in NO_VERDICT_KILLED_BY:
                     # TCE first (#24): a pure function of two code objects — no execution, no test
                     # run — and SOUND, since identical bytecode cannot behave differently. It is
                     # both cheaper than the boundary probes and strictly stronger, so it decides
@@ -11159,7 +11180,7 @@ def run_function_converged(
                         r for r in survivor_records if r["mutant_id"] != _mid
                     ]
                     continue
-                if _res.killed_by in ("diverged", "undetermined", "timeout"):
+                if _res.killed_by in NO_VERDICT_KILLED_BY:
                     seen[_mid] = _res
                     survivor_records[:] = [
                         r for r in survivor_records if r["mutant_id"] != _mid
@@ -11308,7 +11329,6 @@ def run_function_converged(
     depth = converged_coverage_depth(
         budget_exhausted,
         all_contained,
-        _mem_cut,
         total + sum(cr.unscored for cr in per_cat),
         universe,
         passes,

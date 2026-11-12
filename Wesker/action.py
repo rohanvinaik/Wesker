@@ -169,7 +169,7 @@ def gate_suite_health(report: dict, max_inert_pct: int = 50) -> str | None:
 
 def gate_truncation(report: dict) -> str | None:
     """Refuse to call a CUT measurement a completeness measurement — cut by the budget, by a worker
-    that could not be stopped, or by the memory cap (Wesker #13/#14/W#21).
+    that could not be stopped (Wesker #13/#14). A mutant the memory cap stopped is not a cut (W#45).
 
     The refusal names each cut function under the remedy its cause needs. A count alone told the
     maintainer that something was cut and not what: the remedies differ, and for a worker that

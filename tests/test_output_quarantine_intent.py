@@ -162,7 +162,11 @@ def _go(tmp_path, *argv):
         timeout=280,
         check=False,
         env={
-            **os.environ,
+            # PYTHONUNBUFFERED is dropped on purpose. A CI log is a pipe, which Python block-buffers,
+            # and a machine that exports the variable cannot see an ordering defect between
+            # ``sys.stdout`` and the owner's private progress descriptor: this file passed on such a
+            # machine and failed on all six CI cells (the banner landed inside the first progress line).
+            **{k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED"},
             "HOME": str(tmp_path),
             "PYTHONPATH": os.pathsep.join(sys.path),
         },
@@ -175,6 +179,10 @@ def test_the_action_log_holds_none_of_the_measured_tests_output(tmp_path):
     assert done.returncode == 0, done.stderr[-1500:]
     assert "LEAK" not in done.stdout + done.stderr
     assert "[1/1] mod.py 4/4" in done.stdout, "the owner's own progress line is whole"
+    banner = done.stdout.index("Wesker — Whole codebase")
+    assert banner < done.stdout.index("[1/1] mod.py"), (
+        "the banner precedes the progress it announces"
+    )
 
 
 def test_the_plain_cli_keeps_its_own_lines_and_none_of_the_tests(tmp_path):

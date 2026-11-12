@@ -485,7 +485,17 @@ def _open_progress() -> IO[str]:
     The measuring process's per-file progress is written here, never through ``sys.stdout`` or fd 1:
     a nested Action, or a mutant of the stream code, can close or redirect those, and the run then
     dies on its next ``[3/24]`` line. The duplicate is not a name the code under measurement uses.
+
+    It is a SECOND writer on the descriptor ``sys.stdout`` already writes to, so whatever ``sys.stdout``
+    still holds in its buffer is flushed first. When stdout is a pipe, as in every CI log, Python
+    block-buffers it: the banner printed before profiling stayed in that buffer while the first progress
+    prefix went straight out through the duplicate, and the log read
+    ``[1/1] mod.pyWesker — Whole codebase — 1 file(s).`` with the result on the next line.
     """
+    for stream in (sys.stdout, sys.stderr):
+        # a closed or replaced stream has nothing of ours to order
+        with contextlib.suppress(Exception):
+            stream.flush()
     return os.fdopen(os.dup(1), "w", buffering=1, encoding="utf-8", errors="replace")
 
 

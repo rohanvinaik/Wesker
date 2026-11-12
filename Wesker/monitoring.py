@@ -840,6 +840,14 @@ def subscribe(
                 applied.append(c)
                 _recompute_mask(tool, c)
         except BaseException:
+            # (#32) Registry first, masks after, and a failing mask must not stop the rest: the
+            # fault that brought us here (a code object the interpreter refuses to instrument) can
+            # recur in the rollback itself, and a rollback that raises half way leaves this
+            # subscription registered in a dict nothing will ever clean.
+            _active_subscriptions.pop(sub_id, None)
+            selectors_changed = (
+                _subscriptions_with_selectors.pop(sub_id, None) is not None
+            )
             for c in applied:
                 subs = _subscriptions_by_code.get(c, [])
                 if sub in subs:
@@ -851,11 +859,19 @@ def subscribe(
                     sub_set.discard(sub_id)
                     if not sub_set:
                         _discovered_for_code.pop(c, None)
-                _recompute_mask(tool, c)
-            _active_subscriptions.pop(sub_id, None)
-            if _subscriptions_with_selectors.pop(sub_id, None) is not None:
-                _selectors_changed()
-            _recompute_global_events(tool)
+            for c in applied:
+                # BLE001: the original failure is the one the caller must see
+                try:
+                    _recompute_mask(tool, c)
+                except Exception:  # noqa: BLE001, S110
+                    pass
+            try:
+                if selectors_changed:
+                    _selectors_changed()
+                _recompute_global_events(tool)
+            # BLE001: as above
+            except Exception:  # noqa: BLE001, S110
+                pass
             raise
 
         def _do_close() -> None:

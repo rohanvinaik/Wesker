@@ -21,9 +21,11 @@ only arithmetic and is identical on every OS.
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import os
 import sys
+from collections.abc import Iterator
 
 try:
     import resource  # Unix only — absent on Windows.
@@ -341,6 +343,74 @@ def apply_address_limit(peak_bytes: int | None = None) -> bool:
         return True
     except (ValueError, OSError, AttributeError):
         return False
+
+
+def speculative_address_cap(
+    vm_bytes: int, extra_bytes: int, soft: int, hard: int, unlimited: int = -1
+) -> int:
+    """The soft ``RLIMIT_AS`` for a window in which the engine runs a mutant on inputs it invented
+    (#45/#39, pure — pinned); ``unlimited`` when no cap should be set.
+
+    The window may grow the process by ``extra_bytes`` beyond the ``vm_bytes`` it already maps, and
+    never past a limit it already has: the new soft limit is the smaller of that, the existing soft
+    limit and the hard limit (an infinite limit is ``unlimited``, ``-1`` where ``RLIM_INFINITY`` is).
+    Only the SOFT limit is ever lowered, so the caller can put it back: lowering the hard limit is
+    irreversible for a non-root process, and is exactly the failure W#29 measured when a function the
+    engine ran lowered it on the measuring process itself.
+
+    ``vm_bytes <= 0`` (unknown: no ``/proc``) or ``extra_bytes <= 0`` (no budget asked) set nothing.
+    """
+    if vm_bytes <= 0 or extra_bytes <= 0:
+        return unlimited
+    cap = vm_bytes + extra_bytes
+    for limit in (soft, hard):
+        if limit != unlimited and limit < cap:
+            cap = limit
+    return cap
+
+
+def _mapped_bytes() -> int:
+    """This process's current virtual size, from ``/proc/self/statm``; 0 where that is not readable."""
+    try:
+        with open("/proc/self/statm", encoding="ascii") as fh:
+            return int(fh.read().split()[0]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+@contextlib.contextmanager
+def bounded_address_space(extra_bytes: int | None) -> Iterator[bool]:
+    """Bound how far the MEASURING process may grow for the length of the block; yields whether it is.
+
+    The isolated run caps its worker, and the engine also runs a mutant in THIS process on inputs it
+    invented (the equivalence probe). Without a bound there a mutant that allocates without limit
+    took the parent to 6.1 GB, stopped only by an outer ``ulimit`` (measured 2026-11-12). Inside the
+    block an allocation past ``extra_bytes`` raises ``MemoryError``, which the caller reads as a
+    refusal of that mutant. ``None`` (no cap asked), no ``resource`` module, or an OS that will not
+    take the limit (macOS often does not) yields False and changes nothing: the standing is the same
+    as the worker's, and the caller says so.
+
+    The soft limit is restored on every way out, so no window outlives its block. Enter it BEFORE
+    ``contain_speculation``, which refuses a ``setrlimit`` made inside its own window.
+    """
+    if extra_bytes is None or resource is None:
+        yield False
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        cap = speculative_address_cap(
+            _mapped_bytes(), extra_bytes, soft, hard, resource.RLIM_INFINITY
+        )
+        if cap == resource.RLIM_INFINITY:
+            raise ValueError("no cap to set")
+        resource.setrlimit(resource.RLIMIT_AS, (cap, hard))
+    except (ValueError, OSError, AttributeError):
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        resource.setrlimit(resource.RLIMIT_AS, (soft, hard))
 
 
 def telemetry(budget_bytes: int | None = None) -> str:

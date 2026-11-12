@@ -59,7 +59,7 @@ from .line_coverage import coverage_from_trace as _coverage_from_trace
 from .line_coverage import executable_lines as _executable_lines
 from .line_coverage import trace_line_coverage as _trace_line_coverage
 from .line_coverage import trace_suite as _trace_suite
-from .memory_guard import memory_enforcement_standing
+from .memory_guard import bounded_address_space, memory_enforcement_standing
 from .memory_guard import over_budget as _over_budget
 from .memory_guard import reclaim as _reclaim
 from .memory_guard import resolve_budget as _resolve_budget
@@ -10246,6 +10246,12 @@ def _speculative_call(
         pass
     except (SpeculativeEffectRefused, WriteOutsideAuthority):
         return None, None, True
+    except MemoryError:
+        # The window's address-space bound (or the machine's) stopped an allocation: the input is
+        # REFUSED for this function, never an exception to compare. Two functions that both ran out
+        # of memory did not "raise the same type", and one that ran out where the other did not is
+        # not a difference a test could pin.
+        return None, None, True
     # BLE001: the compared functions raise whatever they raise; the exception is the observation
     except Exception as e:  # noqa: BLE001
         exc = e
@@ -10319,7 +10325,7 @@ def _check_equivalent_wrapper(
                 except StepBudgetExceeded:
                     outcomes.append("raised")
                     continue
-                except (SpeculativeEffectRefused, WriteOutsideAuthority):
+                except (SpeculativeEffectRefused, WriteOutsideAuthority, MemoryError):
                     return False
                 # BLE001: the original raised on this input; no codomain evidence
                 except Exception:  # noqa: BLE001
@@ -10337,7 +10343,41 @@ def _check_equivalent_wrapper(
         return False
 
 
+def equivalence_probe_standing(isolated: bool, memory_cut: bool) -> str:
+    """Whether the engine may run a survivor-or-cut mutant itself to look for equivalence (#45, pure — pinned).
+
+      "probe"               run the boundary inputs (the mutant is bounded by the caller's window)
+      "refused_memory_cut"  the isolated worker already stopped THIS mutant at its address-space cap:
+                            running it again in the measuring process, which has no such cap, is the
+                            unbounded execution the cap exists to prevent. The mutant keeps the
+                            worker's `cut` disposition; it is not equivalent and not a survivor.
+
+    ``memory_cut`` only means something for an isolated run (an in-process mutant has no worker to
+    have been cut by), so it cannot refuse a probe of one.
+    """
+    if isolated and memory_cut:
+        return "refused_memory_cut"
+    return "probe"
+
+
 def check_equivalent(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    mutant: Mutant,
+    mem_limit_mb: int | None = None,
+) -> bool:
+    """:func:`_probe_equivalence` with the measuring process bounded to ``mem_limit_mb`` of growth.
+
+    ``mem_limit_mb`` is the isolated run's worker cap (#45): the probe runs the original and the
+    mutant HERE, on inputs this engine invented, and a mutant that allocates without bound would
+    otherwise be uncapped in the one process whose loss ends the run. An allocation past the bound is
+    a refusal (``False``: never equivalent), exactly as a refused write is. ``None`` leaves the
+    process as it was, which is the in-process mode's standing: memory is unbounded there and says so.
+    """
+    with bounded_address_space(mem_limit_mb * 1024 * 1024 if mem_limit_mb else None):
+        return _probe_equivalence(func_node, mutant)
+
+
+def _probe_equivalence(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     mutant: Mutant,
 ) -> bool:
@@ -10642,6 +10682,7 @@ def run_function_converged(
     _orig_tce_key = compute_node_key(func_node)
 
     _iso_worker: IsolatedMutantWorker | None = None
+    _iso_run: IsolatedRun | None = None
     _iso_ctx = None
     _mem_cut = False
     _mem_enforced = False
@@ -10746,7 +10787,17 @@ def run_function_converged(
                         )
                         else ""
                     )
-                    if _warrant or check_equivalent(func_node, mutant):
+                    _probe = equivalence_probe_standing(
+                        isolated, bool(_iso_run is not None and _iso_run.memory_cut)
+                    )
+                    if _warrant or (
+                        _probe == "probe"
+                        and check_equivalent(
+                            func_node,
+                            mutant,
+                            worker_mem_limit_mb if isolated else None,
+                        )
+                    ):
                         # Preserve every execution fact, including future fields (#18/#28).
                         # Reconstructing a partial record here previously erased phase metadata.
                         result = replace(

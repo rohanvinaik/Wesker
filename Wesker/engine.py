@@ -359,6 +359,29 @@ def mutant_disposition(
     return "killed_after_entry" if killed else "survived_after_entry"
 
 
+def survivor_reach(tests_run: int) -> str:
+    """Whether any test RAN against a surviving mutant (W#29/item 4, pure — pinned).
+
+    A survivor is read as "the suite did not detect this", and that is only a claim about the suite when a
+    test was run against the mutant. The in-process evaluation runs the tests whose baseline trace reached
+    the mutated line; a function that no in-process test executes (no test at all, or tests that reach it
+    only through a subprocess, like `_isolated_worker.py`'s) is evaluated against NONE, and its mutants
+    were scored `survived_after_entry` with nothing in the record to tell them from the ones a suite
+    really failed to detect. Not `not_entered`: that needs a positive observation that a test ran and
+    never called the mutant (see `THE entered=None RULE`), and an untested function must never read as
+    fully specified. So the survivor stays a survivor and says what it is.
+
+      "no_test_ran"   ``tests_run == 0``: nothing was run against this mutant; its survival is not a
+                      finding about any test
+      "tests_ran"     at least one test started against it: the survival is a finding about the suite
+      "not_recorded"  ``tests_run < 0``: the construction site ran no test loop (the isolated path), so
+                      nothing is claimed either way
+    """
+    if tests_run == 0:
+        return "no_test_ran"
+    return "tests_ran" if tests_run > 0 else "not_recorded"
+
+
 def baseline_reach(
     ran: list[str], line_coverage: dict[str, list[int]], truncated: list[str]
 ) -> str:
@@ -10876,6 +10899,8 @@ def run_function_converged(
                         killed_by=result.killed_by,
                     ),
                 }
+                if not result.killed:
+                    record["reach"] = survivor_reach(result.tests_run)
                 if result.killed:
                     record["killed_by"] = result.killed_by
                     record["test"] = result.test_name

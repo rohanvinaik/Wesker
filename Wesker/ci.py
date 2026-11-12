@@ -2313,6 +2313,50 @@ def describe_truncation(truncated: list[dict], limit: int = 20) -> str:
     return "\n".join(blocks)
 
 
+def unreached_entries(result: dict) -> list[dict]:
+    """The survivors of one function that NO test ran against, as a rollup entry (pure).
+
+    ``[{"function_key", "count", "of"}]`` when at least one survivor record carries
+    ``reach == "no_test_ran"`` (`engine.survivor_reach`), else ``[]``. Absence of the field (a record
+    from the isolated path or an older engine) is not "tests ran" and is not counted as "no test ran":
+    the entry exists only on a positive reading.
+    """
+    records = result.get("survivor_records") or []
+    n = sum(1 for r in records if r.get("reach") == "no_test_ran")
+    if not n:
+        return []
+    return [
+        {
+            "function_key": result.get("function_key", ""),
+            "count": n,
+            "of": int(result.get("total_mutants", 0)),
+        }
+    ]
+
+
+def describe_unreached(entries: list[dict], limit: int = 10) -> str:
+    """The note for survivors that no test ran against, or "" when there are none (pure)."""
+    if not entries:
+        return ""
+    total = sum(int(e.get("count", 0)) for e in entries)
+    lines = [
+        (
+            f"  .. NOTE: {total} surviving mutant(s) in {len(entries)} function(s) had NO test run "
+            "against them: no usable test executes that code in this process (none exists, the "
+            "tests that do fail on the unmutated code and are barred, or they reach it only through "
+            "a subprocess, as the isolated worker's do). They are counted unpinned; whether the "
+            "suite pins them is not measured here."
+        )
+    ]
+    for e in entries[:limit]:
+        lines.append(
+            f"     {e.get('function_key') or '?'} — {e.get('count', 0)}/{e.get('of', 0)} mutants"
+        )
+    if len(entries) > limit:
+        lines.append(f"     … and {len(entries) - limit} more")
+    return "\n".join(lines)
+
+
 def completeness_warnings(mutation: dict) -> str:
     """The warnings a codebase rollup's ratio must carry beside it, or "" when it needs none (W#51, pure).
 
@@ -2342,6 +2386,9 @@ def completeness_warnings(mutation: dict) -> str:
         ]
         detail = describe_unresolved(mutation.get("unresolved_functions") or [])
         lines += ["     " + ln for ln in detail.splitlines()]
+    note = describe_unreached(mutation.get("unreached_functions") or [])
+    if note:
+        lines.append(note)
     return "\n".join(lines)
 
 
@@ -2522,6 +2569,7 @@ def profile_codebase(
     truncated_functions: list[dict] = []
     unresolved_functions: list[dict] = []
     harness_functions: list[dict] = []
+    unreached_functions: list[dict] = []
     memory_standings: list[str] = []
     total_universe = 0
     total_dof = 0
@@ -2587,6 +2635,7 @@ def profile_codebase(
             # function, a cut one included: the cut below names the function's unevaluated mutants,
             # these were evaluated and are outside the ratio for another reason.
             harness_functions.extend(_harness_entries(r))
+            unreached_functions.extend(unreached_entries(r))
             memory_standings.append(str(r.get("memory_standing", "n/a")))
             cause = truncation_cause(
                 r.get("coverage_depth", ""),
@@ -2740,6 +2789,9 @@ def profile_codebase(
         "harness_mutants": _harness_totals(harness_functions),
         "total_harness": len({e["function_key"] for e in harness_functions}),
         "harness_functions": harness_functions,
+        # Survivors no test ran against (item 4): unpinned because nothing in this process executes
+        # the code, which is not the same finding as a suite that ran and missed.
+        "unreached_functions": unreached_functions,
         # What bounded memory on this run (W#45), from each function's own `memory_standing`.
         "isolated": isolated,
         "memory_limit_mb": worker_mem_limit_mb or 0,

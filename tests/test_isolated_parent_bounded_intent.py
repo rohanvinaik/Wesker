@@ -241,3 +241,11 @@ def test_the_hog_fixture_under_isolated_keeps_the_parent_small_and_exits_clean(
     assert cut_ids, "the runaway mutants are named"
     survivors = {s["mutant_id"]: s for s in mutation["survivors"]}
     assert not cut_ids & set(survivors), "a cut mutant is neither a survivor nor a kill"
+    # The equivalent mutant is a SURVIVOR the probe established (`out.append(bytearray(..))` -> an int,
+    # which `collect` cannot tell apart: it returns `len(out)`), found by what it changes. The old
+    # assertion `total_equivalent == 0` held only while the run stopped before reaching it.
+    equivalent = [s for s in survivors.values() if s.get("equivalent")]
+    assert [s["change"].split(" → ")[1] for s in equivalent] == [
+        "out.append(8 * 1024 * 1024)"
+    ]
+    assert mutation["total_equivalent"] == 1

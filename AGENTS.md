@@ -108,3 +108,13 @@ curl -s -u "$SONAR_TOKEN:" "$SONAR_HOST_URL/api/qualitygates/project_status?proj
 
 Publishing, version bumps and publish order are the user's domain. Wesker and Detective release as a coordinated pair,
 and never automatically.
+
+## Knowability II (planned change; planning home is Detective)
+
+`docs/KNOWABILITY_II_WESKER.md` is the engine-side summary of
+`Detective/docs/theory/knowability_ii/KNOWABILITY_II.md` and its staged plan
+`Detective/openspec/changes/implement-knowability-ii/tasks.md` (stages 0.2, W1–W5 are Wesker's). Run
+`python docs/local_guards_check.py` first: it must print `OK`, and it says exactly what W1 repairs in
+`_BoundaryMutator` (the `!=` guard for `<`/`>` is missing; a suite can kill every BOUNDARY mutant of `a < b`
+without ever exercising `a > b`). Invariants: `SCORED_DISPOSITIONS` unchanged; the site trace defaults off
+and never changes a verdict; no new dependency; the policy id moves at W1 only.

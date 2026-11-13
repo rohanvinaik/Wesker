@@ -1148,6 +1148,33 @@ def _not_entered_detail(
     return detail
 
 
+def _named_unscored_record(
+    result: MutantResult,
+    disposition: str,
+    scoped: list[Callable[..., None]],
+    line_coverage: dict[str, list[int]],
+    truncated: set[str],
+    held: tuple[list[dict[str, str]], str] | None,
+    scan_holders: Callable[[], tuple[list[dict[str, str]], str]],
+) -> tuple[dict, tuple[list[dict[str, str]], str] | None]:
+    """The unscored record of one mutant, with its not-entered cause where it has one (#18).
+
+    ONE builder for every site that records an unscored mutant, because the widen re-recorded a mutant
+    through the bare `_unscored_record` and dropped the cause the first pass had named: a
+    decorator-captured target read "cause unclassified" on the page and routed to nothing. Returns the
+    record and the holder scan (``held``, or the scan this call ran — it is computed once per profile and
+    only when some mutant was not entered).
+    """
+    record = _unscored_record(result, disposition)
+    if disposition == "not_entered":
+        if held is None:
+            held = scan_holders()
+        record.update(
+            _not_entered_detail(result, scoped, line_coverage, truncated, *held)
+        )
+    return record, held
+
+
 # ── §6.4 Dispatch Table: Category → AST Transform ────────────────
 
 
@@ -5194,9 +5221,7 @@ def _build_test_scope(
     elif session is not None:
         # Suite-global baseline, already paid for once. Only the per-function
         # intersection is left, and it is a set operation over data in hand.
-        target_file = getattr(
-            getattr(original_func, "__code__", None), "co_filename", None
-        )
+        target_file = _definition_file(original_func)
         line_cov = _coverage_from_trace(
             session.traced, target_file or "", set(exec_lines)
         )
@@ -7319,13 +7344,29 @@ def _serialized(fn):
     return _wrapped
 
 
+def _definition_file(original_func: Any) -> str | None:
+    """The file the target's code was DEFINED in (#18): the plain function's, found through any wrapper.
+
+    A decorator's wrapper (`functools.lru_cache`, `functools.wraps`) is what a module attribute holds,
+    and it has no ``__code__`` of its own or carries the decorator's file. Reading the file off it left
+    the line ledger intersecting the trace with the empty string (every body line "uncovered", measured
+    on an `lru_cache` target) and the module-qualified patch without a source path. ``None`` when no
+    code is reachable: absent, never an invented path.
+    """
+    plain = _unwrapped_original(original_func)
+    code = getattr(plain if plain is not None else original_func, "__code__", None)
+    return getattr(code, "co_filename", None)
+
+
 def _prepare_base_globals(original_func: Callable[..., Any] | None) -> dict[str, Any]:
     """Copy current globals and their authoritative package metadata (#42/#46).
 
     Same-size rebindings invalidate a snapshot. Copy for each evaluation rather than
     guessing a package or treating dictionary length as an execution-context identity.
     """
-    return dict(getattr(original_func, "__globals__", None) or {})
+    plain = _unwrapped_original(original_func)
+    source = plain if plain is not None else original_func
+    return dict(getattr(source, "__globals__", None) or {})
 
 
 _KILL_REASONS = ("assertion", "exception", "crash")
@@ -7546,9 +7587,7 @@ def evaluate_mutant(
     # this the whole module-qualified patch was inert, so a method exercised via a factory whose class
     # is not imported into the test namespace (e.g. make_role_frame(...).relationP()) was a false survivor.
     if source_path is None:
-        source_path = getattr(
-            getattr(original_func, "__code__", None), "co_filename", None
-        )
+        source_path = _definition_file(original_func)
 
     # Compile the mutated function — or, for a μ⁻ Form-B wrapper mutant, BUILD it by wrapping the
     # original at runtime (its mutated_node is a synthetic marker that is never compiled).
@@ -10047,21 +10086,21 @@ def run_function_profiling(
             if disposition not in SCORED_DISPOSITIONS:
                 cr.unscored += 1
                 cr.unscored_by[disposition] = cr.unscored_by.get(disposition, 0) + 1
-                _record = _unscored_record(result, disposition)
-                if disposition == "not_entered":
-                    # WHY, by name (#18): from the tests that ran and what holds the original.
-                    if _holders is None:
-                        _holders = _original_holders(
-                            original_func,
-                            getattr(func_node, "name", None),
-                            qualname,
-                            source_path,
-                        )
-                    _record.update(
-                        _not_entered_detail(
-                            result, _scoped, line_cov, _trace_truncated, *_holders
-                        )
-                    )
+                # WHY, by name (#18): from the tests that ran and what holds the original.
+                _record, _holders = _named_unscored_record(
+                    result,
+                    disposition,
+                    _scoped,
+                    line_cov,
+                    _trace_truncated,
+                    _holders,
+                    lambda: _original_holders(
+                        original_func,
+                        getattr(func_node, "name", None),
+                        qualname,
+                        source_path,
+                    ),
+                )
                 unscored_records.append(_record)
                 if result.refusal or disposition in NO_VERDICT_DISPOSITIONS:
                     # Still an OPEN OBLIGATION for the widen (#28): an unknown it traces may kill this
@@ -10310,7 +10349,21 @@ def run_function_profiling(
                     unscored_records[:] = [
                         r for r in unscored_records if r["mutant_id"] != _mid
                     ]
-                    unscored_records.append(_unscored_record(_res, _disp))
+                    _record, _holders = _named_unscored_record(
+                        _res,
+                        _disp,
+                        _tests_for(_mutant),
+                        line_cov,
+                        _trace_truncated,
+                        _holders,
+                        lambda: _original_holders(
+                            original_func,
+                            getattr(func_node, "name", None),
+                            qualname,
+                            source_path,
+                        ),
+                    )
+                    unscored_records.append(_record)
                     _refused_open[_mid] = _disp
                 continue
             # Prune the now-killed mutant so the incremental obligation check and the next micro-batch
@@ -11673,25 +11726,21 @@ def run_function_converged(
             ]
             cr.unscored += 1
             cr.unscored_by[disposition] = cr.unscored_by.get(disposition, 0) + 1
-            _record = _unscored_record(result, disposition)
-            if disposition == "not_entered":
-                # WHY, by name (#18) — one helper with the profiling path.
-                if _holders is None:
-                    _holders = _original_holders(
-                        original_func,
-                        getattr(func_node, "name", None),
-                        qualname,
-                        source_path,
-                    )
-                _record.update(
-                    _not_entered_detail(
-                        result,
-                        _unentered_scope.get(result.mutant.mutant_id, []),
-                        line_cov,
-                        _trace_truncated,
-                        *_holders,
-                    )
-                )
+            # WHY, by name (#18) — one helper with the profiling path.
+            _record, _holders = _named_unscored_record(
+                result,
+                disposition,
+                _unentered_scope.get(result.mutant.mutant_id, []),
+                line_cov,
+                _trace_truncated,
+                _holders,
+                lambda: _original_holders(
+                    original_func,
+                    getattr(func_node, "name", None),
+                    qualname,
+                    source_path,
+                ),
+            )
             unscored_records.append(_record)
         elif result.killed:
             cr.total += 1

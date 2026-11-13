@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import inspect
 import io
 import os
 import sys
 import threading
 import time
 from collections.abc import Callable
-from types import CodeType
+from types import CodeType, FunctionType
 from typing import Any
 
 from Wesker.interrupt import Abandoned, JoinedWorker, MeasurementRefused, bounded_join
@@ -103,6 +104,91 @@ def executable_lines(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[i
     if traceable is not None:
         lines &= traceable
     return lines
+
+
+def memo_reset_standing(
+    has_cache_clear: bool, has_cache_info: bool, defined_in_target: bool
+) -> str:
+    """Whether a memoizing wrapper must be emptied before a traced test (#18, pure — pinned).
+
+    A traced run measures which lines a test EXECUTES. A memoized function (`functools.lru_cache`,
+    `functools.cache`, or any wrapper with the same ``cache_clear``/``cache_info`` pair) executes its body
+    only on a miss, so whether a test "reached" a line depended on what ran before it in the process: a
+    later traced pass over a warm cache saw the body run in NO test, and a function every test calls read
+    as wholly uncovered (and its hand-written tests as redundant).
+
+      "reset"        a cache over code defined in a traced file: emptied, so the body runs when called
+      "foreign"      a cache over code defined elsewhere: its body is not a traced line, left alone
+      "not_a_cache"  lacks either member of the pair: not recognised as a memo, never touched
+    """
+    if not (has_cache_clear and has_cache_info):
+        return "not_a_cache"
+    return "reset" if defined_in_target else "foreign"
+
+
+def _memo_candidates(namespace: dict[str, Any]) -> list[Any]:
+    """The values of one namespace a memo could live at, class members included (one level).
+
+    Read through the dictionaries, never through ``getattr``: a module may answer any attribute name,
+    and a descriptor must not run."""
+    found: list[Any] = []
+    for value in list(namespace.values()):
+        found.append(value)
+        if isinstance(value, type):
+            try:
+                members = list(vars(value).values())
+            # BLE001: a class whose namespace cannot be read holds no memo this scan can name
+            except Exception:  # noqa: BLE001
+                members = []
+            found.extend(members)
+    return [
+        m.__func__ if isinstance(m, (staticmethod, classmethod)) else m for m in found
+    ]
+
+
+def _memo_standing_of(obj: Any, match: Callable[[str], str | None]) -> str:
+    """`memo_reset_standing` for one object: its facts read statically, its code found by the
+    ``__wrapped__`` chain in the instance dictionaries."""
+    has_clear = inspect.getattr_static(obj, "cache_clear", None) is not None
+    has_info = inspect.getattr_static(obj, "cache_info", None) is not None
+    if not (has_clear and has_info):
+        return memo_reset_standing(has_clear, has_info, False)
+    inner = obj
+    for _ in range(16):
+        try:
+            held = object.__getattribute__(inner, "__dict__").get("__wrapped__")
+        # BLE001: an object whose dictionary cannot be read has no chain this scan can follow
+        except Exception:  # noqa: BLE001
+            held = None
+        if held is None:
+            break
+        inner = held
+    filename = inner.__code__.co_filename if isinstance(inner, FunctionType) else ""
+    return memo_reset_standing(
+        has_clear, has_info, bool(filename) and match(filename) is not None
+    )
+
+
+def _reset_target_memos(target_files: set[str]) -> None:
+    """Empty every memoizing wrapper over code in ``target_files`` before a traced test (#18).
+
+    Only caches over the traced files, only by their own ``cache_clear``; nothing else of the process
+    is touched, and a cache is semantically transparent, so a test sees the same values from a cold one.
+    """
+    match = _target_matcher(target_files)
+    for module in list(sys.modules.values()):
+        try:
+            namespace = vars(module)
+            filename = namespace.get("__file__")
+        # BLE001: a module that cannot be introspected holds nothing this scan can name
+        except Exception:  # noqa: BLE001
+            namespace, filename = {}, None
+        if not isinstance(filename, str) or match(filename) is None:
+            continue
+        for obj in _memo_candidates(namespace):
+            if _memo_standing_of(obj, match) == "reset":
+                with contextlib.suppress(Exception):
+                    obj.cache_clear()
 
 
 def _target_matcher(target_files: set[str]) -> Callable[[str], str | None]:
@@ -496,6 +582,7 @@ def _trace_one_multi(
                     )
                 )
 
+    _reset_target_memos(target_files)
     thread = JoinedWorker(target=_worker, daemon=True)
     try:
         thread.start()

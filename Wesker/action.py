@@ -507,6 +507,7 @@ def _profile_live(
     targets: list[str],
     budget: float,
     config: dict,
+    diagnostic: dict | None = None,
 ) -> tuple[dict | None, str]:
     """Run the live profile between the stream re-entry and the stack dump; ``(report, refusal)``.
 
@@ -521,6 +522,8 @@ def _profile_live(
     # Action inside the measurement nested (W#52); a nested one does neither.
     progress = None if nested else _open_progress()
     kwargs = {} if progress is None else {"progress": progress}
+    if diagnostic is not None:
+        kwargs["diagnostic"] = diagnostic
     if not nested:
         os.environ[_STREAM_OWNER_ENV] = str(os.getpid())
     try:
@@ -575,6 +578,56 @@ def worker_lost_reason(lost: BaseException) -> str:
         "run never ran. Something raised into its bootstrap, or this process can no longer create a "
         "thread (a resource limit the measured code lowered is one measured cause). Nothing measured "
         "after it can be trusted. If it recurs, report it with this log."
+    )
+
+
+def no_live_session_reason(reason: str, detail: str) -> str:
+    """The refusal text when no live pytest session produced a report, by cause (W#29, pure — pinned).
+
+    Every cause used to read as one sentence, "execution mode is 'legacy-direct-call'": a shard that
+    measured a file for 45 minutes and then lost its report to a pytest crash said the same thing as a
+    project whose suite could not be collected. The cause is `run_in_session`'s ``reason``:
+
+      "pytest_crashed"      pytest raised before or while the measurement ran; ``detail`` says what
+      "collection_errors"   a test file could not be collected; ``detail`` names them
+      "empty_collection"    pytest collected no test at all
+      "pytest_missing"      pytest is not importable
+      anything else         no cause was recorded: the old sentence, and it says so
+    """
+    said = detail.strip()
+    if reason == "pytest_crashed":
+        return (
+            "the live pytest session ended in a crash, so its report was not returned.\n"
+            + said
+        )
+    if reason == "collection_errors":
+        return (
+            "pytest could not collect the suite, so no live session ran the measurement.\n"
+            + (said or "Run `pytest --collect-only` to see the errors.")
+        )
+    if reason == "empty_collection":
+        return (
+            "pytest collected no test, so no live session ran the measurement.\n"
+            "Check testpaths and that the project's tests are importable."
+        )
+    if reason == "pytest_missing":
+        return "pytest is not installed, so no live session ran the measurement."
+    return (
+        gate_execution_mode({"execution_mode": "legacy-direct-call"}) or ""
+    ) + "\n(no cause was recorded for the missing session.)"
+
+
+def _session_detail(diagnostic: dict) -> str:
+    """The detail a missing session came with: its own text, else the test files that failed to collect."""
+    detail = str(diagnostic.get("detail", ""))
+    if detail:
+        return detail
+    errors = diagnostic.get("errors") or ()
+    return "; ".join(
+        f"{nodeid}: {str(error).strip().splitlines()[-1] if str(error).strip() else ''}".rstrip(
+            ": "
+        )
+        for nodeid, error in errors
     )
 
 
@@ -911,6 +964,7 @@ def main(argv: list[str] | None = None) -> int:
         _write_shard_record(shard_index, shard_count, targets, code, reason, report)
         return _fail(reason)
 
+    diagnostic: dict[str, object] = {}
     # Wesker profiling Wesker runs from a private copy of the package, so the modules being
     # mutated are not the ones executing the run. Any other project resolves to the public
     # engine here, exactly as before.
@@ -920,6 +974,7 @@ def main(argv: list[str] | None = None) -> int:
             targets,
             args.budget,
             config,
+            diagnostic=diagnostic,
         )
     # BLE001: ANY failure that escapes the measurement ends it with a record that names it (W#29).
     # A shard that dies on a traceback writes nothing, and the aggregation can then only say
@@ -938,9 +993,18 @@ def main(argv: list[str] | None = None) -> int:
     if report is None:
         return refuse(
             "no_live_session",
-            gate_execution_mode({"execution_mode": "legacy-direct-call"}) or "",
+            no_live_session_reason(
+                str(diagnostic.get("reason", "")), _session_detail(diagnostic)
+            ),
         )
     report["execution_mode"] = "pytest-live"
+    if diagnostic.get("reason") == "pytest_crashed_after_result":
+        # The measurement finished and its report is whole; pytest failed after it (W#29). Said, not hidden.
+        print(
+            "::warning::pytest raised after the measurement had finished; the report was kept.\n"
+            + str(diagnostic.get("detail", "")),
+            file=sys.stderr,
+        )
 
     for code, gate in (
         ("execution_mode", gate_execution_mode(report)),

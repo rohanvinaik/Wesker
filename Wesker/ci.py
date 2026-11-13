@@ -1805,9 +1805,13 @@ def profile_codebase_live(
     project_root: str,
     targets: list[str],
     paths: list[str] | None = None,
+    diagnostic: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> dict | None:
     """:func:`profile_codebase`, executed inside a LIVE pytest session.
+
+    ``diagnostic`` (W#29) receives the reason when no report comes back (``run_in_session``'s
+    ``reason`` and ``detail``), so a caller refusing on ``None`` can name the cause.
 
     This is Wesker-as-a-mutation-tester: the whole profile runs within
     ``pytest_runtestloop``, so every mutant is judged by pytest itself — real
@@ -1849,6 +1853,7 @@ def profile_codebase_live(
         _profile_and_describe_suite,
         target_files=targets,
         paths=paths,
+        diagnostic=diagnostic,
     )
 
 

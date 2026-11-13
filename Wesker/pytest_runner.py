@@ -41,6 +41,7 @@ import contextlib
 import io
 import os
 import sys
+import traceback
 from collections.abc import Callable
 from typing import Any
 
@@ -636,6 +637,44 @@ class _CollectionErrorCapture:
             self.errors.append((report.nodeid or "(root)", longrepr[:800]))
 
 
+def crash_standing(body_started: bool, body_finished: bool) -> str:
+    """What a crash of ``pytest.main`` means for the measurement it hosted (W#29, pure — pinned).
+
+    A crash is not one fact, and the old answer (discard everything, report "no live session") was right
+    for only the first two. The session exists to host the body; once the body has RETURNED, its result
+    is whole, and a pytest failure after it (the terminal summary, a session-finish hook, a closed
+    stdout that a mutant of the capture machinery left behind) says nothing about it. Measured: an
+    exception from a ``pytest_sessionfinish`` hook threw away a finished report and the Action refused
+    with "execution mode is 'legacy-direct-call'", after a shard had measured for 45 minutes.
+
+      "no_session"    the body never started: no measurement exists
+      "session_lost"  the body started and did not finish: its result does not exist
+      "result_kept"   the body finished: the result is returned, and the crash is only reported
+    """
+    if body_finished:
+        return "result_kept"
+    return "session_lost" if body_started else "no_session"
+
+
+def describe_crash(
+    error_type: str, message: str, standing: str, trace_tail: str
+) -> str:
+    """The sentence a pytest crash earns in ``diagnostic["detail"]`` (W#29, pure — pinned).
+
+    The words follow :func:`crash_standing`, because the remedies differ:
+
+      no_session    "pytest raised <T> before the measurement started"
+      session_lost  "pytest raised <T> while the measurement was running"
+      result_kept   "pytest raised <T> after the measurement had finished; its result was kept"
+    """
+    when = {
+        "result_kept": "after the measurement had finished; its result was kept",
+        "session_lost": "while the measurement was running",
+    }.get(standing, "before the measurement started")
+    said = message.strip() or "(no message)"
+    return f"pytest raised {error_type} {when}: {said}\n{trace_tail.rstrip()}"
+
+
 def run_in_session(
     project_root: str,
     body: Callable[[list[Callable[[], None]], Any], Any],
@@ -849,10 +888,23 @@ def run_in_session(
             rc = int(pytest.main(args, plugins=[_Driver(), capture, collect_errors]))
     # BLE001: pytest.main runs the target's suite and plugins; a crash is recorded in
     # `diagnostic` and returned as no result
-    except Exception:  # noqa: BLE001
+    except Exception as crashed:  # noqa: BLE001
+        standing = crash_standing("ran" in box, "result" in box)
         if diagnostic is not None:
-            diagnostic["reason"] = "pytest_crashed"
-        return None
+            diagnostic["reason"] = (
+                "pytest_crashed_after_result"
+                if standing == "result_kept"
+                else "pytest_crashed"
+            )
+            # Which exception, from where, and whether the body had finished (W#29).
+            diagnostic["detail"] = describe_crash(
+                type(crashed).__name__,
+                str(crashed),
+                standing,
+                "".join(traceback.format_exception(crashed)[-6:]),
+            )
+        if standing != "result_kept":
+            return None
     finally:
         # Restore the live-manifest and scope this session bound, innermost first, so a nested
         # or sequential session sees the enclosing context exactly as it was (#26).

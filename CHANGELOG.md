@@ -10,6 +10,17 @@ changed three times, so the policy id moved three times.
 
 ### Correctness
 
+- **A pytest failure after the measurement finished no longer throws the finished report away, and a
+  missing live session names its cause.** Shard 2/4 of the same run measured `ci.py` for 45 minutes,
+  printed every file's result, and refused with `execution mode is 'legacy-direct-call', not
+  'pytest-live'`. `run_in_session` returned None for any exception `pytest.main` raised, including one
+  raised after the measurement had returned (a `pytest_sessionfinish` hook that raises reproduces it:
+  `reason: pytest_crashed` with the report already computed), and the Action read None as "no live
+  session", the one sentence a project with an uncollectable suite also gets. `crash_standing` now decides
+  (`no_session`, `session_lost`, `result_kept`): a crash after the body keeps the result and the Action
+  prints a `::warning::` with the exception; the others stay a refusal. `no_live_session_reason` names the
+  cause of a missing session (the crash, the collection errors, an empty collection, a missing pytest);
+  `profile_codebase_live` takes a `diagnostic` dict to carry it. (W#29)
 - **A mutant that allocates without bound in the badge run is one mutant with no verdict, not a dead
   runner.** Shard 4/4 of the same run was killed by the kernel (exit 137) evaluating a mutant in process:
   only the isolated worker had an address-space cap, so the badge run, which is not `--isolated`, had none.

@@ -7702,14 +7702,15 @@ def evaluate_mutant(
                         _unwrap_descriptor(mutated_obj),
                         patched,
                         test_wall_ms,
-                        memory_capped=capped,
                         **step_args,
                     )
                 if (
                     capped
                     and result != "uncontained"
+                    # A test that fails with the MemoryError reads "crash"; the watch, which sees the
+                    # error raised wherever it is caught, is the evidence that it was the cap's.
                     and memory_cut_run_standing(
-                        result == "memory_error", memory_watch.hit
+                        result == "crash" and memory_watch.hit, memory_watch.hit
                     )
                     != "no_cap"
                 ):
@@ -8487,13 +8488,8 @@ def _run_test_with_timeout(
     step_codes: tuple[types.CodeType, ...] = (),
     step_cap: int | None = None,
     step_sink: list[int] | None = None,
-    memory_capped: bool = False,
 ) -> str | None:
     """Run a single test function with a hard thread-based timeout.
-
-    ``memory_capped`` says an address-space cap is in force for this run (W#29): a ``MemoryError`` the
-    test fails with is then reported as ``memory_error``, never as the kill reason ``crash`` that an
-    uncapped run gives it. The caller reads it, with the cap's own watch, as the unscored ``memory_cut``.
 
     Returns a kill reason ("assertion", "exception", "crash"), an unresolved
     execution code ("undetermined", "diverged"), or None if the test passed.
@@ -8548,12 +8544,8 @@ def _run_test_with_timeout(
             result_box[0] = "assertion"
         # BLE001: any non-assertion exception from the test is a crash kill; the breadth
         # is the classification
-        except Exception as exc:  # noqa: BLE001
-            result_box[0] = (
-                "memory_error"
-                if memory_capped and isinstance(exc, MemoryError)
-                else "crash"
-            )
+        except Exception:  # noqa: BLE001
+            result_box[0] = "crash"
         except (KeyboardInterrupt, SystemExit):
             raise
         # BLE001: interrupts re-raise above; what remains is read below, because a

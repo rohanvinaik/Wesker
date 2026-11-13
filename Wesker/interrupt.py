@@ -366,7 +366,6 @@ def child_wait_disposition(found: int, gone: bool) -> str:
 # names are therefore bound here, at import, and never looked up on the module again: the first whole-
 # codebase run with this path ended on `isinstance() arg 2 must be a type` from a patched `Popen`.
 _REAL_POPEN = subprocess.Popen
-_REAL_RUN = subprocess.run
 _REAL_SUBPROCESS_ERROR = subprocess.SubprocessError
 
 
@@ -429,14 +428,16 @@ def _children_map() -> dict[int, list[int]]:
         if len(tail) > 1 and tail[1].isdigit():
             parents[int(name)] = int(tail[1])
     if not parents:
+        # The real Popen class directly: `subprocess.run` looks `Popen` up on the module at call time,
+        # which is the name a measured test may have replaced (macOS has no /proc, so this is its path).
         try:
-            listing = _REAL_RUN(
+            with _REAL_POPEN(
                 ["ps", "-A", "-o", "pid=,ppid="],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 text=True,
-                timeout=5,
-                check=False,
-            ).stdout
+            ) as ps:
+                listing, _ = ps.communicate(timeout=5)
         except (OSError, _REAL_SUBPROCESS_ERROR):
             listing = ""
         for line in listing.splitlines():
@@ -459,15 +460,18 @@ def release_child_waits(thread: Any, grace_s: float = CHILD_WAIT_GRACE_S) -> boo
     worker's own children and everything beneath them (``process_tree_members``), never the measuring
     process.
     """
+    # BLE001 (both): the search reads state the measured tests can change (a patched `open`, a frame
+    # that raises). It must not end the measurement. A failed frame scan found no child; a failed
+    # process-table read still leaves the children the frames named, which are the ones the wait is on.
     try:
         roots = _popen_pids(thread)
-        members = process_tree_members(
-            roots, _children_map() if roots else {}, [os.getpid()]
-        )
-    # BLE001: finding the children reads state the measured tests can change (a patched `open`, a
-    # frame that raises); a search that fails found no child, and must not end the measurement
     except Exception:  # noqa: BLE001
-        roots, members = [], []
+        roots = []
+    try:
+        table = _children_map() if roots else {}
+    except Exception:  # noqa: BLE001
+        table = {}
+    members = process_tree_members(roots, table, [os.getpid()])
     sig = signal.SIGTERM if sys.platform == "win32" else signal.SIGKILL
     for pid in members:
         with contextlib.suppress(OSError):

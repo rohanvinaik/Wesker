@@ -93,7 +93,6 @@ def test_a_parked_worker_is_released_while_popen_and_run_are_replaced(monkeypatc
 
 def test_the_real_class_is_the_one_bound_at_import():
     assert interrupt._REAL_POPEN is subprocess.Popen
-    assert interrupt._REAL_RUN is subprocess.run
 
 
 class _Raises:
@@ -178,13 +177,41 @@ def test_a_search_that_fails_reports_not_released_and_does_not_raise(monkeypatch
         assert parked.thread.is_alive(), "nothing was stopped, and the answer says so"
 
 
-def test_a_process_table_that_cannot_be_read_reports_not_released(monkeypatch):
+def test_a_process_table_that_cannot_be_read_still_stops_the_children_the_frames_name(
+    monkeypatch,
+):
+    # The table only adds the children's own descendants. The wait is on the child the worker's frames
+    # hold, so losing the table must not lose the stop.
     def _boom() -> dict[int, list[int]]:
         raise OSError("the process table is not readable")
 
     monkeypatch.setattr(interrupt, "_children_map", _boom)
     with _Parked() as parked:
-        assert release_child_waits(parked.thread, grace_s=0.2) is False
+        assert parked.proc is not None
+        assert release_child_waits(parked.thread, grace_s=10) is True
+        assert parked.proc.poll() is not None
+
+
+def test_a_machine_without_proc_reads_the_table_past_a_replaced_popen(monkeypatch):
+    # macOS has no /proc, so the table comes from `ps`. `subprocess.run` resolves `Popen` on the module
+    # when it is called, so a test that replaced it broke the read there (CI, macOS cells, 2026-11-12).
+    real_listdir = interrupt.os.listdir
+
+    def _no_proc(path: str = "."):
+        if path == "/proc":
+            raise FileNotFoundError(path)
+        return real_listdir(path)
+
+    monkeypatch.setattr(interrupt.os, "listdir", _no_proc)
+    with _Parked() as parked:
+        assert parked.proc is not None
+        monkeypatch.setattr(subprocess, "Popen", mock.MagicMock())
+        monkeypatch.setattr(subprocess, "run", _not_a_type)
+        table = interrupt._children_map()
+        assert parked.proc.pid in table.get(interrupt.os.getpid(), []), (
+            "ps was read, not the stand-in"
+        )
+        assert release_child_waits(parked.thread, grace_s=10) is True
 
 
 def test_a_thread_with_no_frames_names_no_child():

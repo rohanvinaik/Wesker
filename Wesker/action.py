@@ -37,6 +37,7 @@ import re
 import subprocess
 import sys
 import threading
+import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -577,6 +578,34 @@ def worker_lost_reason(lost: BaseException) -> str:
     )
 
 
+def escaped_exception_reason(error_type: str, message: str, where: str) -> str:
+    """The refusal an exception that escaped the measurement earns (W#29, pure — pinned).
+
+    Before this the shard died on the traceback and wrote no record, so the aggregation could say only
+    `report_missing`, which names no cause. The reason carries the exception's class, its message and
+    the innermost frame (``file:line in function``) so the merge states what ended the shard. A blank
+    message and a blank frame are each said to be unavailable, never left as an empty sentence.
+    """
+    said = message.strip() or "(no message)"
+    at = where.strip() or "(frame unavailable)"
+    return (
+        f"the measurement ended on {error_type}: {said} (at {at}).\n"
+        "Nothing measured in this run can be trusted or summed. The full traceback is in this job's "
+        "log above."
+    )
+
+
+def _innermost_frame(exc: BaseException) -> str:
+    """``file:line in function`` of the deepest frame ``exc`` unwound through, or "" when it has none."""
+    tb = exc.__traceback__
+    where = ""
+    while tb is not None:
+        code = tb.tb_frame.f_code
+        where = f"{code.co_filename}:{tb.tb_lineno} in {code.co_name}"
+        tb = tb.tb_next
+    return where
+
+
 def _fail(reason: str) -> int:
     print("\n::error::Wesker could not produce a trustworthy number", file=sys.stderr)
     print(f"\nWESKER REFUSED TO REPORT: {reason}\n", file=sys.stderr)
@@ -874,18 +903,35 @@ def main(argv: list[str] | None = None) -> int:
         scope_note = f"Changed in this pull request — {len(targets)} file(s)."
 
     print(f"Wesker — {scope_note}")
-    # Wesker profiling Wesker runs from a private copy of the package, so the modules being
-    # mutated are not the ones executing the run. Any other project resolves to the public
-    # engine here, exactly as before.
-    report, lost = _profile_live(
-        profiler_for_targets(targets), targets, args.budget, config
-    )
+    report: dict | None = None
 
     def refuse(code: str, reason: str) -> int:
         # #29: a refusal is recorded under its name, with the files it concerns, so a merge can
         # re-state it instead of finding a shard that "did not report".
         _write_shard_record(shard_index, shard_count, targets, code, reason, report)
         return _fail(reason)
+
+    # Wesker profiling Wesker runs from a private copy of the package, so the modules being
+    # mutated are not the ones executing the run. Any other project resolves to the public
+    # engine here, exactly as before.
+    try:
+        report, lost = _profile_live(
+            profiler_for_targets(targets),
+            targets,
+            args.budget,
+            config,
+        )
+    # BLE001: ANY failure that escapes the measurement ends it with a record that names it (W#29).
+    # A shard that dies on a traceback writes nothing, and the aggregation can then only say
+    # `report_missing`, which names no cause. Ctrl-C is not a measurement failure and passes through.
+    except (Exception, SystemExit) as escaped:  # noqa: BLE001
+        traceback.print_exc()
+        return refuse(
+            "measurement_failed",
+            escaped_exception_reason(
+                type(escaped).__name__, str(escaped), _innermost_frame(escaped)
+            ),
+        )
 
     if lost:
         return refuse("worker_lost", lost)

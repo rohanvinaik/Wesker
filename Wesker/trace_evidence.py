@@ -131,12 +131,15 @@ def baseline_outcome(run_code: str | None, item_status: str) -> str:
 
 
 def reach_qualification(
-    outlived_thread: bool, preexisting_thread_ran: bool, spawned_process: bool = False
+    outlived_thread: bool,
+    preexisting_thread_ran: bool,
+    spawned_process: bool = False,
+    observation_failed: bool = False,
 ) -> str:
     """The reach-completeness code of ONE traced test (#17, pure — pinned).
 
     Split out of the tracer's worker, which holds thread objects and audit events the literal-input
-    allowlist cannot express; the tracer keeps that handling and this holds the decision. Three
+    allowlist cannot express; the tracer keeps that handling and this holds the decision. Four
     independent facts make absences unknown, and they have different remedies, so they never share
     a name. The answer is ``complete`` when none holds, else the names of the facts that hold,
     joined by ``+`` in this fixed order:
@@ -148,6 +151,11 @@ def reach_qualification(
     * ``incomplete_subprocess`` — the test (or a thread it started) created a process (the audit
       events ``subprocess.Popen`` / ``os.fork`` / ``os.exec*`` / ``os.posix_spawn`` / ...). Code the
       child ran is outside this interpreter and was never observed.
+    * ``incomplete_observation`` — the observer itself failed while tracing this test (W#29): a
+      delivery was still in flight when the trace was read, a callback raised, or discovery
+      failed. What the tracer did record stays recorded, but it may have missed events, so a line
+      absent from ``lines`` is unknown. The failure belongs to this test's trace, never to the
+      measurement of the codebase.
     * ``complete`` — none: absence in ``lines`` is a measured negative.
     """
     causes = [
@@ -156,6 +164,7 @@ def reach_qualification(
             ("incomplete_thread", outlived_thread),
             ("incomplete_preexisting_thread", preexisting_thread_ran),
             ("incomplete_subprocess", spawned_process),
+            ("incomplete_observation", observation_failed),
         )
         if held
     ]
@@ -264,7 +273,7 @@ class TraceEvidence:
     #: ``incomplete_thread`` when a thread it started outlived its traced window, so code that thread
     #: ran afterwards was never observed, or ``incomplete_preexisting_thread`` when a thread alive
     #: before the test ran target code during it (unattributable, so not in ``lines``), or
-    #: ``incomplete_subprocess`` when the test created a process; causes join with ``+``. It qualifies ABSENCE only: the lines that were observed
+    #: ``incomplete_subprocess`` when the test created a process, or ``incomplete_observation`` when the observer failed while tracing it; causes join with ``+``. It qualifies ABSENCE only: the lines that were observed
     #: stay exactly as admissible as ``reason`` says, while a line missing from ``lines`` is
     #: "not observed", never "not reached".
     reach: str = "complete"

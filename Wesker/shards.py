@@ -36,6 +36,7 @@ SCHEMA = 1
 # returns one of these when a shard ended in it; the structural codes below are disjoint from them.
 SHARD_REFUSALS = (
     "worker_lost",
+    "measurement_failed",
     "no_live_session",
     "execution_mode",
     "suite_health",

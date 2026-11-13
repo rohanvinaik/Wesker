@@ -10,6 +10,19 @@ changed twice, so the policy id moved twice.
 
 ### Correctness
 
+- **A trace whose observation failed makes that test's reach unknown, not the run's end, and a shard
+  that fails for any reason writes a record that names it.** Shard 1/4 of the first sharded `Specification
+  (full)` run (GitHub run 43315433429 on `8fcadfe`) died six minutes in on `MonitoringObservationFailed:
+  observation_inflight (subscription=4765)` out of the baseline trace, wrote no `shard_report.json`, and
+  the aggregation could say only `report_missing`. The cause is not a broker defect: a test that leaks a
+  thread which keeps running the traced file leaves deliveries in flight when the next trace is read, and
+  the tracer raised unless its own worker was uncontained (a 3-line fixture reproduces it on the first
+  pass). A failed observation is now that test's `reach: incomplete_observation` (new; it joins the other
+  causes with `+`, last): its lines stay as observed, what is missing is unknown, its trace is not
+  cached, and `observation_failure_standing` names where the failure lives (`observed`, `tolerated`,
+  `reach_unknown`, `refuse` for a caller that collects no reach). Separately, ANY exception that escapes
+  the measurement now writes the shard record with the new refusal `measurement_failed` (class, message,
+  innermost frame), so the merge states the cause. (W#29)
 - **A mutant over the memory cap is one mutant with no verdict, not a cut function, and its outcome no
   longer depends on what ran before it.** Under `--isolated --mem-limit-mb` a mutant the cap stopped was
   recorded `contained=False`, which the evaluation loops read as "a worker is still alive": the function

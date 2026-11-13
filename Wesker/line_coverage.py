@@ -268,6 +268,35 @@ def failing_on_baseline(
     return failing
 
 
+def observation_failure_standing(code: str, contained: bool, can_qualify: bool) -> str:
+    """What a failed observation of ONE test's trace means for the measurement (W#29, pure — pinned).
+
+    ``code`` is the failure the subscription recorded (``MonitoringObservationFailed.code``). It was
+    raised out of the tracer and ended the whole run (measured: `observation_inflight`, subscription
+    4765, out of Wesker's own baseline trace in CI), when the evidence it spoils is one test's. The
+    answer is where that fact lives:
+
+      "observed"          ``code`` is empty: nothing failed
+      "tolerated"         a delivery was still in flight on a worker that could NOT be stopped: that
+                          non-quiescence is already explicit in the uncontained result, so it is not
+                          named twice
+      "reach_unknown"     any other failure, and the caller collects reach: this test's lines stay as
+                          recorded and what is missing from them is UNKNOWN (``incomplete_observation``),
+                          never a negative
+      "refuse"            any other failure, and the caller collects no reach to say so in: the failure
+                          is raised, as before. A caller that cannot qualify the absence must not
+                          receive a trace that looks complete
+
+    A contained worker with a delivery still in flight is NOT tolerated: nothing explains it, so it is
+    an unobserved reach rather than silence.
+    """
+    if not code:
+        return "observed"
+    if code == "observation_inflight" and not contained:
+        return "tolerated"
+    return "reach_unknown" if can_qualify else "refuse"
+
+
 def _trace_one_multi(
     test_fn: Callable[..., None],
     target_files: set[str],
@@ -385,6 +414,9 @@ def _trace_one_multi(
             frame_last.pop(id(frame), None)
 
     spawned: list[int] = []
+    # What the worker saw when it ended: (a thread outlived the run, a pre-existing thread ran
+    # target code, a process was created). Joined with the observer's own state below, once.
+    facts: list[tuple[bool, bool, bool]] = []
     _install_spawn_hook()
     _spawn_watchers[token] = (_owns_thread, spawned)
     handles = []
@@ -452,16 +484,17 @@ def _trace_one_multi(
             pass
         finally:
             if reach is not None:
-                code = reach_qualification(
-                    any(
-                        t not in alive_before and t is not threading.current_thread()
-                        for t in threading.enumerate()
-                    ),
-                    bool(preexisting_hit),
-                    bool(spawned),
+                facts.append(
+                    (
+                        any(
+                            t not in alive_before
+                            and t is not threading.current_thread()
+                            for t in threading.enumerate()
+                        ),
+                        bool(preexisting_hit),
+                        bool(spawned),
+                    )
                 )
-                if code != "complete":
-                    reach.append(code)
 
     thread = JoinedWorker(target=_worker, daemon=True)
     try:
@@ -475,14 +508,24 @@ def _trace_one_multi(
         for h in handles:
             h.close()
 
+    observation_failed = False
     for h in handles:
         try:
             h.check()
         except MonitoringObservationFailed as exc:
-            # Non-quiescence is already explicit in this inadmissible result.
-            # Preserve other observation failures rather than returning partial proof.
-            if contained or exc.code != "observation_inflight":
+            standing = observation_failure_standing(
+                exc.code, contained, reach is not None
+            )
+            if standing == "refuse":
                 raise
+            observation_failed = observation_failed or standing == "reach_unknown"
+    if reach is not None:
+        outlived, preexisting, spawned_process = facts[0] if facts else (False,) * 3
+        code = reach_qualification(
+            outlived, preexisting, spawned_process, observation_failed
+        )
+        if code != "complete":
+            reach.append(code)
 
     return (
         {f: set(lines) for f, lines in dict(hits).items()},

@@ -9203,6 +9203,73 @@ def worker_succession(alive: bool, memory_cut: bool) -> str:
     return "replace_memory_cut" if memory_cut else "keep"
 
 
+def _wrapper_cause_of(
+    original_func: Any,
+    func_name: str | None,
+    qualname: str | None,
+    source_path: str | None,
+    box: list[Any],
+    scoped: list[Callable[..., None]],
+    line_cov: dict[str, list[int]],
+    truncated: set[str],
+) -> Callable[[MutantResult], str]:
+    """The `cause_of` an isolated evaluation consults before a second look (#18).
+
+    The holder scan runs once per function (``box`` caches it) and only when a mutant was not entered;
+    ``scoped``, ``line_cov`` and ``truncated`` are the values of the evaluation being decided; the
+    callback is consulted inside that same evaluation, before any of them can be rebuilt.
+    """
+
+    def cause(result: MutantResult) -> str:
+        if box[0] is None:
+            box[0] = _original_holders(original_func, func_name, qualname, source_path)
+        return _not_entered_detail(result, scoped, line_cov, truncated, *box[0])[
+            "cause"
+        ]
+
+    return cause
+
+
+def robust_retry_standing(disposition: str, cause: str, robust_run: bool) -> str:
+    """Whether a mutant's plain install earns a second look through the import hook (#18, pure — pinned).
+
+    The plain install rebinds names AFTER the target and its tests imported. A decorator, `lru_cache` or
+    registry that captured the original at import keeps calling it, so the mutant is installed and never
+    entered. That is exactly the case an import-time install repairs, and ONLY that case: every other
+    `not_entered` cause (nothing reached the function, a pre-bound alias, a module-level constant) has
+    a repair the hook does not perform, and re-running it would only repeat the verdict.
+
+      "reevaluate_with_hook"  ``not_entered`` or ``not_installed`` with cause ``decorator_wrapper``, not
+                              already hooked. The isolated worker reads a wrapper whose code lives in
+                              another module as ``not_installed`` (no site could be rebound), the
+                              in-process path as ``not_entered``; the holder scan names the same
+                              wrapper for both, and the hook repairs both.
+      "keep"                  anything else: the plain verdict stands.
+    """
+    if robust_run:
+        return "keep"
+    if disposition in ("not_entered", "not_installed") and cause == "decorator_wrapper":
+        return "reevaluate_with_hook"
+    return "keep"
+
+
+def robust_adoption_standing(
+    constructed: bool, entered: bool | None, timed_out: bool, memory_cut: bool
+) -> str:
+    """Whether the hooked evaluation replaces the plain verdict (#18, pure — pinned).
+
+    "adopt"       the hook built and installed the mutant and a test POSITIVELY entered it: the
+                  entry acknowledgement is what makes the outcome a kill or a survivor.
+    "keep_first"  anything else (the target was already imported, the definition could not be
+                  replaced, no test entered it, a wall or the memory cap stopped it): the plain
+                  `not_entered` stands. A harness failure of the second look never becomes a
+                  `harness_error` for a mutant the first look had installed.
+    """
+    if timed_out or memory_cut or not constructed:
+        return "keep_first"
+    return "adopt" if entered is True else "keep_first"
+
+
 def _evaluate_isolated(
     worker: IsolatedMutantWorker | None,
     mutant: Mutant,
@@ -9212,8 +9279,14 @@ def _evaluate_isolated(
     step_plan: StepPlan | None = None,
     original_func: Any = None,
     full_matrix: bool = False,
+    cause_of: Callable[[MutantResult], str] | None = None,
 ) -> tuple[MutantResult, IsolatedMutantWorker | None, IsolatedRun | None]:
     """Evaluate one mutant in a killable isolated worker, recycling the worker when spent (#19).
+
+    ``cause_of`` names why an unentered result was not entered (the caller's `not_entered_cause`). A
+    mutant whose plain install was `not_entered` or `not_installed` with cause `decorator_wrapper` gets ONE second look in
+    a fresh worker whose import hook installs the mutant before the target imports (#18); the second
+    verdict replaces the first only when a test entered the mutant (`robust_adoption_standing`).
 
     Returns the verdict AND the (possibly fresh) worker, which the caller threads forward — a hang
     or a reached recycle cap retires the current worker and a new one takes the next mutant. A mutant
@@ -9325,7 +9398,48 @@ def _evaluate_isolated(
         # Retired HERE, so the next mutant opens a fresh one (the caller threads `None` forward).
         worker.close()
         worker = None
-    return _isolated_result(mutant, run, _elapsed(t0), full_matrix), worker, run
+    first = _isolated_result(mutant, run, _elapsed(t0), full_matrix)
+    if cause_of is not None:
+        disposition = mutant_disposition(
+            first.constructed,
+            first.installed,
+            first.entered,
+            True,
+            first.killed,
+            first.refusal,
+            killed_by=first.killed_by,
+        )
+        cause = (
+            cause_of(first) if disposition in ("not_entered", "not_installed") else ""
+        )
+        if robust_retry_standing(disposition, cause, False) == "reevaluate_with_hook":
+            hooked = IsolatedMutantWorker(
+                root, [], target, qualname, mem_limit_bytes=mem_limit
+            )
+            try:
+                second_run = hooked.evaluate(
+                    source,
+                    timeout_s,
+                    node_ids=node_ids,
+                    step_caps=step_caps or None,
+                    full_matrix=full_matrix,
+                    robust=True,
+                )
+            finally:
+                hooked.close()
+            second_run = _named_run(second_run, identities, selector_key)
+            second = _isolated_result(mutant, second_run, _elapsed(t0), full_matrix)
+            if (
+                robust_adoption_standing(
+                    second.constructed,
+                    second.entered,
+                    second_run.timed_out,
+                    second_run.memory_cut,
+                )
+                == "adopt"
+            ):
+                return second, worker, second_run
+    return first, worker, run
 
 
 def next_routing_action(
@@ -9780,6 +9894,7 @@ def run_function_profiling(
     # worker's cwd matches the measured collection rather than a re-derived guess.
     _iso_worker: IsolatedMutantWorker | None = None
     _iso_ctx: tuple[str, str, str, int, int | None] | None = None
+    _cause_box: list[Any] = [None]  # the holder scan, once per function (#18)
     _mem_cut = False
     _mem_enforced = False
     if isolated:
@@ -9841,6 +9956,16 @@ def run_function_profiling(
                     step_plan,
                     original_func,
                     full_matrix,
+                    cause_of=_wrapper_cause_of(
+                        original_func,
+                        getattr(func_node, "name", None),
+                        qualname,
+                        source_path,
+                        _cause_box,
+                        _scoped,
+                        line_cov,
+                        _trace_truncated,
+                    ),
                 )
                 if _iso_run is not None:
                     _mem_cut = _mem_cut or _iso_run.memory_cut
@@ -11115,6 +11240,7 @@ def run_function_converged(
     _orig_tce_key = compute_node_key(func_node)
 
     _iso_worker: IsolatedMutantWorker | None = None
+    _cause_box: list[Any] = [None]  # the holder scan, once per function (#18)
     _iso_run: IsolatedRun | None = None
     _iso_ctx = None
     _mem_cut = False
@@ -11181,6 +11307,16 @@ def run_function_converged(
                         _cap_ms,
                         step_plan,
                         original_func,
+                        cause_of=_wrapper_cause_of(
+                            original_func,
+                            getattr(func_node, "name", None),
+                            qualname,
+                            source_path,
+                            _cause_box,
+                            scoped,
+                            line_cov,
+                            _trace_truncated,
+                        ),
                     )
                     if _iso_run is not None:
                         _mem_cut = _mem_cut or _iso_run.memory_cut
@@ -11399,6 +11535,16 @@ def run_function_converged(
                         _cap_ms,
                         step_plan,
                         original_func,
+                        cause_of=_wrapper_cause_of(
+                            original_func,
+                            getattr(func_node, "name", None),
+                            qualname,
+                            source_path,
+                            _cause_box,
+                            _scoped,
+                            line_cov,
+                            _trace_truncated,
+                        ),
                     )
                     if _iso_run is not None:
                         _mem_cut = _mem_cut or _iso_run.memory_cut

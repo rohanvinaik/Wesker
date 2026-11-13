@@ -27,10 +27,12 @@ from __future__ import annotations
 import ast
 import contextlib
 import importlib
+import importlib.abc
 import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 from typing import Any, Self
 
@@ -192,6 +194,133 @@ def _build_mutant(target_file: str, func_name: str, mutant_source: str) -> Any |
         return None
     obj = namespace.get(func_name)
     return _entry_probe(obj) if obj is not None else None
+
+
+def robust_hook_standing(target_loaded: bool) -> str:
+    """Whether an import hook can still install the mutant before the target imports (#18, pure — pinned).
+
+    The robust mode exists for a decorator, registry or `lru_cache` that CAPTURED the original function
+    object when the target module was imported: replacing a name afterwards cannot reach the capture.
+    Only an import that has not happened yet can be given the mutant to capture.
+
+      "install"   the target module is not in ``sys.modules``: the hook sees its import.
+      "too_late"  it already is: whatever captured the original did so before this hook existed, so the
+                  mutant cannot be given to it. The caller keeps the plain-install verdict
+                  (``not_entered``); it never scores a mutant the hook could not install.
+    """
+    return "too_late" if target_loaded else "install"
+
+
+class _MutantLoader(importlib.abc.Loader):
+    """Execute the target module's source with the target function's definition replaced (#18)."""
+
+    def __init__(self, inner: Any, hook: _MutantImportHook) -> None:
+        self._inner = inner
+        self._hook = hook
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def create_module(self, spec: Any) -> Any:
+        return self._inner.create_module(spec)
+
+    def exec_module(self, module: Any) -> None:
+        origin = vars(module)["__file__"]
+        source = self._inner.get_source(module.__name__)
+        if source is None:
+            self._hook.failure = "no source for the target module"
+            raise ImportError(self._hook.failure)
+        try:
+            tree = self._hook.replace_definition(ast.parse(source, origin))
+        # a definition the hook cannot replace is a harness fact, recorded and surfaced as an
+        # ImportError the caller reads as "robust mode unavailable"
+        except Exception as exc:
+            self._hook.failure = f"{type(exc).__name__}: {exc}"
+            raise ImportError(self._hook.failure) from exc
+        vars(module)["__wesker_entry__"] = self._hook.entry
+        exec(compile(tree, origin, "exec"), vars(module))  # noqa: S102
+        self._hook.installed = True
+
+
+class _MutantImportHook(importlib.abc.MetaPathFinder):
+    """A ``sys.meta_path`` finder that gives the target module the mutant at IMPORT time (#18).
+
+    When the target file is imported, its module AST is rebuilt with the target function's definition
+    replaced by the mutant's, so a decorator (`functools.wraps`, `lru_cache`, a registry) that captures
+    the function at import captures the MUTANT. The mutant's definition gets one extra, innermost
+    decorator, ``__wesker_entry__``, that wraps it in the engine's own entry probe: the outer decorators
+    capture the probe, and ``probe.entered`` is the acknowledgement that a test called the mutant. No
+    source line moves (the definition keeps its place), and nothing is rebound afterwards.
+    """
+
+    def __init__(self, target: str, qualname: str, mutant_source: str) -> None:
+        self.target = target
+        self.qualname = qualname
+        self.mutant_source = mutant_source
+        self.probe: Any | None = None
+        self.installed = False
+        self.failure = ""
+
+    def entry(self, fn: Any) -> Any:
+        from Wesker.engine import _entry_probe
+
+        self.probe = _entry_probe(fn)
+        return self.probe
+
+    def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
+        for finder in sys.meta_path:
+            if finder is self or not hasattr(finder, "find_spec"):
+                continue
+            spec = finder.find_spec(fullname, path, target)
+            if spec is None:
+                continue
+            origin = spec.origin
+            if (
+                isinstance(origin, str)
+                and spec.loader is not None
+                and hasattr(spec.loader, "get_source")
+                and os.path.realpath(origin) == self.target
+            ):
+                spec.loader = _MutantLoader(spec.loader, self)
+            return spec
+        return None
+
+    def replace_definition(self, tree: ast.Module) -> ast.Module:
+        """``tree`` with the target function's definition replaced by the mutant's (raises if absent)."""
+        name = self.qualname.split(".")[-1]
+        mutant = next(
+            (
+                node
+                for node in ast.parse(self.mutant_source).body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == name
+            ),
+            None,
+        )
+        if mutant is None:
+            raise LookupError(f"the mutant source defines no {name!r}")
+        scope: ast.AST = tree
+        for part in self.qualname.split(".")[:-1]:
+            scope = next(
+                node
+                for node in getattr(scope, "body", [])
+                if isinstance(node, ast.ClassDef) and node.name == part
+            )
+        body = getattr(scope, "body", [])
+        index = next(
+            i
+            for i, node in enumerate(body)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        )
+        original = body[index]
+        first = min([original.lineno, *(d.lineno for d in original.decorator_list)])
+        mutant_first = min([mutant.lineno, *(d.lineno for d in mutant.decorator_list)])
+        ast.increment_lineno(mutant, first - mutant_first)
+        # The last decorator is applied FIRST: this one sits next to the function, under the rest.
+        mutant.decorator_list.append(ast.Name(id="__wesker_entry__", ctx=ast.Load()))
+        body[index] = ast.fix_missing_locations(mutant)
+        return tree
 
 
 #: The pristine test arguments of this worker process (#55). Module-level on purpose: every
@@ -358,7 +487,11 @@ class _MutantPlugin(_FreshArgumentsPlugin):
         project_root: str = "",
         write_roots: tuple[str, ...] = (),
         full_matrix: bool = False,
+        hook: _MutantImportHook | None = None,
     ) -> None:
+        #: The import hook that already gave the target module the mutant (#18), or None: with one, the
+        #: mutant is in the module before any test imports it, and nothing is rebound per test.
+        self._hook = hook
         #: Detective #145: run every node and keep each one's reason, instead of stopping the session
         #: at the first value kill. The verdict is unchanged either way (`decided_kill_reason`).
         self._full_matrix = full_matrix
@@ -438,12 +571,20 @@ class _MutantPlugin(_FreshArgumentsPlugin):
         self.collected.update(str(getattr(i, "nodeid", "")) for i in session.items)
         # Built ONCE per evaluation: a continuation round must keep the same mutant, whose `entered`
         # flag is the proof of entry the earlier rounds recorded.
-        if self._mutant_source and self._mutated is None:
+        if self._hook is not None:
+            self._mutated = self._hook.probe
+        elif self._mutant_source and self._mutated is None:
             self._mutated = _build_mutant(
                 self._target_file, self._func_name, self._mutant_source
             )
         self._mutant_codes = (
-            _step_codes_of(self._mutated) if self._mutated is not None else ()
+            _step_codes_of(
+                getattr(self._mutated, "__wrapped__", self._mutated)
+                if self._hook is not None
+                else self._mutated
+            )
+            if self._mutated is not None
+            else ()
         )
 
     def _step_arm_for(self, nodeid: str) -> tuple[tuple[Any, ...], int | None]:
@@ -473,14 +614,23 @@ class _MutantPlugin(_FreshArgumentsPlugin):
         arm = _StepArm(*self._step_arm_for(getattr(item, "nodeid", "")))
         self.done.add(getattr(item, "nodeid", ""))
         with _execution_guard() as proof:
-            module_saved = _patch_module_qualified(
-                proof, self._func_name, self._mutated, self._target_file, self._qualname
-            )
-            patched, saved, target = _patch_mutant_into_test(
-                proof, test_fn, self._qualname, self._mutated
-            )
-            if patched or module_saved:
-                self.installed = True
+            if self._hook is not None:
+                # Already in the module (#18): rebinding would replace what the import captured.
+                module_saved, patched, saved, target = [], False, None, None
+                self.installed = self._hook.installed
+            else:
+                module_saved = _patch_module_qualified(
+                    proof,
+                    self._func_name,
+                    self._mutated,
+                    self._target_file,
+                    self._qualname,
+                )
+                patched, saved, target = _patch_mutant_into_test(
+                    proof, test_fn, self._qualname, self._mutated
+                )
+                if patched or module_saved:
+                    self.installed = True
             self.ran += 1
             # Armed only here, where the mutant is installed (#105) — never around `pytest.main`,
             # whose collection and basetemp creation are the harness's writes. This session's own
@@ -614,6 +764,7 @@ def _evaluate_full(
     project_root: str = "",
     write_roots: tuple[str, ...] = (),
     full_matrix: bool = False,
+    robust: bool = False,
 ) -> dict[str, Any]:
     """Run the node IDs against ONE mutant; return its verdict payload.
 
@@ -627,6 +778,19 @@ def _evaluate_full(
     # W#27: per-node loop budgets arrive from the parent, which counted the ORIGINAL on each node in
     # its own process — never here, where a count pass would run nodes this mutant's first value
     # kill short-circuits, inside this request's own timeout.
+    hook: _MutantImportHook | None = None
+    if robust:
+        target_real = os.path.realpath(target_abspath)
+        loaded = any(
+            isinstance(vars(m).get("__file__"), str)
+            and os.path.realpath(vars(m)["__file__"]) == target_real
+            for m in list(sys.modules.values())
+            if isinstance(m, type(sys))
+        )
+        if robust_hook_standing(loaded) == "too_late":
+            return _unbuilt_payload()
+        hook = _MutantImportHook(target_real, func_qualname, mutant_source)
+        sys.meta_path.insert(0, hook)
     plugin = _MutantPlugin(
         None,
         func_qualname,
@@ -636,12 +800,17 @@ def _evaluate_full(
         project_root,
         write_roots,
         full_matrix,
+        hook,
     )
     rcs: list[int] = []
     voided: set[str] = set()
     controlled = 0
     while True:
-        rcs.append(_pytest_round(node_ids, plugin))
+        try:
+            rcs.append(_pytest_round(node_ids, plugin))
+        finally:
+            if hook is not None and hook in sys.meta_path:
+                sys.meta_path.remove(hook)
         # The ORIGINAL control (#55): every node that failed under the mutant is re-run against the
         # original, in the process state this evaluation left, and a failure it reproduces is not a
         # difference. One decision, `engine.original_control_standing`, shared with the in-process loop.
@@ -649,7 +818,9 @@ def _evaluate_full(
         controlled = len(plugin.node_reasons)
         sensitive: set[str] = set()
         if fresh_failures:
-            newly_voided, sensitive = _voided_by_control(fresh_failures)
+            newly_voided, sensitive = _voided_by_control(
+                fresh_failures, fresh_process_root=project_root if robust else None
+            )
             voided |= newly_voided
             if sensitive:
                 # These nodes failed under the mutant on COPIES of arguments their test cannot be
@@ -735,6 +906,26 @@ def _evaluate_full(
     }
 
 
+def _unbuilt_payload() -> dict[str, Any]:
+    """The verdict payload of a mutant that was not built: the harness's, never a kill or a survivor."""
+    return {
+        "diverged": False,
+        "rc": 0,
+        "killed_by": None,
+        "constructed": False,
+        "test_name": None,
+        "installed": False,
+        "ran": 0,
+        "entered": False,
+        "memory_cut": False,
+        "write_blocked": None,
+        "blocked_writes": [],
+        "original_also_fails": [],
+        "killers": None,
+        "unresolved_nodes": [],
+    }
+
+
 def _pytest_round(node_ids: list[str], plugin: Any) -> int:
     """One ``pytest.main`` over ``node_ids`` with ``plugin``; its output goes to a sink.
 
@@ -761,7 +952,31 @@ def _pytest_round(node_ids: list[str], plugin: Any) -> int:
         )
 
 
-def _voided_by_control(failures: list[tuple[str, str]]) -> tuple[set[str], set[str]]:
+def _control_in_fresh_process(root: str, nodes: list[str]) -> dict[str, str] | None:
+    """How each node fails against the ORIGINAL, measured in a process the import hook never touched (#18).
+
+    After a robust run this process holds the mutant in the target module, so a control run here would
+    run the mutant. A fresh interpreter has the original. None when the measurement could not be made.
+    """
+    try:
+        done = subprocess.run(
+            [sys.executable, "-m", "Wesker._isolated_worker", "--control"],
+            input=json.dumps({"project_root": root, "node_ids": nodes}),
+            capture_output=True,
+            text=True,
+            cwd=root,
+            timeout=300,
+            check=False,
+        )
+        reasons = json.loads(done.stdout.strip().splitlines()[-1])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+    return reasons if isinstance(reasons, dict) else None
+
+
+def _voided_by_control(
+    failures: list[tuple[str, str]], fresh_process_root: str | None = None
+) -> tuple[set[str], set[str]]:
     """The failing nodes whose failure the ORIGINAL reproduces in this process state, and the ones that
     reproduce it only because they were handed copies (#55).
 
@@ -778,17 +993,26 @@ def _voided_by_control(failures: list[tuple[str, str]]) -> tuple[set[str], set[s
 
     nodes = list(dict.fromkeys(nodeid for nodeid, _ in failures))
     control = _ControlPlugin()
-    try:
-        _pytest_round(nodes, control)
-    # BLE001: a control that cannot run is no control; the failures keep the verdict they had
-    except Exception:  # noqa: BLE001
-        return set(), set()
+    if fresh_process_root is not None:
+        fresh = _control_in_fresh_process(fresh_process_root, nodes)
+        if fresh is None:
+            return set(), set()
+        control.reasons = fresh
+    else:
+        try:
+            _pytest_round(nodes, control)
+        # BLE001: a control that cannot run is no control; the failures keep the verdict they had
+        except Exception:  # noqa: BLE001
+            return set(), set()
     same = {
         nodeid
         for nodeid, reason in failures
         if original_control_standing(reason, control.reasons.get(nodeid))
         == "control_same"
     }
+    if fresh_process_root is not None:
+        # The identity probe below re-runs nodes in THIS process, which holds the mutant.
+        return same, set()
     unmeasured = sorted(same - _MEASURED)
     sensitive: set[str] = set()
     if unmeasured:
@@ -939,6 +1163,7 @@ def _serve() -> int:
             project_root=session["project_root"],
             write_roots=tuple(session.get("write_roots") or ()),
             full_matrix=bool(spec.get("full_matrix")),
+            robust=bool(spec.get("robust")),
         )
         payload["enforced"] = enforced
         real_stdout.write(json.dumps(payload) + "\n")
@@ -949,6 +1174,16 @@ def _serve() -> int:
 def main() -> int:
     if "--serve" in sys.argv[1:]:
         return _serve()
+    if "--control" in sys.argv[1:]:
+        # The nodes against the unmutated target in a fresh process (#18): one JSON line, node -> reason.
+        real_stdout = sys.stdout
+        spec = json.loads(sys.stdin.read())
+        _setup(spec)
+        control = _ControlPlugin()
+        _pytest_round(list(spec["node_ids"]), control)
+        real_stdout.write(json.dumps(control.reasons) + "\n")
+        real_stdout.flush()
+        return 0
     if "--baseline" in sys.argv[1:]:
         # Traced baseline run of the unmutated target, for the determinism check (#19). One fresh
         # process, one JSON line: {"lines": [...], "outcome": "..."}. The tracer's own redirect is

@@ -206,7 +206,7 @@ def test_converged_closes_worker_when_later_progress_interrupts(monkeypatch):
     monkeypatch.setattr(engine, "generate_mutants", lambda *a, **k: [mutant, mutant])
     calls = 0
 
-    def evaluate(*args):
+    def evaluate(*args, **_kwargs):
         nonlocal calls
         calls += 1
         if calls == 2:

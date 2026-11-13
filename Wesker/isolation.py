@@ -831,6 +831,7 @@ class IsolatedMutantWorker:
         node_ids: Sequence[str] | None = None,
         step_caps: dict[str, int] | None = None,
         full_matrix: bool = False,
+        robust: bool = False,
     ) -> IsolatedRun:
         """Evaluate ONE mutant on the reused worker. A hang kills the group and retires the worker.
 
@@ -849,6 +850,9 @@ class IsolatedMutantWorker:
         if full_matrix:
             # Detective #145: run every node and report each failing node's own reason.
             spec["full_matrix"] = True
+        if robust:
+            # #18: give the mutant to the target's IMPORT. Only a worker that has not imported it yet.
+            spec["robust"] = True
         try:
             # Explicit checks, not `assert`s (see `open`): an assert vanishes under `python -O`.
             if self._proc.stdin is None or self._proc.stdout is None:

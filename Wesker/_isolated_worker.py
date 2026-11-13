@@ -24,7 +24,9 @@ engine's ``value_killed`` split survives the crossing into an isolated process.
 
 from __future__ import annotations
 
+import ast
 import contextlib
+import importlib
 import importlib.util
 import io
 import json
@@ -45,12 +47,96 @@ from Wesker.write_authority import (
 )
 
 
+def standalone_load_standing(
+    named: bool, in_package_dir: bool, relative_imports: bool
+) -> str:
+    """How a target no collected test imported may be loaded (#46, pure — pinned).
+
+    The split exists because the standalone fallback (``_wesker_mutant_target``) has NO package: a
+    relative import in the module, or in the mutated function, fails there for a reason that is the
+    harness's, and the mutant would then read as killed or crashed. Three states, three remedies:
+
+      "real_name"      the file imports under its real dotted name from ``sys.path`` (a regular or a
+                       namespace package, or a flat module): load it that way, so ``__package__`` and
+                       relative imports are the project's own.
+      "standalone"     no dotted name, but nothing in the file needs one: a flat module loaded by path.
+      "unconstructible" no dotted name, and the file sits in a package or uses a relative import: the
+                       mutant cannot be built honestly. It is a named harness disposition, never a kill.
+    """
+    if named:
+        return "real_name"
+    if in_package_dir or relative_imports:
+        return "unconstructible"
+    return "standalone"
+
+
+def _real_name_candidates(target: str) -> list[str]:
+    """Dotted names ``target`` could import under, one per ``sys.path`` entry that contains it."""
+    names: list[str] = []
+    for entry in sys.path:
+        base = os.path.realpath(entry or os.getcwd())
+        if not target.startswith(base + os.sep):
+            continue
+        parts = os.path.relpath(target, base).removesuffix(".py").split(os.sep)
+        if parts[-1] == "__init__":
+            parts.pop()
+        if parts and all(part.isidentifier() for part in parts):
+            name = ".".join(parts)
+            if name not in names:
+                names.append(name)
+    return names
+
+
+def _import_or_none(name: str) -> Any | None:
+    """``importlib.import_module(name)``, or None when that name does not import."""
+    try:
+        return importlib.import_module(name)
+    # BLE001: a candidate name that does not import is simply not this file's name
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _import_under_real_name(target: str) -> Any | None:
+    """The module for ``target`` imported by a dotted name whose ``__file__`` is that file, or None."""
+    for name in _real_name_candidates(target):
+        module = _import_or_none(name)
+        found = vars(module).get("__file__") if module is not None else None
+        if isinstance(found, str) and os.path.realpath(found) == target:
+            return module
+    return None
+
+
+def _read_text(path: str) -> str:
+    """The file's text, or empty when it cannot be read (the load below then fails by itself)."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _uses_relative_import(*sources: str) -> bool:
+    """True when any source holds ``from . import``/``from .x import`` at any depth."""
+    for source in sources:
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError):
+            continue
+        if any(
+            isinstance(node, ast.ImportFrom) and node.level > 0
+            for node in ast.walk(tree)
+        ):
+            return True
+    return False
+
+
 def _build_mutant(target_file: str, func_name: str, mutant_source: str) -> Any | None:
     """Compile in the namespace pytest actually imported for this source.
 
-    Relative imports, dataclasses and namespace packages use their real module identity.
-    A flat module not imported during collection retains the standalone fallback, with
-    normal sys.modules registration while its module body executes.
+    Relative imports, dataclasses and namespace packages use their real module identity. A target no
+    collected test imported is imported under its real dotted name (#46); only a file with no dotted
+    name and no need of one is loaded standalone, and one that needs a package it cannot have is not
+    built (``standalone_load_standing``).
     """
     from types import ModuleType
 
@@ -73,6 +159,17 @@ def _build_mutant(target_file: str, func_name: str, mutant_source: str) -> Any |
     )
     try:
         if module is None:
+            module = _import_under_real_name(target)
+        named = module is not None
+        standing = standalone_load_standing(
+            named,
+            not named
+            and os.path.isfile(os.path.join(os.path.dirname(target), "__init__.py")),
+            not named and _uses_relative_import(_read_text(target), mutant_source),
+        )
+        if standing == "unconstructible":
+            return None
+        if standing == "standalone":
             name = "_wesker_mutant_target"
             spec = importlib.util.spec_from_file_location(name, target_file)
             if spec is None or spec.loader is None:

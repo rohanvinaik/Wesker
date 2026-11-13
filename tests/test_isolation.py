@@ -1068,10 +1068,14 @@ def _drop_cap(tmp_path):
     sys.modules.pop("test_cap", None)
 
 
-def test_a_mutant_never_entered_is_excluded_not_a_false_survivor(tmp_path):
-    """THE #18 payoff on the isolated path: mutants of a function the test reaches only through a
-    captured original are NOT installed/entered on the call path, so they are scored outside the
-    denominator — zero false survivors, every unscored one named."""
+def test_a_mutant_captured_at_import_is_entered_by_robust_mode_and_scored(tmp_path):
+    """THE #18 payoff on the isolated path. The test reaches `h` only through `_captured = h`, bound
+    at import. A plain install rebinds `cap.h` and never what `_captured` holds, so the mutant used to
+    be named `not_entered` and kept out of the denominator. Robust mode (6d8e13e, e85029a) re-evaluates
+    such a mutant once in a fresh worker that compiles it into the module BEFORE the module's own
+    import-time capture runs, so `_captured` holds the mutant and the test provably enters it: each
+    mutant is now scored on what the test actually checked. What must never happen still never does:
+    no mutant is an unqualified survivor."""
     from Wesker.ci import _PROJECT_ROOT
     from Wesker.engine import run_function_profiling
     from Wesker.filter import filter_categories
@@ -1089,14 +1093,16 @@ def test_a_mutant_never_entered_is_excluded_not_a_false_survivor(tmp_path):
                 isolated=True,
             )
             assert r.total_survived == 0, (
-                "a never-entered mutant must not be a survivor"
+                "a mutant the test does not enter must never read as a survivor"
             )
-            assert r.total_killed == 0
-            unscored = sum(cr.unscored for cr in r.per_category)
-            assert unscored > 0, (
-                "the never-entered mutants must be scored outside the denominator"
+            # Every mutant of `h` changes its return value, and `test_it` asserts it, so once robust
+            # mode installs them at import every one is killed by the test that entered it.
+            assert r.total_killed > 0
+            assert all(
+                killers == ["test_cap.py::test_it"]
+                for killers in r.kill_matrix.values()
             )
-            # Every unscored one is NAMED (not_installed / not_entered), never an unqualified survivor.
+            # Anything left unscored is still NAMED, never an unqualified survivor.
             reasons = {k for cr in r.per_category for k in cr.unscored_by}
             assert reasons <= {"not_installed", "not_entered", "harness_error"}
         finally:

@@ -187,16 +187,24 @@ def five(x):
 """
 _TEST = """\
 from calc import add
+from calc import five as times_five
 
 
 def test_add():
     assert add(1, 2) == 3
     assert add(5, 2) == 3
+
+
+def test_five():
+    assert times_five(2) == 10
 """
 
 
 def test_the_cli_summary_and_json_say_it_end_to_end(tmp_path):
-    """The issue's own shape through the real command: a wrapped target whose mutants are never built."""
+    """The issue's own shape through the real command: a wrapped target whose mutants are never ENTERED.
+
+    They used to be never built (the wrapper's namespace was read as empty, #18); built now, a test that
+    reaches the wrapper through an alias leaves them installed and unentered, which the rollup counts the same."""
     (tmp_path / "tests").mkdir()
     (tmp_path / "calc.py").write_text(_CALC)
     (tmp_path / "tests" / "test_calc.py").write_text(_TEST)

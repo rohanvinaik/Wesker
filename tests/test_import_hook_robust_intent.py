@@ -46,6 +46,14 @@ _DECO = (
 )
 
 
+# Plain functions held by a copy taken AT IMPORT: (module tail, how a test calls it).
+_CAPTURES = {
+    "alias": ("DOUBLE = double\n", "DOUBLE"),
+    "handlers": ("HANDLERS = {'d': double}\n", "HANDLERS['d']"),
+    "default": ("def apply(value, fn=double):\n    return fn(value)\n", "apply"),
+}
+
+
 def _project(tmp_path, kind, strong=True):
     """Write a project of unique module names; returns (module, function, tests-module, names)."""
     tag = uuid.uuid4().hex[:8]
@@ -61,6 +69,17 @@ def _project(tmp_path, kind, strong=True):
             else f"import {mod}\n\n\ndef test_pin():\n    assert {mod}.plus_one(3) is not None\n"
         )
         func, names = "plus_one", ["test_pin"]
+    elif kind in _CAPTURES:
+        tail, call = _CAPTURES[kind]
+        (tmp_path / f"{mod}.py").write_text(
+            "def double(value):\n    return value * 2\n\n\n" + tail
+        )
+        (tmp_path / f"{tests}.py").write_text(
+            f"import {mod}\n\n\ndef test_cap():\n    assert {mod}.{call}(4) == 8\n"
+            if kind == "default"
+            else f"from {mod} import {call.split('[')[0]}\n\n\ndef test_cap():\n    assert {call}(4) == 8\n"
+        )
+        return mod, "double", tests, ["test_cap"]
     else:
         (tmp_path / f"{deco}.py").write_text(_DECO)
         (tmp_path / f"{mod}.py").write_text(
@@ -243,8 +262,12 @@ def test_robust_hook_standing(loaded, code):
         ("not_entered", "decorator_wrapper", False, "reevaluate_with_hook"),
         ("not_installed", "decorator_wrapper", False, "reevaluate_with_hook"),
         ("not_entered", "decorator_wrapper", True, "keep"),
-        ("not_entered", "captured_at_import", False, "keep"),
-        ("not_entered", "pre_bound_reference", False, "keep"),
+        ("not_entered", "captured_at_import", False, "reevaluate_with_hook"),
+        ("not_entered", "pre_bound_reference", False, "reevaluate_with_hook"),
+        ("not_installed", "pre_bound_reference", False, "reevaluate_with_hook"),
+        ("not_entered", "pre_bound_reference", True, "keep"),
+        ("not_entered", "captured_at_import", True, "keep"),
+        ("not_entered", "holder_not_found", False, "keep"),
         ("not_entered", "not_reached", False, "keep"),
         ("not_entered", "no_reach_data", False, "keep"),
         ("not_installed", "no_reach_data", False, "keep"),
@@ -271,3 +294,56 @@ def test_robust_retry_standing(disposition, cause, robust, code):
 )
 def test_robust_adoption_standing(constructed, entered, timed_out, memory_cut, code):
     assert robust_adoption_standing(constructed, entered, timed_out, memory_cut) == code
+
+
+def _profile_plain(tmp_path, kind, isolated):
+    """`_profile` for a plain (undecorated) target: the original is the function itself."""
+    mod, func, tests_mod, _names = _project(tmp_path, kind)
+    sys.path.insert(0, str(tmp_path))
+    try:
+        module = importlib.import_module(mod)
+        tree = ast.parse((tmp_path / f"{mod}.py").read_text())
+        node = next(
+            n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == func
+        )
+        tests_module = importlib.import_module(tests_mod)
+        fn = tests_module.test_cap
+        fn.__qualname__ = f"{tests_mod}.py::test_cap"
+        token = _PROJECT_ROOT.set(str(tmp_path))
+        try:
+            return run_function_profiling(
+                node,
+                f"{mod}.py::{func}",
+                filter_categories(node),
+                [fn],
+                module.double,
+                isolated=isolated,
+            )
+        finally:
+            _PROJECT_ROOT.reset(token)
+    finally:
+        sys.path[:] = [p for p in sys.path if p != str(tmp_path)]
+        for name in list(sys.modules):
+            if name.endswith(mod[-8:]) or name == tests_mod:
+                sys.modules.pop(name, None)
+
+
+@pytest.mark.parametrize("kind", sorted(_CAPTURES))
+def test_a_plain_function_captured_at_import_is_scored_under_isolation(tmp_path, kind):
+    """An alias constant, a handler dict and a default argument each hold the original taken at import; the
+    hook compiles the module with the definition replaced, so each holds the mutant and the test enters it."""
+    result = _profile_plain(tmp_path, kind, True)
+    assert result.unscored_records == []
+    assert result.total_mutants > 0
+    assert result.total_killed == result.total_mutants
+
+
+@pytest.mark.parametrize("kind", sorted(_CAPTURES))
+def test_in_process_the_same_capture_is_still_named_not_entered(tmp_path, kind):
+    result = _profile_plain(tmp_path, kind, False)
+    assert result.total_mutants == 0
+    assert {r["disposition"] for r in result.unscored_records} == {"not_entered"}
+    assert {r["cause"] for r in result.unscored_records} <= {
+        "pre_bound_reference",
+        "captured_at_import",
+    }

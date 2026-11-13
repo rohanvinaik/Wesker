@@ -9269,25 +9269,37 @@ def _wrapper_cause_of(
     return cause
 
 
+_HOOK_REPAIRABLE_CAUSES = (
+    "decorator_wrapper",
+    "pre_bound_reference",
+    "captured_at_import",
+)
+
+
 def robust_retry_standing(disposition: str, cause: str, robust_run: bool) -> str:
     """Whether a mutant's plain install earns a second look through the import hook (#18, pure — pinned).
 
-    The plain install rebinds names AFTER the target and its tests imported. A decorator, `lru_cache` or
-    registry that captured the original at import keeps calling it, so the mutant is installed and never
-    entered. That is exactly the case an import-time install repairs, and ONLY that case: every other
-    `not_entered` cause (nothing reached the function, a pre-bound alias, a module-level constant) has
-    a repair the hook does not perform, and re-running it would only repeat the verdict.
+    The plain install rebinds names AFTER the target and its tests imported. Whatever took a reference to
+    the original AT IMPORT keeps calling it, so the mutant is installed and never entered: a decorator or
+    `lru_cache`, an alias (`FEE = fee`, `from m import fn as alias`), a dict of handlers, a default
+    argument, a partial. The hook compiles the target module with the function's definition replaced by the
+    mutant's, so every one of those captures the MUTANT, which is exactly what it repairs. The other causes
+    have a repair it does not perform (nothing reached the function; a holder the scan could not find; no
+    reach data), and re-running them would only repeat the verdict.
 
-      "reevaluate_with_hook"  ``not_entered`` or ``not_installed`` with cause ``decorator_wrapper``, not
-                              already hooked. The isolated worker reads a wrapper whose code lives in
-                              another module as ``not_installed`` (no site could be rebound), the
-                              in-process path as ``not_entered``; the holder scan names the same
-                              wrapper for both, and the hook repairs both.
+      "reevaluate_with_hook"  ``not_entered`` or ``not_installed`` with cause ``decorator_wrapper``,
+                              ``pre_bound_reference`` or ``captured_at_import``, not already hooked. The
+                              isolated worker reads a wrapper whose code lives in another module as
+                              ``not_installed`` (no site could be rebound), the in-process path as
+                              ``not_entered``; the holder scan names the same cause for both.
       "keep"                  anything else: the plain verdict stands.
     """
     if robust_run:
         return "keep"
-    if disposition in ("not_entered", "not_installed") and cause == "decorator_wrapper":
+    if (
+        disposition in ("not_entered", "not_installed")
+        and cause in _HOOK_REPAIRABLE_CAUSES
+    ):
         return "reevaluate_with_hook"
     return "keep"
 
@@ -9323,7 +9335,7 @@ def _evaluate_isolated(
     """Evaluate one mutant in a killable isolated worker, recycling the worker when spent (#19).
 
     ``cause_of`` names why an unentered result was not entered (the caller's `not_entered_cause`). A
-    mutant whose plain install was `not_entered` or `not_installed` with cause `decorator_wrapper` gets ONE second look in
+    mutant whose plain install was `not_entered` or `not_installed` with a cause the hook repairs (`robust_retry_standing`) gets ONE second look in
     a fresh worker whose import hook installs the mutant before the target imports (#18); the second
     verdict replaces the first only when a test entered the mutant (`robust_adoption_standing`).
 

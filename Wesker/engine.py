@@ -60,7 +60,11 @@ from .line_coverage import coverage_from_trace as _coverage_from_trace
 from .line_coverage import executable_lines as _executable_lines
 from .line_coverage import trace_line_coverage as _trace_line_coverage
 from .line_coverage import trace_suite as _trace_suite
-from .memory_guard import bounded_address_space, memory_enforcement_standing
+from .memory_guard import (
+    bounded_address_space,
+    inprocess_cap_mb,
+    memory_enforcement_standing,
+)
 from .memory_guard import over_budget as _over_budget
 from .memory_guard import reclaim as _reclaim
 from .memory_guard import resolve_budget as _resolve_budget
@@ -7336,6 +7340,55 @@ def first_refusal(
     return code, test_id
 
 
+def _cap_bytes(megabytes: int | None) -> int | None:
+    """``megabytes`` as bytes for :func:`~Wesker.memory_guard.bounded_address_space`; None is no cap."""
+    return megabytes * 1024 * 1024 if megabytes else None
+
+
+def memory_cut_run_standing(
+    failed_with_memory_error: bool, raised_memory_error: bool
+) -> str:
+    """Whether the address-space cap stopped an in-process run of a mutant (W#29, pure — pinned).
+
+    The in-process counterpart of ``_isolated_worker.memory_cut_standing`` (a test holds the two equal
+    over every input; this one cannot import it, because a pin is a function of its arguments alone and
+    that module is not loaded for an in-process run until a cap lands), with the same three answers
+    (``cap_failed_node`` / ``cap_swallowed`` / ``no_cap``), because the two modes must give one mutant one
+    verdict: a ``MemoryError`` the code under test catches (``except Exception: return -1``) leaves a test
+    that fails on the VALUE the handler returned, and reading that as a kill lets the budget manufacture
+    one. Either cap answer means the run is the budget's, not the suite's.
+    """
+    if failed_with_memory_error:
+        return "cap_failed_node"
+    return "cap_swallowed" if raised_memory_error else "no_cap"
+
+
+class _MemoryWatch:
+    """Record whether a ``MemoryError`` was raised while an in-process cap was in force (W#29).
+
+    The isolated worker's own watch (``sys.monitoring`` RAISE under a tool id of its own) when the cap
+    landed, and nothing when it did not: without a cap a ``MemoryError`` is the machine's, not ours.
+    """
+
+    def __init__(self, armed: bool) -> None:
+        self.hit = False
+        self._watch: Any = None
+        if armed:
+            from Wesker._isolated_worker import _MemoryErrorWatch
+
+            self._watch = _MemoryErrorWatch()
+
+    def __enter__(self) -> Self:
+        if self._watch is not None:
+            self._watch.__enter__()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self._watch is not None:
+            self._watch.__exit__(*exc)
+            self.hit = bool(self._watch.hit)
+
+
 @_serialized
 def evaluate_mutant(
     mutant: Mutant,
@@ -7350,8 +7403,15 @@ def evaluate_mutant(
     source_path: str | None = None,
     step_plan: StepPlan | None = None,
     liveness_ceiling_ms: float | None = None,
+    address_cap_mb: int | None = None,
 ) -> MutantResult:
     """Evaluate a mutant against test functions.
+
+    ``address_cap_mb`` bounds how far this process may GROW while a test runs the mutant (W#29): an
+    allocation past it raises ``MemoryError``, and a mutant that does so, caught or not, is the unscored
+    ``memory_cut`` outcome the isolated worker's cap produces — one mutant without a verdict. ``None``
+    takes the run's memory budget (:func:`~Wesker.memory_guard.inprocess_cap_mb`); a platform that will
+    not take the limit runs the mutant uncapped, as before.
 
     With a ``step_plan`` (W#27), each test's ORIGINAL loop count is measured once per pass before
     the mutant is installed, and every mutant observation of a test the original passed under the
@@ -7628,13 +7688,48 @@ def evaluate_mutant(
                 # so it stays unarmed, like the baseline.
                 # A test boundary (#49): a Form B wrapper's memory (stale) ends with the test that made it.
                 begin_test()
-                with contain_writes() as blocked:
+                # The cap is entered BEFORE the write guard (which refuses a `setrlimit` made inside its
+                # own window) and its watch only when the cap actually landed.
+                with (
+                    bounded_address_space(
+                        _cap_bytes(inprocess_cap_mb(address_cap_mb))
+                    ) as capped,
+                    _MemoryWatch(capped) as memory_watch,
+                    contain_writes() as blocked,
+                ):
                     result = _run_test_with_timeout(
                         test_fn,
                         _unwrap_descriptor(mutated_obj),
                         patched,
                         test_wall_ms,
+                        memory_capped=capped,
                         **step_args,
+                    )
+                if (
+                    capped
+                    and result != "uncontained"
+                    and memory_cut_run_standing(
+                        result == "memory_error", memory_watch.hit
+                    )
+                    != "no_cap"
+                ):
+                    # The cap stopped this mutant, caught or not (W#29): whatever the test made of the
+                    # error is the budget's, never a kill and never a pass. ONE mutant with no verdict.
+                    # What it allocated is released before the next mutant runs, so that mutant's verdict
+                    # is its own, not the runaway's.
+                    _reclaim()
+                    from Wesker.ci import callable_test_id
+
+                    return MutantResult(
+                        mutant=mutant,
+                        killed=False,
+                        killed_by=MEMORY_CUT,
+                        test_name=callable_test_id(test_fn),
+                        contained=not saw_uncontained,
+                        uncontained_test=uncontained_test,
+                        installed=patched,
+                        tests_run=ran,
+                        elapsed_ms=_elapsed(start),
                     )
                 if blocked and result != "uncontained":
                     result = WRITE_OUTSIDE_AUTHORITY
@@ -8392,8 +8487,13 @@ def _run_test_with_timeout(
     step_codes: tuple[types.CodeType, ...] = (),
     step_cap: int | None = None,
     step_sink: list[int] | None = None,
+    memory_capped: bool = False,
 ) -> str | None:
     """Run a single test function with a hard thread-based timeout.
+
+    ``memory_capped`` says an address-space cap is in force for this run (W#29): a ``MemoryError`` the
+    test fails with is then reported as ``memory_error``, never as the kill reason ``crash`` that an
+    uncapped run gives it. The caller reads it, with the cap's own watch, as the unscored ``memory_cut``.
 
     Returns a kill reason ("assertion", "exception", "crash"), an unresolved
     execution code ("undetermined", "diverged"), or None if the test passed.
@@ -8448,8 +8548,12 @@ def _run_test_with_timeout(
             result_box[0] = "assertion"
         # BLE001: any non-assertion exception from the test is a crash kill; the breadth
         # is the classification
-        except Exception:  # noqa: BLE001
-            result_box[0] = "crash"
+        except Exception as exc:  # noqa: BLE001
+            result_box[0] = (
+                "memory_error"
+                if memory_capped and isinstance(exc, MemoryError)
+                else "crash"
+            )
         except (KeyboardInterrupt, SystemExit):
             raise
         # BLE001: interrupts re-raise above; what remains is read below, because a

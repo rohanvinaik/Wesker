@@ -369,6 +369,37 @@ def speculative_address_cap(
     return cap
 
 
+def inprocess_cap_standing(explicit_mb: int, budget_bytes: int) -> str:
+    """Where the address-space cap of an IN-PROCESS mutant run comes from (W#29, pure — pinned).
+
+    The isolated run caps its worker; the in-process run (the badge run's, since it is not
+    ``--isolated``) had no cap, so a mutant that allocates without bound took the whole runner to the
+    kernel's kill (CI shard 4/4, exit 137, evaluating a mutant of ``interrupt.py``). The cap is the
+    same kind of bound the worker has, and it is chosen in this order:
+
+      "explicit"   ``explicit_mb`` > 0: the caller named a cap (the isolated run's ``--mem-limit-mb``)
+      "budget"     no explicit cap and the run has a finite memory budget (``WESKER_MEM_BUDGET_MB``, else
+                   the capacity-derived default): a mutant may grow the process by that much
+      "unbounded"  the budget is off (a non-positive ``WESKER_MEM_BUDGET_MB`` selects ``sys.maxsize``):
+                   the user opted out, on purpose, so nothing is capped
+    """
+    if explicit_mb > 0:
+        return "explicit"
+    # `resolve_budget` spells "off" as `sys.maxsize`; no finite budget is anywhere near 2**62 bytes, and
+    # a literal keeps this a function of its arguments alone.
+    return "unbounded" if budget_bytes >= 1 << 62 else "budget"
+
+
+def inprocess_cap_mb(explicit_mb: int | None = None) -> int | None:
+    """The growth, in MB, a mutant may demand of THIS process, or None for no cap (W#29)."""
+    standing = inprocess_cap_standing(explicit_mb or 0, resolve_budget())
+    if standing == "explicit":
+        return explicit_mb
+    if standing == "unbounded":
+        return None
+    return max(1, resolve_budget() // _MB)
+
+
 def _mapped_bytes() -> int:
     """This process's current virtual size, from ``/proc/self/statm``; 0 where that is not readable."""
     try:

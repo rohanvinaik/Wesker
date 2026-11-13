@@ -89,8 +89,9 @@ def main(argv: list[str] | None = None) -> int:
         "--isolated",
         action="store_true",
         help="Run each mutant in a killable worker subprocess with a memory cap (#45). Without "
-        "it NO per-mutant memory bound exists: a mutant that allocates without bound is stopped "
-        "only by the wall clock, which cannot interrupt one huge allocation",
+        "it the mutant runs in this process, which may grow by the run's memory budget "
+        "(WESKER_MEM_BUDGET_MB; 0 turns the bound off) where the OS accepts RLIMIT_AS; a mutant "
+        "over it is a named cut. The wall clock alone cannot interrupt one huge allocation",
     )
     parser.add_argument(
         "--mem-limit-mb",

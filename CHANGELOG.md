@@ -6,10 +6,20 @@ Notable changes, newest first. Dates are the commit dates.
 
 Development source after 1.2.2; no version or release is implied. The operator universe is unchanged —
 policy 8, the same categories and the same fingerprint counts — but the observation rule it declares
-changed twice, so the policy id moved twice.
+changed three times, so the policy id moved three times.
 
 ### Correctness
 
+- **A mutant that allocates without bound in the badge run is one mutant with no verdict, not a dead
+  runner.** Shard 4/4 of the same run was killed by the kernel (exit 137) evaluating a mutant in process:
+  only the isolated worker had an address-space cap, so the badge run, which is not `--isolated`, had none.
+  An in-process mutant may now grow the measuring process by the run's memory budget
+  (`WESKER_MEM_BUDGET_MB`, else RAM/8 clamped to 256 MB-2 GB; a non-positive budget opts out; a platform
+  that refuses `RLIMIT_AS` stays uncapped), and one that raises `MemoryError` under it, caught or not, is
+  the existing unscored `memory_cut`. Measured on a fixture whose mutant allocates 5 GB under an outer
+  6000 MB limit: peak 4809 MB before, 42 MB and `memory_cut` after. Policy id moves (the observation
+  clause now covers the in-process cap; the universe and `POLICY_VERSION` do not): one-sign
+  `9.5d2c6bafc8ae` -> `9.a5aeead0de4f`, two-sign `9+neg.fec711a421e9` -> `9+neg.6035bc2f613d`. (W#29)
 - **A trace whose observation failed makes that test's reach unknown, not the run's end, and a shard
   that fails for any reason writes a record that names it.** Shard 1/4 of the first sharded `Specification
   (full)` run (GitHub run 43315433429 on `8fcadfe`) died six minutes in on `MonitoringObservationFailed:

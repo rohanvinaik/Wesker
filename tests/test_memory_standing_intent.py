@@ -197,7 +197,9 @@ def test_the_help_text_says_the_truth(capsys):
     with pytest.raises(SystemExit):
         cli.main(["--help"])
     out = " ".join(capsys.readouterr().out.split())
-    assert "NO per-mutant memory bound" in out
+    assert (
+        "WESKER_MEM_BUDGET_MB" in out
+    )  # W#29: the in-process bound is the run's budget
     assert "ONLY with --isolated" in out
     assert "named cut, never a kill" in out
 

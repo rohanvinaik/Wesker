@@ -13,10 +13,14 @@ is restored that was never installed, there is no fall-through to the bare-name 
 ``__name__`` those would rebind the TEST module's own ``__name__``), and every other function in the
 file is still measured. Isolated execution reads the mutant ``not_installed``.
 
-NOT closed here: the in-process path records no install proof at all (``MutantResult.installed`` keeps
-its default there), so the same mutant reads ``not_entered`` in-process — unscored, never a kill or a
-survivor, but under the wrong cause. Recording installation in ``evaluate_mutant`` is the remaining
-step.
+W#50 (real toolz, both modes): the refused binding still read ``not_entered`` ("installed"), and
+in-process the mutant was credited as a crash kill by ``test_curried.py::test_reduce``, a test that never
+touches ``Compose``. The mechanism: a test module whose globals do NOT hold ``Compose`` has no owner to
+refuse the binding, so the bare-name strategies ran and found the test module's OWN ``__name__`` global,
+replaced it with the mutant, and reported "installed". Two defects follow, both closed here: the bare-name
+strategies never bind a name every module namespace carries (``bare_binding_standing``), and the in-process
+result records whether anything took the mutant (``install_standing``), so a refused binding is
+``not_installed`` in BOTH modes and no unrelated test can be credited with it.
 """
 
 from __future__ import annotations
@@ -34,8 +38,10 @@ from Wesker.engine import (
     _metaclass_owns_name,
     _patch_mutant_into_test,
     _unpatch_mutant,
+    bare_binding_standing,
     evaluate_mutant,
     generate_mutants,
+    install_standing,
 )
 
 _SOURCE = textwrap.dedent(
@@ -200,6 +206,17 @@ def test_the_file_profile_continues_and_isolated_reads_not_installed(
             """
         )
     )
+    # The real-toolz shape (#50): a second module whose globals do not hold `Compose` and which never
+    # touches it, as `test_curried.py::test_reduce` never touches toolz's.
+    (tmp_path / "tests" / "test_w38_unrelated.py").write_text(
+        textwrap.dedent(
+            """
+            def test_unrelated():
+                assert isinstance(__name__, str)
+                assert "w38" in __name__
+            """
+        )
+    )
     (tmp_path / "pyproject.toml").write_text(
         '[tool.pytest.ini_options]\npythonpath = ["."]\ntestpaths = ["tests"]\n'
     )
@@ -216,7 +233,7 @@ def test_the_file_profile_continues_and_isolated_reads_not_installed(
 
     rows = run_with_live_suite(str(tmp_path), body, target_files=["w38_mod.py"])
     assert rows is not None, "no live session"
-    for mode, by_fn in rows.items():
+    for by_fn in rows.values():
         name_row = by_fn["w38_mod.py::Compose.__name__"]
         # Never a kill or a survivor: the mutants sit outside the denominator, and the run is refused.
         assert name_row["total_mutants"] == 0
@@ -224,7 +241,68 @@ def test_the_file_profile_continues_and_isolated_reads_not_installed(
         # Every other function in the file was still measured.
         assert by_fn["w38_mod.py::Compose.__call__"]["total_killed"] > 0
         assert by_fn["w38_mod.py::compose"]["total_mutants"] > 0
-        if mode:
-            assert set(name_row["unscored_by"]) == {"not_installed"}
-        else:
-            assert sum(name_row["unscored_by"].values()) > 0
+        # Refused in both modes, under the same cause, and credited to no test (#50).
+        assert set(name_row["unscored_by"]) == {"not_installed"}
+        assert name_row["total_killed"] == 0
+
+
+def test_a_test_whose_globals_lack_the_owner_does_not_lose_its_own_module_name():
+    """#50: no owner in the namespace must not mean "rebind the module's own `__name__`"."""
+    namespace = {"__name__": "tests.test_unrelated", "__doc__": "doc"}
+    exec("def test_fn():\n    assert __name__\n", namespace)  # noqa: S102
+    for name in ("__name__", "__doc__"):
+        with _execution_guard() as proof:
+            patched, saved, target = _patch_mutant_into_test(
+                proof, namespace["test_fn"], f"Compose.{name}", lambda self: "MUTANT"
+            )
+        assert (patched, saved, target) == (False, None, None)
+    assert namespace["__name__"] == "tests.test_unrelated"
+    assert namespace["__doc__"] == "doc"
+
+
+def test_a_bare_function_named_like_an_ordinary_global_is_still_bound():
+    namespace = {"helper": lambda: 1}
+    exec("def test_fn():\n    assert helper() == 1\n", namespace)  # noqa: S102
+    mutant = lambda: 2
+    with _execution_guard() as proof:
+        patched, saved, target = _patch_mutant_into_test(
+            proof, namespace["test_fn"], "helper", mutant
+        )
+        assert patched is True
+        assert namespace["helper"] is mutant
+        _unpatch_mutant(proof, patched, saved, target, "helper")
+    assert namespace["helper"]() == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "code"),
+    [
+        ("__name__", "module_reserved"),
+        ("__doc__", "module_reserved"),
+        ("__file__", "module_reserved"),
+        ("__spec__", "module_reserved"),
+        ("__call__", "bindable"),
+        ("__init__", "bindable"),
+        ("name", "bindable"),
+        ("", "bindable"),
+    ],
+)
+def test_bare_binding_standing(name, code):
+    assert bare_binding_standing(name) == code
+
+
+@pytest.mark.parametrize(
+    ("ran", "module", "patched", "injected", "refused", "code"),
+    [
+        (0, 0, 0, 0, 0, "unobserved"),
+        (0, 3, 2, 1, 1, "unobserved"),
+        (2, 0, 0, 0, 1, "not_installed"),
+        (2, 0, 0, 0, 0, "not_proven"),
+        (2, 1, 0, 0, 1, "installed"),
+        (2, 0, 1, 0, 0, "installed"),
+        (2, 0, 0, 1, 1, "installed"),
+        (-1, 0, 0, 0, 1, "unobserved"),
+    ],
+)
+def test_install_standing(ran, module, patched, injected, refused, code):
+    assert install_standing(ran, module, patched, injected, refused) == code

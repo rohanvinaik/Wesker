@@ -5875,13 +5875,19 @@ def _precompute_patch_targets(
     return targets
 
 
+class _Bindings(list[tuple[Any, Any]]):
+    """The bindings `_patch_module_qualified` took, as ``[(owner, saved)]``, plus how many it was REFUSED (#50)."""
+
+    refused: int = 0
+
+
 def _patch_module_qualified(
     _proof: _PatchProof,
     func_name: str | None,
     mutated_obj: Any,
     source_path: str | None,
     qualname: str | None = None,
-) -> list[tuple[Any, Any]]:
+) -> _Bindings:
     """Patch every module-level binding of the ORIGINAL function to the mutant.
 
     Requires `_PatchProof` (#19): this mutates process-global state, so calling it without the
@@ -5911,12 +5917,12 @@ def _patch_module_qualified(
     so the caller's behaviour and output are unchanged in that case.
     """
     if not func_name or not source_path:
-        return []
+        return _Bindings()
 
     # Reloads and late re-exports can change owners without changing sys.modules' size.
     patch_targets = _precompute_patch_targets(func_name, source_path, qualname)
 
-    saved: list[tuple[Any, Any]] = []
+    saved = _Bindings()
     for target, is_method in patch_targets:
         try:
             if is_method:
@@ -5929,8 +5935,11 @@ def _patch_module_qualified(
                 existing = getattr(target, func_name, None)
                 setattr(target, func_name, mutated_obj)
                 saved.append((target, existing))
-        except Exception:  # noqa: BLE001, S112
-            continue
+        # BLE001: an owner that refuses the assignment (a metaclass-owned `__name__`, an immutable
+        # type) simply keeps the original; counted, because a refusal is evidence that nothing was
+        # installed there (#50)
+        except Exception:  # noqa: BLE001
+            saved.refused += 1
     return saved
 
 
@@ -6270,24 +6279,104 @@ def _original_holders(
     return found, ("budget_cut" if budget[0] <= 0 else "complete")
 
 
+#: Names the import system and the interpreter put in EVERY module namespace. A class attribute that
+#: shares one of them (toolz's `Compose.__name__` property) must never be installed by rebinding it in
+#: a test module's globals: that rebinds the TEST module's own `__name__`/`__doc__`/...
+_MODULE_RESERVED_NAMES = frozenset(
+    {
+        "__name__",
+        "__doc__",
+        "__package__",
+        "__loader__",
+        "__spec__",
+        "__file__",
+        "__cached__",
+        "__builtins__",
+        "__path__",
+        "__annotations__",
+    }
+)
+
+
+def bare_binding_standing(func_name: str) -> str:
+    """Whether a bare name may be rebound in a test's namespace as an install site (#50, pure — pinned).
+
+    The bare-name strategies of `_patch_mutant_into_test` (closure cell, test globals, test module) run
+    when the qualified owner was not found in the test's namespace. For a name every module namespace
+    already carries (`__name__`, `__doc__`, ...) they would find the TEST module's own entry and replace
+    it with the mutant: the mutant then reads as "installed" (so a refused binding read `not_entered`),
+    and the unrelated test, whose module name is now a function, crashes and is credited as a kill.
+
+      "module_reserved"  the name is one the import system gives every module: never a binding site.
+      "bindable"         any other name: the strategies below apply as before.
+    """
+    return "module_reserved" if func_name in _MODULE_RESERVED_NAMES else "bindable"
+
+
+def install_standing(
+    ran: int,
+    module_bindings: int,
+    patched_tests: int,
+    injected_tests: int,
+    refused_bindings: int,
+) -> str:
+    """Whether the in-process evaluation installed the mutant, and whether that is KNOWN (#50, pure — pinned).
+
+    The isolated worker has always recorded `installed = patched or module_saved`; the in-process
+    result carried the dataclass default `True`, so a mutant whose every binding was REFUSED read
+    `not_entered` (installed, never called) instead of `not_installed`. An install site is a module/owner
+    rebinding, a rebinding in a test's namespace, or the mutant passed to a test as its argument.
+
+      "unobserved"      ``ran <= 0``: no test ran, so nothing can be said (the synthesis path keeps its
+                        pre-#18 reading, a plain survivor).
+      "installed"       at least one site took the mutant.
+      "not_installed"   tests ran, no site took the mutant, and at least one binding was REFUSED: the
+                        original stayed bound, positively observed.
+      "not_proven"      tests ran and nothing took the mutant, but nothing refused either (a decorator
+                        wrapper the install skips; a test that reaches the target some other way). The
+                        absence of a site is not a refusal, so this keeps the pre-existing reading
+                        (`not_entered` by cause) rather than claiming `not_installed`.
+    """
+    if ran <= 0:
+        return "unobserved"
+    if module_bindings > 0 or patched_tests > 0 or injected_tests > 0:
+        return "installed"
+    return "not_installed" if refused_bindings > 0 else "not_proven"
+
+
 def _patch_mutant_into_test(
     _proof: _PatchProof,
     test_fn: Callable[..., None],
     qualname: str | None,
     mutated_obj: Any,
 ) -> tuple[bool, Any, Any]:
-    """Patch mutated function into the test's namespace.
+    """`_patch_mutant_into_test_ex` without the refusal flag: (patched, saved_original, patch_target)."""
+    patched, saved, target, _refused = _patch_mutant_into_test_ex(
+        _proof, test_fn, qualname, mutated_obj
+    )
+    return patched, saved, target
+
+
+def _patch_mutant_into_test_ex(
+    _proof: _PatchProof,
+    test_fn: Callable[..., None],
+    qualname: str | None,
+    mutated_obj: Any,
+) -> tuple[bool, Any, Any, bool]:
+    """Patch mutated function into the test's namespace, and say whether a binding was REFUSED (#50).
 
     Requires `_PatchProof` (#19) — see there.
 
     Tries __globals__ first (works for dynamically imported modules),
     then falls back to inspect.getmodule.
 
-    Returns (patched, saved_original, patch_target) where patch_target
-    is either a dict (__globals__) or a module object.
+    Returns (patched, saved_original, patch_target, refused) where patch_target
+    is either a dict (__globals__) or a module object, and ``refused`` is True when a binding site
+    was found and would not take the mutant (a metaclass-owned name, an immutable owner, a module
+    attribute): that is a positive observation of non-installation, which a mere absence is not.
     """
     if not qualname:
-        return False, None, None
+        return False, None, None, False
 
     func_name = qualname.split(".")[-1]
 
@@ -6315,26 +6404,30 @@ def _patch_mutant_into_test(
         # file's profile, and never a fall-through to the bare-name strategies below, which for a
         # name like `__name__` would rebind the TEST module's own `__name__` global.
         if _metaclass_owns_name(owner, func_name):
-            return False, None, None
+            return False, None, None, True
         saved = _get_raw_attr(owner, func_name)
         try:
             setattr(owner, func_name, _preserve_descriptor_shape(saved, mutated_obj))
         except (TypeError, AttributeError):
             # An immutable type, a slot or read-only attribute, a descriptor that validates its
             # value: the original stays bound, so nothing must be restored either.
-            return False, None, None
-        return True, saved, owner
+            return False, None, None, True
+        return True, saved, owner, False
+
+    if bare_binding_standing(func_name) == "module_reserved":
+        # #50: no owner took the binding, and the bare name is the test module's own attribute.
+        return False, None, None, True
 
     closure_cell = _find_closure_cell(closure_bindings, func_name)
     if closure_cell is not None:
         saved = closure_cell.cell_contents
         closure_cell.cell_contents = _preserve_closure_binding_shape(saved, mutated_obj)
-        return True, saved, ("closure_cell", closure_cell)
+        return True, saved, ("closure_cell", closure_cell), False
 
     if test_globals is not None and func_name in test_globals:
         saved = test_globals[func_name]
         test_globals[func_name] = _preserve_closure_binding_shape(saved, mutated_obj)
-        return True, saved, test_globals
+        return True, saved, test_globals, False
 
     # Fallback: inspect.getmodule (works for regular module-level functions)
     if test_module is not None and hasattr(test_module, func_name):
@@ -6342,9 +6435,9 @@ def _patch_mutant_into_test(
         setattr(
             test_module, func_name, _preserve_closure_binding_shape(saved, mutated_obj)
         )
-        return True, saved, test_module
+        return True, saved, test_module, False
 
-    return False, None, None
+    return False, None, None, False
 
 
 def _resolve_qualified_owner(
@@ -7587,6 +7680,31 @@ def evaluate_mutant(
         # must never produce, so with `ran == 0` entry stays UNOBSERVED (None) and the mutant
         # is scored a plain survivor, exactly as before #18.
         ran = 0
+        # Install sites seen so far (#50): tests whose namespace took the mutant, and every test tried.
+        patched_tests = 0
+        refused_tests = 0
+        tried: list[Callable[..., None]] = []
+
+        def _installed_now() -> bool:
+            """False only when a binding was REFUSED and nothing took the mutant, as of now (#50)."""
+            injected = (
+                0
+                if module_saved
+                or patched_tests
+                or not (refused_tests or module_saved.refused)
+                else sum(1 for t in tried if _test_call_args(t, mutated_obj))
+            )
+            return (
+                install_standing(
+                    ran,
+                    len(module_saved),
+                    patched_tests,
+                    injected,
+                    refused_tests + module_saved.refused,
+                )
+                != "not_installed"
+            )
+
         for test_fn in test_functions:
             remaining_ms = timeout_ms - _elapsed(allowance_t0)
             if remaining_ms <= 0:
@@ -7604,6 +7722,7 @@ def evaluate_mutant(
                     contained=not saw_uncontained,
                     uncontained_test=uncontained_test,
                     entered=(getattr(mutated_obj, "entered", None) if ran else None),
+                    installed=_installed_now(),
                     tests_run=ran,
                     elapsed_ms=_elapsed(start),
                 )
@@ -7630,10 +7749,15 @@ def evaluate_mutant(
             # both regular imports and dynamically loaded test modules. Falls back to
             # inspect.getmodule for inline test callables without __globals__.
             patch_name = qualname or func_name
-            patched, saved, patch_target = _patch_mutant_into_test(
+            patched, saved, patch_target, refused = _patch_mutant_into_test_ex(
                 _proof, test_fn, patch_name, mutated_obj
             )
             ran += 1
+            tried.append(test_fn)
+            if patched:
+                patched_tests += 1
+            if refused:
+                refused_tests += 1
             try:
                 arm_codes: tuple[types.CodeType, ...] = ()
                 arm_cap: int | None = None
@@ -7879,6 +8003,7 @@ def evaluate_mutant(
                                 mutant=mutant,
                                 contained=not saw_uncontained,
                                 uncontained_test=uncontained_test,
+                                installed=_installed_now(),
                                 elapsed_ms=_elapsed(start),
                                 **verdict,
                             )
@@ -7924,6 +8049,7 @@ def evaluate_mutant(
                 mutant=mutant,
                 contained=not saw_uncontained,
                 uncontained_test=uncontained_test,
+                installed=_installed_now(),
                 elapsed_ms=_elapsed(start),
                 **decided,
                 **scan,
@@ -7940,6 +8066,7 @@ def evaluate_mutant(
                 contained=not saw_uncontained,
                 uncontained_test=uncontained_test,
                 entered=(getattr(mutated_obj, "entered", None) if ran else None),
+                installed=_installed_now(),
                 tests_run=ran,
                 elapsed_ms=_elapsed(start),
                 **scan,
@@ -7957,6 +8084,7 @@ def evaluate_mutant(
             contained=not saw_uncontained,
             uncontained_test=uncontained_test,
             entered=(getattr(mutated_obj, "entered", None) if ran else None),
+            installed=_installed_now(),
             tests_run=ran,
             # Nothing killed it, but a test that might have was refused (#28): not a survivor.
             refusal=refusal,
